@@ -1,0 +1,11 @@
+# build output
+build/
+out/
+.cache/
+compile_commands.json
+
+# editors & OS
+.DS_Store
+.vs/
+.idea/
+*.swp

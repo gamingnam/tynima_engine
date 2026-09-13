@@ -1,0 +1,19 @@
+# Starting point — change freely, then run clang-format -i over the tree once.
+BasedOnStyle: LLVM
+Standard: c++20
+IndentWidth: 4
+ColumnLimit: 110
+PointerAlignment: Left
+AllowShortFunctionsOnASingleLine: Inline
+AllowShortIfStatementsOnASingleLine: Never
+BreakBeforeBraces: Attach
+IncludeBlocks: Regroup
+IncludeCategories:
+  - Regex: '^<tynima\.h>'
+    Priority: 1
+  - Regex: '^<tynima/'
+    Priority: 2
+  - Regex: '^<doctest/'
+    Priority: 3
+  - Regex: '^<'
+    Priority: 4

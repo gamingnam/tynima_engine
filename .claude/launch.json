@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "scratch-preview",
+      "runtimeExecutable": "python3",
+      "runtimeArgs": ["-m", "http.server", "8765", "--bind", "127.0.0.1", "--directory", "/private/tmp/claude-501/-Users-namdang-Coding-tynima-engine/ff1e3ff1-f2c1-4d00-8203-740f31d3bddb/scratchpad"],
+      "port": 8765
+    }
+  ]
+}
