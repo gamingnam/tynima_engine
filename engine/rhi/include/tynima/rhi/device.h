@@ -1,0 +1,305 @@
+#pragma once
+
+#include <cstddef>
+#include <cstdint>
+#include <memory>
+#include <optional>
+
+namespace tynima::platform {
+class Window;
+}
+
+namespace tynima::rhi {
+
+// ------------------------------------------------------------------ shaders
+
+enum class ShaderStage : std::uint8_t { Vertex, Fragment };
+
+// What a backend consumes. The device tells you which one it wants. Metal
+// accepts MSL *source* and compiles it at runtime, which is what lets Phase 0
+// run without the Xcode shader toolchain.
+enum class ShaderFormat : std::uint8_t { Msl, SpirV, Dxil };
+const char* shader_format_name(ShaderFormat format) noexcept;
+
+struct ShaderDesc {
+    ShaderStage stage = ShaderStage::Vertex;
+    ShaderFormat format = ShaderFormat::Msl;
+    const void* code = nullptr; // MSL: source text (no terminator needed); otherwise bytecode
+    std::size_t code_size = 0;
+    const char* entry_point = "main";
+    std::uint32_t num_uniform_buffers = 0; // pushed with RenderPass::push_*_uniforms, slot n = [[buffer(n)]] in MSL
+    std::uint32_t num_samplers = 0;
+};
+
+// ---------------------------------------------------------------- resources
+
+// Opaque GPU objects, owned by the Device that created them. Phase 2 turns
+// these raw pointers into generational handles.
+struct Shader;
+struct GraphicsPipeline;
+struct Buffer;
+struct Texture;
+struct Sampler;
+
+enum class BufferUsage : std::uint8_t { Vertex, Index };
+
+struct BufferDesc {
+    BufferUsage usage = BufferUsage::Vertex;
+    std::uint32_t size = 0; // bytes
+};
+
+// Rgba8Srgb is the same bytes as Rgba8Unorm, but the GPU decodes sRGB to
+// linear when sampling — the right format for color textures authored for
+// the eye (base color, emissive); data textures (normals, roughness) stay Unorm.
+enum class TextureFormat : std::uint8_t { Rgba8Unorm, Rgba8Srgb, Depth32Float, Depth24Stencil8, Depth16 };
+const char* texture_format_name(TextureFormat format) noexcept;
+[[nodiscard]] constexpr bool is_depth_format(TextureFormat format) noexcept {
+    return format == TextureFormat::Depth32Float || format == TextureFormat::Depth24Stencil8 ||
+           format == TextureFormat::Depth16;
+}
+// Bytes per pixel for the color formats (0 for depth: never uploaded from the CPU).
+[[nodiscard]] constexpr std::uint32_t bytes_per_pixel(TextureFormat format) noexcept {
+    return format == TextureFormat::Rgba8Unorm || format == TextureFormat::Rgba8Srgb ? 4 : 0;
+}
+// Levels in a full mip chain down to 1x1.
+[[nodiscard]] std::uint32_t mip_level_count(std::uint32_t width, std::uint32_t height) noexcept;
+
+// Bit flags. Default picks Sampled for color formats and DepthStencilTarget
+// for depth formats. GPU mipmap generation needs ColorTarget on every backend.
+enum class TextureUsage : std::uint8_t { Default = 0, Sampled = 1, ColorTarget = 2, DepthStencilTarget = 4 };
+[[nodiscard]] constexpr TextureUsage operator|(TextureUsage a, TextureUsage b) noexcept {
+    return static_cast<TextureUsage>(static_cast<std::uint8_t>(a) | static_cast<std::uint8_t>(b));
+}
+[[nodiscard]] constexpr bool has_usage(TextureUsage flags, TextureUsage bit) noexcept {
+    return (static_cast<std::uint8_t>(flags) & static_cast<std::uint8_t>(bit)) != 0;
+}
+
+struct TextureDesc {
+    TextureFormat format = TextureFormat::Rgba8Unorm;
+    std::uint32_t width = 0;
+    std::uint32_t height = 0;
+    std::uint32_t mip_levels = 1; // 0 = full chain
+    TextureUsage usage = TextureUsage::Default;
+};
+
+struct Extent2D {
+    std::uint32_t width = 0;
+    std::uint32_t height = 0;
+};
+
+enum class Filter : std::uint8_t { Nearest, Linear };
+enum class AddressMode : std::uint8_t { Repeat, MirroredRepeat, ClampToEdge };
+
+struct SamplerDesc {
+    Filter min_filter = Filter::Linear;
+    Filter mag_filter = Filter::Linear;
+    Filter mip_filter = Filter::Linear;
+    AddressMode address_u = AddressMode::Repeat;
+    AddressMode address_v = AddressMode::Repeat;
+    float max_anisotropy = 1.0f; // 1 = off; 8-16 is what a material sampler wants
+};
+
+// ---------------------------------------------------------------- pipelines
+
+enum class PrimitiveTopology : std::uint8_t { TriangleList, TriangleStrip, LineList };
+enum class VertexFormat : std::uint8_t { Float2, Float3, Float4 };
+enum class CullMode : std::uint8_t { None, Back, Front };
+enum class CompareOp : std::uint8_t { Never, Less, Equal, LessEqual, Greater, NotEqual, GreaterEqual, Always };
+enum class IndexType : std::uint8_t { Uint16, Uint32 };
+
+// One vertex attribute; `location` is [[attribute(n)]] in MSL.
+struct VertexAttribute {
+    std::uint32_t location = 0;
+    VertexFormat format = VertexFormat::Float3;
+    std::uint32_t offset = 0; // bytes from the start of the vertex
+};
+
+// One interleaved vertex buffer at slot 0. A view: the attribute array must
+// outlive the pipeline creation call only.
+struct VertexLayout {
+    std::uint32_t stride = 0; // bytes per vertex; 0 means no vertex buffer
+    const VertexAttribute* attributes = nullptr;
+    std::uint32_t attribute_count = 0;
+};
+
+// Reverse-Z by default: GREATER passes what is nearer, and the depth target
+// is cleared to 0. See math/transform.h for the matching projection.
+struct DepthState {
+    bool test = false;
+    bool write = false;
+    CompareOp compare = CompareOp::Greater;
+};
+
+// The only render target is the swapchain (its format comes from the window)
+// plus, optionally, a depth texture in the device's preferred depth format.
+struct GraphicsPipelineDesc {
+    Shader* vertex_shader = nullptr;
+    Shader* fragment_shader = nullptr;
+    PrimitiveTopology topology = PrimitiveTopology::TriangleList;
+    VertexLayout vertex_layout{};
+    CullMode cull = CullMode::None; // front faces are counter-clockwise, as in glTF
+    DepthState depth{};
+    bool has_depth_target = false;
+};
+
+struct ClearColor {
+    float r = 0.0f;
+    float g = 0.0f;
+    float b = 0.0f;
+    float a = 1.0f;
+};
+
+// ---------------------------------------------------------------- recording
+
+// A render pass that targets the swapchain image. end() closes it; the
+// destructor closes it if you forget.
+class RenderPass {
+public:
+    RenderPass(RenderPass&& other) noexcept;
+    RenderPass& operator=(RenderPass&& other) noexcept;
+    RenderPass(const RenderPass&) = delete;
+    RenderPass& operator=(const RenderPass&) = delete;
+    ~RenderPass();
+
+    void bind_pipeline(GraphicsPipeline& pipeline) noexcept;
+    void bind_vertex_buffer(Buffer& buffer, std::uint32_t offset = 0) noexcept;
+    void bind_index_buffer(Buffer& buffer, IndexType type, std::uint32_t offset = 0) noexcept;
+    // Slot n is [[texture(n)]] and [[sampler(n)]] in the fragment shader; the
+    // shader's ShaderDesc::num_samplers must cover it.
+    void bind_fragment_texture(std::uint32_t slot, Texture& texture, Sampler& sampler) noexcept;
+
+    // Uniform data for the next draws; `size` bytes are copied immediately.
+    // Slot n is [[buffer(n)]] in MSL. Keep structs 16-byte aligned like the shader expects.
+    void push_vertex_uniforms(std::uint32_t slot, const void* data, std::uint32_t size) noexcept;
+    void push_fragment_uniforms(std::uint32_t slot, const void* data, std::uint32_t size) noexcept;
+
+    void draw(std::uint32_t vertex_count, std::uint32_t instance_count = 1) noexcept;
+    void draw_indexed(std::uint32_t index_count, std::uint32_t first_index = 0, std::int32_t vertex_offset = 0,
+                      std::uint32_t instance_count = 1) noexcept;
+    void end() noexcept;
+
+private:
+    friend class Frame;
+    RenderPass(void* command_buffer, void* pass) noexcept : command_buffer_(command_buffer), pass_(pass) {}
+    void* command_buffer_; // SDL_GPUCommandBuffer*, not owned
+    void* pass_;           // SDL_GPURenderPass*
+};
+
+// One frame's command buffer and, when the window is visible, its swapchain
+// image. Must end with submit(); the destructor submits if you forget.
+class Frame {
+public:
+    Frame(Frame&& other) noexcept;
+    Frame& operator=(Frame&& other) noexcept;
+    Frame(const Frame&) = delete;
+    Frame& operator=(const Frame&) = delete;
+    ~Frame();
+
+    // False while the window is minimized: nothing to draw to this frame, but
+    // submit() is still required.
+    [[nodiscard]] bool has_swapchain_image() const noexcept { return swapchain_texture_ != nullptr; }
+    [[nodiscard]] std::uint32_t width() const noexcept { return width_; }   // pixels
+    [[nodiscard]] std::uint32_t height() const noexcept { return height_; } // pixels
+
+    // Begins a pass that clears the swapchain image and, if given, the depth
+    // texture (which must match the swapchain size). nullopt when there is no
+    // image. Depth contents are discarded after the pass: they are never read
+    // back, which is what lets a tile-based GPU keep them on-chip.
+    [[nodiscard]] std::optional<RenderPass> begin_swapchain_pass(const ClearColor& clear, Texture* depth = nullptr,
+                                                                 float depth_clear = 0.0f) noexcept;
+    void submit() noexcept;
+
+private:
+    friend class Device;
+    Frame(void* command_buffer, void* swapchain_texture, std::uint32_t width, std::uint32_t height) noexcept;
+    void* command_buffer_;    // SDL_GPUCommandBuffer*
+    void* swapchain_texture_; // SDL_GPUTexture*, not owned
+    std::uint32_t width_;
+    std::uint32_t height_;
+};
+
+// ------------------------------------------------------------------- device
+
+struct DeviceDesc {
+    bool debug = false; // validation layers; slow, loud, and worth it in Debug builds
+    bool vsync = true;
+    // An sRGB-encoded swapchain: shaders write linear light and the display
+    // encoding happens in hardware. Falls back to a plain SDR swapchain where
+    // unsupported — check swapchain_is_linear() and encode in the shader then.
+    bool linear_swapchain = true;
+};
+
+class Device {
+public:
+    // Creates a device with no window attached — enough to compile shaders
+    // and upload buffers, which is how tests exercise the GPU path headless.
+    // nullptr on failure; platform::last_error() says why. Fails where no
+    // backend consumes the shader formats we can supply: until SDL_shadercross
+    // joins the build, that means Windows.
+    [[nodiscard]] static std::unique_ptr<Device> create(const DeviceDesc& desc = {});
+    ~Device();
+    Device(const Device&) = delete;
+    Device& operator=(const Device&) = delete;
+
+    // Claims the window for presentation. Required before begin_frame() and
+    // before creating pipelines (they target the swapchain format). Fails on
+    // a headless window: there is no surface to present to.
+    [[nodiscard]] bool attach_window(platform::Window& window) noexcept;
+
+    [[nodiscard]] const char* backend_name() const noexcept; // "metal", "vulkan", "direct3d12"
+    [[nodiscard]] ShaderFormat shader_format() const noexcept;
+    // The best depth format this GPU supports as a render target.
+    [[nodiscard]] TextureFormat preferred_depth_format() const noexcept;
+    // True once a window is attached with an sRGB-encoded swapchain.
+    [[nodiscard]] bool swapchain_is_linear() const noexcept { return swapchain_linear_; }
+
+    [[nodiscard]] Shader* create_shader(const ShaderDesc& desc) noexcept;
+    void destroy_shader(Shader* shader) noexcept;
+
+    // Shaders may be destroyed as soon as the pipeline exists.
+    [[nodiscard]] GraphicsPipeline* create_graphics_pipeline(const GraphicsPipelineDesc& desc) noexcept;
+    void destroy_graphics_pipeline(GraphicsPipeline* pipeline) noexcept;
+
+    [[nodiscard]] Buffer* create_buffer(const BufferDesc& desc) noexcept;
+    // Copies `size` bytes into `buffer` at `offset` and waits for the copy:
+    // for loading, not for per-frame streaming.
+    [[nodiscard]] bool upload_buffer(Buffer& buffer, const void* data, std::uint32_t size,
+                                     std::uint32_t offset = 0) noexcept;
+    [[nodiscard]] Buffer* create_buffer_with_data(BufferUsage usage, const void* data, std::uint32_t size) noexcept;
+    void destroy_buffer(Buffer* buffer) noexcept;
+
+    [[nodiscard]] Texture* create_texture(const TextureDesc& desc) noexcept;
+    [[nodiscard]] Extent2D texture_extent(const Texture& texture) const noexcept;
+    // Uploads tightly packed pixels for one mip level and waits for the copy.
+    // `size` must equal width * height * bytes_per_pixel at that level.
+    [[nodiscard]] bool upload_texture(Texture& texture, const void* pixels, std::uint32_t size,
+                                      std::uint32_t mip_level = 0) noexcept;
+    // Fills levels 1..n from level 0 on the GPU and waits. The texture needs
+    // more than one level and ColorTarget usage.
+    [[nodiscard]] bool generate_mipmaps(Texture& texture) noexcept;
+    // A sampled color texture with a full mip chain: created, uploaded, mipmapped.
+    [[nodiscard]] Texture* create_texture_with_data(TextureFormat format, std::uint32_t width, std::uint32_t height,
+                                                    const void* pixels, std::uint32_t size,
+                                                    bool mipmaps = true) noexcept;
+    void destroy_texture(Texture* texture) noexcept;
+
+    [[nodiscard]] Sampler* create_sampler(const SamplerDesc& desc) noexcept;
+    void destroy_sampler(Sampler* sampler) noexcept;
+
+    // Acquires this frame's command buffer and swapchain image; with vsync on
+    // this is where the loop waits for the display. nullopt on error.
+    [[nodiscard]] std::optional<Frame> begin_frame() noexcept;
+
+private:
+    Device(void* device, bool vsync, bool linear_swapchain) noexcept
+        : device_(device), vsync_(vsync), want_linear_swapchain_(linear_swapchain) {}
+    [[nodiscard]] bool run_copy_and_wait(void* transfer, void* target, std::uint32_t size, std::uint32_t level_or_offset,
+                                         Extent2D extent, bool is_texture) noexcept;
+    void* device_;           // SDL_GPUDevice*
+    void* window_ = nullptr; // SDL_Window*, once attached
+    bool vsync_;
+    bool want_linear_swapchain_;
+    bool swapchain_linear_ = false;
+};
+
+} // namespace tynima::rhi

@@ -22,6 +22,7 @@ option(TYNIMA_BUILD_EDITOR       "Build the editor"                       ON)
 option(TYNIMA_BUILD_APPS         "Build apps/ (the sandbox)"              ON)
 option(TYNIMA_FETCH_SDL3         "Fetch and build SDL3 with FetchContent" ON)
 option(TYNIMA_WARNINGS_AS_ERRORS "Treat compiler warnings as errors"      OFF)
+option(TYNIMA_PROFILE            "Compile in Tracy instrumentation"       ON)
 
 if(TYNIMA_BUILD_TESTS)
   enable_testing()

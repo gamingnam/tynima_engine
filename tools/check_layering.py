@@ -17,6 +17,8 @@ checks every C/C++ source under the module against four rules:
   3. `editor` may depend on `sdk` and nothing else — the editor is a client
      of the public API with no special privileges.
   4. Every source file must live inside a declared module.
+  5. Third-party headers with a designated home stay there: SDL3, Tracy,
+     cgltf and stb may be included only by the modules listed in THIRD_PARTY below.
 
 Usage:
     python3 tools/check_layering.py            # check, exit 1 on violations
@@ -41,9 +43,14 @@ SCAN_ROOTS = ["engine", "sdk", "editor", "apps"]
 
 SOURCE_SUFFIXES = {".h", ".hpp", ".inl", ".c", ".cc", ".cpp", ".cxx", ".m", ".mm"}
 
+# Include path prefix (a directory with its slash, or a bare header name) ->
+# the modules allowed to include it. Everything else goes through those.
+THIRD_PARTY = {"SDL3/": {"platform", "rhi"}, "tracy/": {"core"}, "cgltf.h": {"assets"}, "stb_": {"assets"}}
+
 DECLARATION_RE = re.compile(r"tynima_add_(module|app)\s*\(\s*NAME\s+(\w+)(.*?)\)", re.S)
 # <tynima/core/version.h>, "tynima/rhi/device.h", or the C ABI header <tynima.h>.
 INCLUDE_RE = re.compile(r'^\s*#\s*include\s*[<"](tynima\.h|tynima/([\w-]+)/[^>"]*)[>"]', re.M)
+THIRD_PARTY_RE = re.compile(r'^\s*#\s*include\s*[<"](' + "|".join(map(re.escape, THIRD_PARTY)) + r')', re.M)
 
 
 @dataclass
@@ -142,6 +149,12 @@ def check_sources(root: Path, modules: dict[str, Module]) -> list[Violation]:
                 continue
             allowed = {module.name, *module.depends}
             text = path.read_text(encoding="utf-8", errors="replace")
+            for match in THIRD_PARTY_RE.finditer(text):
+                prefix = match.group(1)
+                if module.name not in THIRD_PARTY[prefix]:
+                    line = text.count("\n", 0, match.start()) + 1
+                    homes = ", ".join(sorted(THIRD_PARTY[prefix]))
+                    violations.append(Violation(path, line, f"'{module.name}' includes {prefix.rstrip('/')} directly; only {homes} may — use that module's wrapper instead"))
             for match in INCLUDE_RE.finditer(text):
                 included = "sdk" if match.group(1) == "tynima.h" else match.group(2)
                 if included in allowed:
