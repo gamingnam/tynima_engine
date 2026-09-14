@@ -78,6 +78,14 @@ TEST_CASE("glTF import bakes node transforms and merges primitives") {
     // Bounds span both baked primitives.
     CHECK(mesh.bounds_min == Vec3{0.0f, 0.0f, 0.0f});
     CHECK(mesh.bounds_max == Vec3{2.0f, 3.0f, 3.0f});
+
+    // Neither primitive carries TANGENT, so frames are computed: the quad's
+    // u runs along +x with right-handed frames; the triangle has no UVs and
+    // still gets a unit tangent perpendicular to its normal.
+    CHECK(approx_equal(mesh.vertices[0].tangent.xyz(), Vec3::unit_x()));
+    CHECK(mesh.vertices[0].tangent.w == 1.0f);
+    CHECK(length(mesh.vertices[4].tangent.xyz()) == doctest::Approx(1.0f));
+    CHECK(dot(mesh.vertices[4].tangent.xyz(), mesh.vertices[4].normal) == doctest::Approx(0.0f));
 }
 
 TEST_CASE("glTF import carries materials and decodes their images") {

@@ -4,7 +4,9 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <initializer_list>
 #include <limits>
+#include <vector>
 
 namespace tynima::render {
 
@@ -13,8 +15,9 @@ const rhi::VertexLayout& vertex_layout() noexcept {
         {0, rhi::VertexFormat::Float3, offsetof(Vertex, position)},
         {1, rhi::VertexFormat::Float3, offsetof(Vertex, normal)},
         {2, rhi::VertexFormat::Float2, offsetof(Vertex, uv)},
+        {3, rhi::VertexFormat::Float4, offsetof(Vertex, tangent)},
     };
-    static const rhi::VertexLayout layout{sizeof(Vertex), attributes, 3};
+    static const rhi::VertexLayout layout{sizeof(Vertex), attributes, 4};
     return layout;
 }
 
@@ -38,6 +41,55 @@ void MeshData::compute_normals(std::uint32_t first_index, std::uint32_t index_co
     for (std::size_t i = begin; i < end; ++i) {
         Vertex& v = vertices[indices[i]];
         v.normal = math::normalize(v.normal);
+    }
+}
+
+void MeshData::compute_tangents(std::uint32_t first_index, std::uint32_t index_count) {
+    const std::size_t begin = first_index;
+    const std::size_t end = index_count == 0xFFFFFFFFu ? indices.size() : std::min<std::size_t>(indices.size(), begin + index_count);
+
+    // Lengyel's method: per triangle, solve the 2x2 system that maps UV
+    // deltas to position deltas, giving the directions along which u and v
+    // increase; accumulate per vertex, then orthogonalize against the normal.
+    std::vector<math::Vec3> tan_u(vertices.size(), math::Vec3::zero());
+    std::vector<math::Vec3> tan_v(vertices.size(), math::Vec3::zero());
+    for (std::size_t i = begin; i + 2 < end; i += 3) {
+        const std::uint32_t i0 = indices[i], i1 = indices[i + 1], i2 = indices[i + 2];
+        const Vertex& v0 = vertices[i0];
+        const Vertex& v1 = vertices[i1];
+        const Vertex& v2 = vertices[i2];
+        const math::Vec3 e1 = v1.position - v0.position;
+        const math::Vec3 e2 = v2.position - v0.position;
+        const math::Vec2 d1 = v1.uv - v0.uv;
+        const math::Vec2 d2 = v2.uv - v0.uv;
+        const float det = d1.x * d2.y - d2.x * d1.y;
+        if (math::approx_equal(det, 0.0f, 1e-12f)) {
+            continue; // degenerate UVs: this triangle says nothing about the frame
+        }
+        const float r = 1.0f / det;
+        const math::Vec3 sdir = (e1 * d2.y - e2 * d1.y) * r;
+        const math::Vec3 tdir = (e2 * d1.x - e1 * d2.x) * r;
+        for (const std::uint32_t idx : {i0, i1, i2}) {
+            tan_u[idx] += sdir;
+            tan_v[idx] += tdir;
+        }
+    }
+    for (std::size_t i = begin; i < end; ++i) {
+        const std::uint32_t idx = indices[i];
+        Vertex& v = vertices[idx];
+        const math::Vec3 n = v.normal;
+        math::Vec3 t = tan_u[idx] - n * math::dot(n, tan_u[idx]); // Gram-Schmidt against the normal
+        float w = 1.0f;
+        if (math::length_squared(t) < 1e-12f) {
+            // No usable UV information: any perpendicular will do.
+            t = math::cross(n, math::Vec3::unit_x());
+            if (math::length_squared(t) < 1e-6f) {
+                t = math::cross(n, math::Vec3::unit_y());
+            }
+        } else {
+            w = math::dot(math::cross(n, t), tan_v[idx]) < 0.0f ? -1.0f : 1.0f;
+        }
+        v.tangent = {math::normalize(t), w};
     }
 }
 

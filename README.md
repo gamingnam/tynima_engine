@@ -50,9 +50,9 @@ draws it with a reverse-Z depth buffer through SDL3 GPU with its Metal shaders
 compiled at runtime — sRGB textures sampled through sRGB formats, lighting in
 linear, an sRGB-encoded swapchain on the way out — and lets you fly around it: hold the right mouse button to look, W/A/S/D to move, Q/E
 to descend and climb, Shift to run, Escape to quit. `1`/`2`/`3` switch between
-unlit, Blinn-Phong and Cook-Torrance shading; `N`/`M`/`O` show normals,
-metallic/roughness and occlusion; `T` toggles tonemapping; the arrow keys move
-the light. `--model path.glb` loads
+unlit, Blinn-Phong and Cook-Torrance shading; `N`/`M`/`O`/`V`/`B` show the
+mapped normals, metallic/roughness, occlusion, vertex normals and tangents;
+`T` toggles tonemapping; the arrow keys move the light. `--model path.glb` loads
 something else. `--headless --frames N` runs the same loop with no window and
 no GPU (the model still loads), which is what the `sandbox_headless` CTest
 does on CI.

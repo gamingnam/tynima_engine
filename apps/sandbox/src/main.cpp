@@ -87,6 +87,7 @@ struct VertexIn {
     float3 position [[attribute(0)]];
     float3 normal   [[attribute(1)]];
     float2 uv       [[attribute(2)]];
+    float4 tangent  [[attribute(3)]]; // xyz along +u, w = handedness
 };
 
 struct Uniforms {
@@ -98,6 +99,7 @@ struct VSOut {
     float4 position [[position]];
     float3 world_position;
     float3 world_normal;
+    float4 world_tangent;
     float2 uv;
 };
 
@@ -107,6 +109,7 @@ vertex VSOut vs_main(VertexIn in [[stage_in]], constant Uniforms& u [[buffer(0)]
     out.position = u.mvp * float4(in.position, 1.0);
     out.world_position = world.xyz;
     out.world_normal = (u.model * float4(in.normal, 0.0)).xyz;
+    out.world_tangent = float4((u.model * float4(in.tangent.xyz, 0.0)).xyz, in.tangent.w);
     out.uv = in.uv;
     return out;
 }
@@ -120,7 +123,7 @@ struct FrameUniforms {
 
 struct MaterialUniforms {
     float4 base_color_factor;
-    float4 factors;         // x: metallic, y: roughness, z: occlusion strength
+    float4 factors;         // x: metallic, y: roughness, z: occlusion strength, w: normal scale
     float4 emissive_factor; // rgb
 };
 
@@ -158,6 +161,7 @@ fragment float4 fs_main(VSOut in [[stage_in]],
                         texture2d<float> metallic_roughness_map [[texture(1)]],
                         texture2d<float> occlusion_map [[texture(2)]],
                         texture2d<float> emissive_map [[texture(3)]],
+                        texture2d<float> normal_map [[texture(4)]],
                         sampler map_sampler [[sampler(0)]],
                         constant FrameUniforms& frame [[buffer(0)]],
                         constant MaterialUniforms& m [[buffer(1)]]) {
@@ -168,7 +172,16 @@ fragment float4 fs_main(VSOut in [[stage_in]],
     float occlusion = mix(1.0, occlusion_map.sample(map_sampler, in.uv).r, m.factors.z);
     float3 emissive = emissive_map.sample(map_sampler, in.uv).rgb * m.emissive_factor.rgb;
 
-    float3 n = normalize(in.world_normal);
+    // Tangent frame: re-orthogonalize the interpolated tangent against the
+    // interpolated normal, then the bitangent follows from the handedness.
+    float3 geometric_n = normalize(in.world_normal);
+    float3 t = in.world_tangent.xyz;
+    t = normalize(t - geometric_n * dot(geometric_n, t));
+    float3 b = cross(geometric_n, t) * (in.world_tangent.w < 0.0 ? -1.0 : 1.0);
+    float3 nm = normal_map.sample(map_sampler, in.uv).xyz * 2.0 - 1.0; // tangent space, +z straight up
+    nm.xy *= m.factors.w;
+    float3 n = normalize(t * nm.x + b * nm.y + geometric_n * nm.z);
+
     float3 v = normalize(frame.camera_position.xyz - in.world_position);
     float3 l = normalize(frame.light_direction.xyz);
     float3 h = normalize(l + v);
@@ -188,6 +201,10 @@ fragment float4 fs_main(VSOut in [[stage_in]],
         color = float3(metallic, roughness, 0.0);
     } else if (debug_view == 3) {
         color = float3(occlusion);
+    } else if (debug_view == 4) {
+        color = geometric_n * 0.5 + 0.5;
+    } else if (debug_view == 5) {
+        color = t * 0.5 + 0.5;
     } else if (mode == 0) {
         color = base.rgb;
     } else if (mode == 1) {
@@ -278,7 +295,7 @@ static_assert(sizeof(MaterialUniforms) == 48, "matches the MSL MaterialUniforms 
 // What the keys toggle. Printed whenever it changes.
 struct Shading {
     int model = 2;      // 0 unlit, 1 Blinn-Phong, 2 Cook-Torrance
-    int debug_view = 0; // 0 lit, 1 normals, 2 metallic/roughness, 3 occlusion
+    int debug_view = 0; // 0 lit, 1 shading normals, 2 metallic/roughness, 3 occlusion, 4 vertex normals, 5 tangents
     bool tonemap = true;
     float light_azimuth = radians(35.0f);   // around +y, from +z
     float light_elevation = radians(50.0f); // above the horizon
@@ -292,9 +309,12 @@ struct Shading {
 
     void print() const {
         static constexpr const char* kModels[] = {"unlit", "blinn-phong", "cook-torrance"};
-        static constexpr const char* kViews[] = {"lit", "normals", "metallic (r) / roughness (g)", "occlusion"};
+        static constexpr const char* kViews[] = {"lit", "shading normals (mapped)", "metallic (r) / roughness (g)",
+                                                 "occlusion", "vertex normals", "tangents"};
+        float azimuth = std::fmod(degrees(light_azimuth), 360.0f);
+        if (azimuth < 0.0f) azimuth += 360.0f;
         std::printf("shading %s | view %s | tonemap %s | light az %.0f el %.0f\n", kModels[model], kViews[debug_view],
-                    tonemap ? "aces" : "off", static_cast<double>(degrees(light_azimuth)),
+                    tonemap ? "aces" : "off", static_cast<double>(azimuth),
                     static_cast<double>(degrees(light_elevation)));
     }
 
@@ -309,6 +329,8 @@ struct Shading {
         if (input.key_pressed(Key::N)) debug_view = debug_view == 1 ? 0 : 1;
         if (input.key_pressed(Key::M)) debug_view = debug_view == 2 ? 0 : 2;
         if (input.key_pressed(Key::O)) debug_view = debug_view == 3 ? 0 : 3;
+        if (input.key_pressed(Key::V)) debug_view = debug_view == 4 ? 0 : 4;
+        if (input.key_pressed(Key::B)) debug_view = debug_view == 5 ? 0 : 5;
         if (input.key_pressed(Key::Digit0)) debug_view = 0;
         if (input.key_pressed(Key::T)) tonemap = !tonemap;
         const float turn = radians(60.0f) * dt;
@@ -380,7 +402,7 @@ struct Renderer {
     rhi::GraphicsPipeline* mesh_pipeline = nullptr;
     rhi::GraphicsPipeline* triangle_pipeline = nullptr;
     rhi::Texture* depth = nullptr;
-    rhi::Texture* white = nullptr;
+    render::FallbackTextures fallbacks;
     rhi::Sampler* sampler = nullptr;
     render::Model model;
 
@@ -388,8 +410,8 @@ struct Renderer {
     Renderer(Renderer&& other) noexcept
         : device(std::move(other.device)), mesh_pipeline(std::exchange(other.mesh_pipeline, nullptr)),
           triangle_pipeline(std::exchange(other.triangle_pipeline, nullptr)), depth(std::exchange(other.depth, nullptr)),
-          white(std::exchange(other.white, nullptr)), sampler(std::exchange(other.sampler, nullptr)),
-          model(std::exchange(other.model, render::Model{})) {}
+          fallbacks(std::exchange(other.fallbacks, render::FallbackTextures{})),
+          sampler(std::exchange(other.sampler, nullptr)), model(std::exchange(other.model, render::Model{})) {}
     Renderer& operator=(Renderer&&) = delete;
     ~Renderer() { destroy(); }
 
@@ -415,12 +437,12 @@ struct Renderer {
         if (device != nullptr) {
             render::destroy_model(*device, model);
             device->destroy_sampler(sampler);
-            device->destroy_texture(white);
+            render::destroy_fallback_textures(*device, fallbacks);
             device->destroy_graphics_pipeline(mesh_pipeline);
             device->destroy_graphics_pipeline(triangle_pipeline);
             device->destroy_texture(depth);
             mesh_pipeline = triangle_pipeline = nullptr;
-            depth = white = nullptr;
+            depth = nullptr;
             sampler = nullptr;
             device.reset();
         }
@@ -487,21 +509,20 @@ Renderer create_renderer(platform::Window& window, const render::ModelData* mode
     mesh_desc.cull = rhi::CullMode::Back;
     mesh_desc.depth = {.test = true, .write = true, .compare = rhi::CompareOp::Greater}; // reverse-Z
     mesh_desc.has_depth_target = true;
-    r.mesh_pipeline = make_pipeline(*r.device, kMeshMsl, mesh_desc, 1, 2, 4);
+    r.mesh_pipeline = make_pipeline(*r.device, kMeshMsl, mesh_desc, 1, 2, 5);
 
     rhi::GraphicsPipelineDesc triangle_desc;
     triangle_desc.has_depth_target = true; // same pass, so the same targets, even with the test off
     r.triangle_pipeline = make_pipeline(*r.device, kTriangleMsl, triangle_desc, 0, 0, 0);
 
-    r.white = render::create_white_texture(*r.device);
     r.sampler = r.device->create_sampler({.max_anisotropy = 8.0f});
-    if (r.white == nullptr || r.sampler == nullptr) {
-        std::fprintf(stderr, "gpu     default texture or sampler failed: %s\n", platform::last_error());
+    if (!render::create_fallback_textures(*r.device, r.fallbacks) || r.sampler == nullptr) {
+        std::fprintf(stderr, "gpu     fallback textures or sampler failed: %s\n", platform::last_error());
         return r;
     }
     if (model_data != nullptr) {
         const double t0 = platform::now_seconds();
-        if (!render::upload_model(*r.device, *model_data, *r.white, r.model)) {
+        if (!render::upload_model(*r.device, *model_data, r.fallbacks, r.model)) {
             std::fprintf(stderr, "gpu     model upload failed: %s\n", platform::last_error());
         } else {
             std::size_t uploaded = 0;
@@ -572,7 +593,7 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "model   %s — showing the triangle instead\n", import_error.c_str());
     }
     std::printf("controls right-drag looks, WASD/QE move, Shift runs, Escape quits\n"
-                "        1/2/3 unlit / Blinn-Phong / Cook-Torrance, N/M/O debug views, T tonemap, arrows move the light\n");
+                "        1/2/3 unlit / Blinn-Phong / Cook-Torrance, N/M/O/V/B debug views, T tonemap, arrows move the light\n");
 
     Renderer renderer = options.headless ? Renderer{} : create_renderer(*window, has_model ? &model_data : nullptr);
     bool reported_swapchain = false;
@@ -652,12 +673,14 @@ int main(int argc, char** argv) {
                                 const render::Material& material = renderer.model.materials[sub.material];
                                 const MaterialUniforms material_uniforms{
                                     material.base_color_factor,
-                                    {material.metallic_factor, material.roughness_factor, material.occlusion_strength, 0.0f},
+                                    {material.metallic_factor, material.roughness_factor, material.occlusion_strength,
+                                     material.normal_scale},
                                     {material.emissive_factor, 0.0f}};
                                 pass->bind_fragment_texture(0, *material.base_color, *renderer.sampler);
                                 pass->bind_fragment_texture(1, *material.metallic_roughness, *renderer.sampler);
                                 pass->bind_fragment_texture(2, *material.occlusion, *renderer.sampler);
                                 pass->bind_fragment_texture(3, *material.emissive, *renderer.sampler);
+                                pass->bind_fragment_texture(4, *material.normal, *renderer.sampler);
                                 pass->push_fragment_uniforms(1, &material_uniforms, sizeof(material_uniforms));
                                 pass->draw_indexed(sub.index_count, sub.first_index);
                             }

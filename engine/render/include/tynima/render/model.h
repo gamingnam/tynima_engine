@@ -70,14 +70,19 @@ struct Model {
     std::vector<rhi::Texture*> textures; // owned, one per ModelData::images entry (nullptr if it failed)
 };
 
-// Uploads the mesh and every image; materials without a base color map point
-// at `fallback_white`. false if the mesh fails (a failed image is a warning:
-// its slot stays nullptr and the material falls back).
-[[nodiscard]] bool upload_model(rhi::Device& device, const ModelData& data, rhi::Texture& fallback_white,
+// The device-wide fallback textures every Model borrows from.
+struct FallbackTextures {
+    rhi::Texture* white = nullptr;       // 1x1 (255,255,255,255): a missing map multiplies out to its factor
+    rhi::Texture* flat_normal = nullptr; // 1x1 (128,128,255,255): "straight up" in tangent space
+};
+[[nodiscard]] bool create_fallback_textures(rhi::Device& device, FallbackTextures& out) noexcept;
+void destroy_fallback_textures(rhi::Device& device, FallbackTextures& textures) noexcept;
+
+// Uploads the mesh and every image; a material's missing maps point at the
+// fallbacks. false if the mesh fails (a failed image is a warning: its slot
+// stays nullptr and the material falls back).
+[[nodiscard]] bool upload_model(rhi::Device& device, const ModelData& data, const FallbackTextures& fallbacks,
                                 Model& out) noexcept;
 void destroy_model(rhi::Device& device, Model& model) noexcept;
-
-// 1x1 opaque white, so an untextured material samples 1.0 and shows its factor.
-[[nodiscard]] rhi::Texture* create_white_texture(rhi::Device& device) noexcept;
 
 } // namespace tynima::render

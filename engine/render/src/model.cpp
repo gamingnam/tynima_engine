@@ -4,7 +4,7 @@
 
 namespace tynima::render {
 
-bool upload_model(rhi::Device& device, const ModelData& data, rhi::Texture& fallback_white, Model& out) noexcept {
+bool upload_model(rhi::Device& device, const ModelData& data, const FallbackTextures& fallbacks, Model& out) noexcept {
     TY_PROFILE_SCOPE_NAMED("render::upload_model");
     destroy_model(device, out);
     if (!upload_mesh(device, data.mesh, out.mesh)) {
@@ -22,33 +22,34 @@ bool upload_model(rhi::Device& device, const ModelData& data, rhi::Texture& fall
         out.textures.push_back(texture);
     }
 
-    auto texture_or_white = [&](std::int32_t index) -> rhi::Texture* {
+    auto texture_or = [&](std::int32_t index, rhi::Texture* fallback) -> rhi::Texture* {
         if (index >= 0 && static_cast<std::size_t>(index) < out.textures.size() && out.textures[index] != nullptr) {
             return out.textures[index];
         }
-        return &fallback_white;
+        return fallback;
     };
 
     out.materials.reserve(data.materials.size() + 1);
     for (const MaterialData& m : data.materials) {
         Material material;
         material.base_color_factor = m.base_color_factor;
-        material.base_color = texture_or_white(m.base_color_image);
+        material.base_color = texture_or(m.base_color_image, fallbacks.white);
         material.metallic_factor = m.metallic_factor;
         material.roughness_factor = m.roughness_factor;
-        material.metallic_roughness = texture_or_white(m.metallic_roughness_image);
-        material.normal = m.normal_image >= 0 ? texture_or_white(m.normal_image) : nullptr; // white is not a normal
+        material.metallic_roughness = texture_or(m.metallic_roughness_image, fallbacks.white);
+        material.normal = texture_or(m.normal_image, fallbacks.flat_normal);
         material.normal_scale = m.normal_scale;
-        material.occlusion = texture_or_white(m.occlusion_image);
+        material.occlusion = texture_or(m.occlusion_image, fallbacks.white);
         material.occlusion_strength = m.occlusion_strength;
         material.emissive_factor = m.emissive_factor;
-        material.emissive = texture_or_white(m.emissive_image);
+        material.emissive = texture_or(m.emissive_image, fallbacks.white);
         material.double_sided = m.double_sided;
         out.materials.push_back(material);
     }
     if (out.materials.empty()) {
         Material material;
-        material.base_color = material.metallic_roughness = material.occlusion = material.emissive = &fallback_white;
+        material.base_color = material.metallic_roughness = material.occlusion = material.emissive = fallbacks.white;
+        material.normal = fallbacks.flat_normal;
         material.metallic_factor = 0.0f; // an untextured, unspecified material reads as matte dielectric
         material.roughness_factor = 0.8f;
         out.materials.push_back(material);
@@ -70,9 +71,22 @@ void destroy_model(rhi::Device& device, Model& model) noexcept {
     model = Model{};
 }
 
-rhi::Texture* create_white_texture(rhi::Device& device) noexcept {
+bool create_fallback_textures(rhi::Device& device, FallbackTextures& out) noexcept {
     const std::uint8_t white[4] = {255, 255, 255, 255};
-    return device.create_texture_with_data(rhi::TextureFormat::Rgba8Unorm, 1, 1, white, sizeof(white), false);
+    const std::uint8_t flat[4] = {128, 128, 255, 255};
+    out.white = device.create_texture_with_data(rhi::TextureFormat::Rgba8Unorm, 1, 1, white, sizeof(white), false);
+    out.flat_normal = device.create_texture_with_data(rhi::TextureFormat::Rgba8Unorm, 1, 1, flat, sizeof(flat), false);
+    if (out.white == nullptr || out.flat_normal == nullptr) {
+        destroy_fallback_textures(device, out);
+        return false;
+    }
+    return true;
+}
+
+void destroy_fallback_textures(rhi::Device& device, FallbackTextures& textures) noexcept {
+    device.destroy_texture(textures.white);
+    device.destroy_texture(textures.flat_normal);
+    textures = FallbackTextures{};
 }
 
 } // namespace tynima::render

@@ -141,6 +141,10 @@ struct Importer {
         }
         const cgltf_accessor* normals = find_attribute(prim, cgltf_attribute_type_normal);
         const cgltf_accessor* uvs = find_attribute(prim, cgltf_attribute_type_texcoord, 0);
+        const cgltf_accessor* tangents = find_attribute(prim, cgltf_attribute_type_tangent);
+        if (tangents != nullptr && (tangents->type != cgltf_type_vec4 || tangents->count != positions->count)) {
+            tangents = nullptr;
+        }
         if (normals != nullptr && (normals->type != cgltf_type_vec3 || normals->count != positions->count)) {
             normals = nullptr; // malformed: recompute rather than fail
         }
@@ -198,6 +202,19 @@ struct Importer {
         const auto index_count = static_cast<std::uint32_t>(out.indices.size()) - first_index;
         if (normals == nullptr) {
             out.compute_normals(first_index, index_count);
+        }
+        if (tangents != nullptr) {
+            // Directions transform with the model matrix itself; only normals need the inverse transpose.
+            const math::Mat3 direction_matrix = world.upper3x3();
+            scratch.resize(vertex_count * 4);
+            cgltf_accessor_unpack_floats(tangents, scratch.data(), vertex_count * 4);
+            for (cgltf_size i = 0; i < vertex_count; ++i) {
+                const math::Vec3 t{scratch[i * 4], scratch[i * 4 + 1], scratch[i * 4 + 2]};
+                const float w = scratch[i * 4 + 3] < 0.0f ? -1.0f : 1.0f;
+                out.vertices[vertex_base + i].tangent = {math::normalize(direction_matrix * t), w};
+            }
+        } else {
+            out.compute_tangents(first_index, index_count);
         }
 
         render::Submesh sub;
