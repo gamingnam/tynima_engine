@@ -1,5 +1,6 @@
 #include <tynima/platform/platform.h>
 
+#include <tynima/core/memory.h>
 #include <tynima/core/version.h>
 
 #include "sdl.h"
@@ -14,6 +15,7 @@ bool init(const InitOptions& options) {
     if (g_initialized) {
         return true;
     }
+    TY_EXTERNAL_ALLOCATIONS();
     SDL_SetAppMetadata("Tynima", TYNIMA_VERSION_STRING, "dev.tynima.engine");
     if (options.headless) {
         SDL_SetHint(SDL_HINT_VIDEO_DRIVER, "dummy");
@@ -28,6 +30,7 @@ bool init(const InitOptions& options) {
 }
 
 void shutdown() noexcept {
+    TY_EXTERNAL_ALLOCATIONS();
     if (g_initialized) {
         SDL_Quit();
         g_initialized = false;

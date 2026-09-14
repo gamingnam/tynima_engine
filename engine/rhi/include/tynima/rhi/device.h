@@ -1,5 +1,7 @@
 #pragma once
 
+#include <tynima/core/handle.h>
+
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -10,6 +12,23 @@ class Window;
 }
 
 namespace tynima::rhi {
+
+// ------------------------------------------------------------------ handles
+
+// GPU objects are addressed by generational handles (see core/handle.h) and
+// owned by the Device that created them. A handle to a destroyed object
+// resolves to nothing: creation functions return the null handle on failure,
+// binds and uploads with a stale handle are refused (and assert in Debug).
+struct ShaderTag {};
+struct PipelineTag {};
+struct BufferTag {};
+struct TextureTag {};
+struct SamplerTag {};
+using ShaderHandle = core::Handle<ShaderTag>;
+using PipelineHandle = core::Handle<PipelineTag>;
+using BufferHandle = core::Handle<BufferTag>;
+using TextureHandle = core::Handle<TextureTag>;
+using SamplerHandle = core::Handle<SamplerTag>;
 
 // ------------------------------------------------------------------ shaders
 
@@ -32,14 +51,6 @@ struct ShaderDesc {
 };
 
 // ---------------------------------------------------------------- resources
-
-// Opaque GPU objects, owned by the Device that created them. Phase 2 turns
-// these raw pointers into generational handles.
-struct Shader;
-struct GraphicsPipeline;
-struct Buffer;
-struct Texture;
-struct Sampler;
 
 enum class BufferUsage : std::uint8_t { Vertex, Index };
 
@@ -133,8 +144,8 @@ struct DepthState {
 // The only render target is the swapchain (its format comes from the window)
 // plus, optionally, a depth texture in the device's preferred depth format.
 struct GraphicsPipelineDesc {
-    Shader* vertex_shader = nullptr;
-    Shader* fragment_shader = nullptr;
+    ShaderHandle vertex_shader;
+    ShaderHandle fragment_shader;
     PrimitiveTopology topology = PrimitiveTopology::TriangleList;
     VertexLayout vertex_layout{};
     CullMode cull = CullMode::None; // front faces are counter-clockwise, as in glTF
@@ -151,6 +162,8 @@ struct ClearColor {
 
 // ---------------------------------------------------------------- recording
 
+class Device;
+
 // A render pass that targets the swapchain image. end() closes it; the
 // destructor closes it if you forget.
 class RenderPass {
@@ -161,12 +174,12 @@ public:
     RenderPass& operator=(const RenderPass&) = delete;
     ~RenderPass();
 
-    void bind_pipeline(GraphicsPipeline& pipeline) noexcept;
-    void bind_vertex_buffer(Buffer& buffer, std::uint32_t offset = 0) noexcept;
-    void bind_index_buffer(Buffer& buffer, IndexType type, std::uint32_t offset = 0) noexcept;
+    void bind_pipeline(PipelineHandle pipeline) noexcept;
+    void bind_vertex_buffer(BufferHandle buffer, std::uint32_t offset = 0) noexcept;
+    void bind_index_buffer(BufferHandle buffer, IndexType type, std::uint32_t offset = 0) noexcept;
     // Slot n is [[texture(n)]] and [[sampler(n)]] in the fragment shader; the
     // shader's ShaderDesc::num_samplers must cover it.
-    void bind_fragment_texture(std::uint32_t slot, Texture& texture, Sampler& sampler) noexcept;
+    void bind_fragment_texture(std::uint32_t slot, TextureHandle texture, SamplerHandle sampler) noexcept;
 
     // Uniform data for the next draws; `size` bytes are copied immediately.
     // Slot n is [[buffer(n)]] in MSL. Keep structs 16-byte aligned like the shader expects.
@@ -180,7 +193,9 @@ public:
 
 private:
     friend class Frame;
-    RenderPass(void* command_buffer, void* pass) noexcept : command_buffer_(command_buffer), pass_(pass) {}
+    RenderPass(Device* device, void* command_buffer, void* pass) noexcept
+        : device_(device), command_buffer_(command_buffer), pass_(pass) {}
+    Device* device_;       // resolves handles; not owned
     void* command_buffer_; // SDL_GPUCommandBuffer*, not owned
     void* pass_;           // SDL_GPURenderPass*
 };
@@ -205,13 +220,15 @@ public:
     // texture (which must match the swapchain size). nullopt when there is no
     // image. Depth contents are discarded after the pass: they are never read
     // back, which is what lets a tile-based GPU keep them on-chip.
-    [[nodiscard]] std::optional<RenderPass> begin_swapchain_pass(const ClearColor& clear, Texture* depth = nullptr,
+    [[nodiscard]] std::optional<RenderPass> begin_swapchain_pass(const ClearColor& clear, TextureHandle depth = {},
                                                                  float depth_clear = 0.0f) noexcept;
     void submit() noexcept;
 
 private:
     friend class Device;
-    Frame(void* command_buffer, void* swapchain_texture, std::uint32_t width, std::uint32_t height) noexcept;
+    Frame(Device* device, void* command_buffer, void* swapchain_texture, std::uint32_t width,
+          std::uint32_t height) noexcept;
+    Device* device_;          // resolves handles; not owned
     void* command_buffer_;    // SDL_GPUCommandBuffer*
     void* swapchain_texture_; // SDL_GPUTexture*, not owned
     std::uint32_t width_;
@@ -227,6 +244,13 @@ struct DeviceDesc {
     // encoding happens in hardware. Falls back to a plain SDR swapchain where
     // unsupported — check swapchain_is_linear() and encode in the shader then.
     bool linear_swapchain = true;
+    // Resource budgets: pools of this many. Creation past a budget fails with
+    // the null handle rather than growing.
+    std::uint32_t max_shaders = 256;
+    std::uint32_t max_pipelines = 256;
+    std::uint32_t max_buffers = 4096;
+    std::uint32_t max_textures = 4096;
+    std::uint32_t max_samplers = 64;
 };
 
 class Device {
@@ -253,50 +277,68 @@ public:
     // True once a window is attached with an sRGB-encoded swapchain.
     [[nodiscard]] bool swapchain_is_linear() const noexcept { return swapchain_linear_; }
 
-    [[nodiscard]] Shader* create_shader(const ShaderDesc& desc) noexcept;
-    void destroy_shader(Shader* shader) noexcept;
+    // Handle validity: false for null handles and for anything destroyed.
+    [[nodiscard]] bool valid(ShaderHandle handle) const noexcept;
+    [[nodiscard]] bool valid(PipelineHandle handle) const noexcept;
+    [[nodiscard]] bool valid(BufferHandle handle) const noexcept;
+    [[nodiscard]] bool valid(TextureHandle handle) const noexcept;
+    [[nodiscard]] bool valid(SamplerHandle handle) const noexcept;
+
+    [[nodiscard]] ShaderHandle create_shader(const ShaderDesc& desc) noexcept;
+    void destroy_shader(ShaderHandle shader) noexcept;
 
     // Shaders may be destroyed as soon as the pipeline exists.
-    [[nodiscard]] GraphicsPipeline* create_graphics_pipeline(const GraphicsPipelineDesc& desc) noexcept;
-    void destroy_graphics_pipeline(GraphicsPipeline* pipeline) noexcept;
+    [[nodiscard]] PipelineHandle create_graphics_pipeline(const GraphicsPipelineDesc& desc) noexcept;
+    void destroy_graphics_pipeline(PipelineHandle pipeline) noexcept;
 
-    [[nodiscard]] Buffer* create_buffer(const BufferDesc& desc) noexcept;
+    [[nodiscard]] BufferHandle create_buffer(const BufferDesc& desc) noexcept;
     // Copies `size` bytes into `buffer` at `offset` and waits for the copy:
     // for loading, not for per-frame streaming.
-    [[nodiscard]] bool upload_buffer(Buffer& buffer, const void* data, std::uint32_t size,
+    [[nodiscard]] bool upload_buffer(BufferHandle buffer, const void* data, std::uint32_t size,
                                      std::uint32_t offset = 0) noexcept;
-    [[nodiscard]] Buffer* create_buffer_with_data(BufferUsage usage, const void* data, std::uint32_t size) noexcept;
-    void destroy_buffer(Buffer* buffer) noexcept;
+    [[nodiscard]] BufferHandle create_buffer_with_data(BufferUsage usage, const void* data,
+                                                       std::uint32_t size) noexcept;
+    void destroy_buffer(BufferHandle buffer) noexcept;
 
-    [[nodiscard]] Texture* create_texture(const TextureDesc& desc) noexcept;
-    [[nodiscard]] Extent2D texture_extent(const Texture& texture) const noexcept;
+    [[nodiscard]] TextureHandle create_texture(const TextureDesc& desc) noexcept;
+    // {0, 0} for an invalid handle.
+    [[nodiscard]] Extent2D texture_extent(TextureHandle texture) const noexcept;
     // Uploads tightly packed pixels for one mip level and waits for the copy.
     // `size` must equal width * height * bytes_per_pixel at that level.
-    [[nodiscard]] bool upload_texture(Texture& texture, const void* pixels, std::uint32_t size,
+    [[nodiscard]] bool upload_texture(TextureHandle texture, const void* pixels, std::uint32_t size,
                                       std::uint32_t mip_level = 0) noexcept;
     // Fills levels 1..n from level 0 on the GPU and waits. The texture needs
     // more than one level and ColorTarget usage.
-    [[nodiscard]] bool generate_mipmaps(Texture& texture) noexcept;
+    [[nodiscard]] bool generate_mipmaps(TextureHandle texture) noexcept;
     // A sampled color texture with a full mip chain: created, uploaded, mipmapped.
-    [[nodiscard]] Texture* create_texture_with_data(TextureFormat format, std::uint32_t width, std::uint32_t height,
-                                                    const void* pixels, std::uint32_t size,
-                                                    bool mipmaps = true) noexcept;
-    void destroy_texture(Texture* texture) noexcept;
+    [[nodiscard]] TextureHandle create_texture_with_data(TextureFormat format, std::uint32_t width,
+                                                         std::uint32_t height, const void* pixels,
+                                                         std::uint32_t size, bool mipmaps = true) noexcept;
+    void destroy_texture(TextureHandle texture) noexcept;
 
-    [[nodiscard]] Sampler* create_sampler(const SamplerDesc& desc) noexcept;
-    void destroy_sampler(Sampler* sampler) noexcept;
+    [[nodiscard]] SamplerHandle create_sampler(const SamplerDesc& desc) noexcept;
+    void destroy_sampler(SamplerHandle sampler) noexcept;
+
+    // Live objects per pool: a leak check, and a view of the budgets.
+    struct ResourceCounts {
+        std::uint32_t shaders = 0, pipelines = 0, buffers = 0, textures = 0, samplers = 0;
+    };
+    [[nodiscard]] ResourceCounts resource_counts() const noexcept;
 
     // Acquires this frame's command buffer and swapchain image; with vsync on
     // this is where the loop waits for the display. nullopt on error.
     [[nodiscard]] std::optional<Frame> begin_frame() noexcept;
 
 private:
-    Device(void* device, bool vsync, bool linear_swapchain) noexcept
-        : device_(device), vsync_(vsync), want_linear_swapchain_(linear_swapchain) {}
+    friend class Frame;
+    friend class RenderPass;
+    struct Pools; // the resource pools; complete in device.cpp
+    Device(void* device, const DeviceDesc& desc) noexcept;
     [[nodiscard]] bool run_copy_and_wait(void* transfer, void* target, std::uint32_t size, std::uint32_t level_or_offset,
                                          Extent2D extent, bool is_texture) noexcept;
     void* device_;           // SDL_GPUDevice*
     void* window_ = nullptr; // SDL_Window*, once attached
+    Pools* pools_;
     bool vsync_;
     bool want_linear_swapchain_;
     bool swapchain_linear_ = false;

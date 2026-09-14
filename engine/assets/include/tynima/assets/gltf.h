@@ -1,5 +1,6 @@
 #pragma once
 
+#include <tynima/core/jobs.h>
 #include <tynima/render/model.h>
 
 #include <cstddef>
@@ -15,10 +16,18 @@
 // cooker — a shipping build never parses glTF.
 namespace tynima::assets {
 
+struct ImportOptions {
+    // Decodes images in parallel when given; a file with several large
+    // textures loads several times faster.
+    core::JobSystem* jobs = nullptr;
+};
+
 // External buffers and images resolve relative to `path`.
-[[nodiscard]] bool import_gltf_file(const char* path, render::ModelData& out, std::string& error);
+[[nodiscard]] bool import_gltf_file(const char* path, render::ModelData& out, std::string& error,
+                                    const ImportOptions& options = {});
 
 // Only embedded buffers (GLB binary chunk, data: URIs) can be resolved.
-[[nodiscard]] bool import_gltf_memory(const void* data, std::size_t size, render::ModelData& out, std::string& error);
+[[nodiscard]] bool import_gltf_memory(const void* data, std::size_t size, render::ModelData& out, std::string& error,
+                                      const ImportOptions& options = {});
 
 } // namespace tynima::assets

@@ -1,12 +1,17 @@
-// Engine developer's playground. Phase 1: a glTF model through the importer
-// with its base color texture, a reverse-Z depth buffer, an sRGB swapchain,
-// and a fly camera. Falls back to Phase 0's triangle when there is no model.
+// Engine developer's playground. A grid of glTF models as entities in the
+// scene World, lit with Cook-Torrance, a reverse-Z depth buffer, an sRGB
+// swapchain, and a fly camera. Falls back to Phase 0's triangle when there is
+// no model.
 //
 //   tynima-sandbox [--headless] [--frames N] [--model path.glb]
 //
 // Controls: hold the right mouse button to look; W/A/S/D move, Q/E descend
 // and climb, Shift runs; Escape quits.
 #include <tynima/assets/gltf.h>
+#include <tynima/core/arena.h>
+#include <tynima/core/assert.h>
+#include <tynima/core/jobs.h>
+#include <tynima/core/memory.h>
 #include <tynima/core/profile.h>
 #include <tynima/core/version.h>
 #include <tynima/platform/events.h>
@@ -18,10 +23,17 @@
 #include <tynima/render/mesh.h>
 #include <tynima/render/model.h>
 #include <tynima/rhi/device.h>
+#include <tynima/scene/components.h>
+#include <tynima/scene/systems.h>
+#include <tynima/scene/world.h>
+#include <tynima/sdk/game_module.h>
+
+#include "spin.h"
 
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <limits>
 #include <cstdlib>
 #include <cstring>
 #include <memory>
@@ -33,9 +45,38 @@ namespace platform = tynima::platform;
 namespace rhi = tynima::rhi;
 namespace render = tynima::render;
 namespace assets = tynima::assets;
+namespace scene = tynima::scene;
 using namespace tynima::math;
 
 namespace {
+
+// Lays out a grid of the model, spaced by its footprint, with a spin that
+// varies across the grid. Returns the world-space bounds of the whole grid.
+void populate_grid(scene::World& world, const render::MeshData& mesh, int side, Vec3& bounds_min, Vec3& bounds_max) {
+    const Vec3 size = mesh.bounds_max - mesh.bounds_min;
+    const float spacing = std::max(size.x, size.z) * 1.8f;
+    const float half = static_cast<float>(side - 1) * 0.5f;
+    bounds_min = Vec3{std::numeric_limits<float>::max()};
+    bounds_max = Vec3{std::numeric_limits<float>::lowest()};
+    for (int z = 0; z < side; ++z) {
+        for (int x = 0; x < side; ++x) {
+            const Vec3 position{(static_cast<float>(x) - half) * spacing, 0.0f, (static_cast<float>(z) - half) * spacing};
+            const float spin = (static_cast<float>(x + z) - 2.0f * half) * 0.35f; // centre still, edges opposite ways
+            (void)world.create(scene::Transform{.position = position}, scene::LocalToWorld{},
+                               scene::MeshRenderer{.model = 0}, Spin{spin});
+            bounds_min = min(bounds_min, position + mesh.bounds_min);
+            bounds_max = max(bounds_max, position + mesh.bounds_max);
+        }
+    }
+}
+
+#ifndef TYNIMA_SANDBOX_GAME_MODULE
+#define TYNIMA_SANDBOX_GAME_MODULE ""
+#endif
+
+void game_log(const char* message) {
+    std::printf("game    %s\n", message);
+}
 
 #ifndef NDEBUG
 constexpr bool kGpuDebug = true; // Metal validation: catches API misuse loudly
@@ -399,34 +440,34 @@ struct FlyCamera {
 
 struct Renderer {
     std::unique_ptr<rhi::Device> device;
-    rhi::GraphicsPipeline* mesh_pipeline = nullptr;
-    rhi::GraphicsPipeline* triangle_pipeline = nullptr;
-    rhi::Texture* depth = nullptr;
+    rhi::PipelineHandle mesh_pipeline;
+    rhi::PipelineHandle triangle_pipeline;
+    rhi::TextureHandle depth;
     render::FallbackTextures fallbacks;
-    rhi::Sampler* sampler = nullptr;
+    rhi::SamplerHandle sampler;
     render::Model model;
 
     Renderer() = default;
     Renderer(Renderer&& other) noexcept
-        : device(std::move(other.device)), mesh_pipeline(std::exchange(other.mesh_pipeline, nullptr)),
-          triangle_pipeline(std::exchange(other.triangle_pipeline, nullptr)), depth(std::exchange(other.depth, nullptr)),
+        : device(std::move(other.device)), mesh_pipeline(std::exchange(other.mesh_pipeline, {})),
+          triangle_pipeline(std::exchange(other.triangle_pipeline, {})), depth(std::exchange(other.depth, {})),
           fallbacks(std::exchange(other.fallbacks, render::FallbackTextures{})),
-          sampler(std::exchange(other.sampler, nullptr)), model(std::exchange(other.model, render::Model{})) {}
+          sampler(std::exchange(other.sampler, {})), model(std::exchange(other.model, render::Model{})) {}
     Renderer& operator=(Renderer&&) = delete;
     ~Renderer() { destroy(); }
 
     // The depth texture tracks the swapchain size: recreate it when that changes.
-    rhi::Texture* depth_for(std::uint32_t width, std::uint32_t height) {
-        if (depth != nullptr) {
-            const rhi::Extent2D extent = device->texture_extent(*depth);
+    rhi::TextureHandle depth_for(std::uint32_t width, std::uint32_t height) {
+        if (depth) {
+            const rhi::Extent2D extent = device->texture_extent(depth);
             if (extent.width == width && extent.height == height) {
                 return depth;
             }
             device->destroy_texture(depth);
-            depth = nullptr;
+            depth = {};
         }
         depth = device->create_texture({.format = device->preferred_depth_format(), .width = width, .height = height});
-        if (depth == nullptr) {
+        if (!depth) {
             std::fprintf(stderr, "gpu     depth texture failed: %s\n", platform::last_error());
         }
         return depth;
@@ -441,17 +482,17 @@ struct Renderer {
             device->destroy_graphics_pipeline(mesh_pipeline);
             device->destroy_graphics_pipeline(triangle_pipeline);
             device->destroy_texture(depth);
-            mesh_pipeline = triangle_pipeline = nullptr;
-            depth = nullptr;
-            sampler = nullptr;
+            mesh_pipeline = triangle_pipeline = {};
+            depth = {};
+            sampler = {};
             device.reset();
         }
     }
 };
 
-rhi::GraphicsPipeline* make_pipeline(rhi::Device& device, const char* msl, const rhi::GraphicsPipelineDesc& base,
-                                     std::uint32_t vertex_uniforms, std::uint32_t fragment_uniforms,
-                                     std::uint32_t fragment_samplers) {
+rhi::PipelineHandle make_pipeline(rhi::Device& device, const char* msl, const rhi::GraphicsPipelineDesc& base,
+                                  std::uint32_t vertex_uniforms, std::uint32_t fragment_uniforms,
+                                  std::uint32_t fragment_samplers) {
     const rhi::ShaderDesc common{.format = rhi::ShaderFormat::Msl, .code = msl, .code_size = std::strlen(msl)};
     rhi::ShaderDesc vs_desc = common;
     vs_desc.stage = rhi::ShaderStage::Vertex;
@@ -463,16 +504,16 @@ rhi::GraphicsPipeline* make_pipeline(rhi::Device& device, const char* msl, const
     fs_desc.num_uniform_buffers = fragment_uniforms;
     fs_desc.num_samplers = fragment_samplers;
 
-    rhi::Shader* vs = device.create_shader(vs_desc);
-    rhi::Shader* fs = device.create_shader(fs_desc);
-    rhi::GraphicsPipeline* pipeline = nullptr;
-    if (vs != nullptr && fs != nullptr) {
+    const rhi::ShaderHandle vs = device.create_shader(vs_desc);
+    const rhi::ShaderHandle fs = device.create_shader(fs_desc);
+    rhi::PipelineHandle pipeline;
+    if (vs && fs) {
         rhi::GraphicsPipelineDesc desc = base;
         desc.vertex_shader = vs;
         desc.fragment_shader = fs;
         pipeline = device.create_graphics_pipeline(desc);
     }
-    if (pipeline == nullptr) {
+    if (!pipeline) {
         std::fprintf(stderr, "gpu     pipeline failed: %s\n", platform::last_error());
     }
     device.destroy_shader(vs); // the pipeline holds what it needs
@@ -516,7 +557,7 @@ Renderer create_renderer(platform::Window& window, const render::ModelData* mode
     r.triangle_pipeline = make_pipeline(*r.device, kTriangleMsl, triangle_desc, 0, 0, 0);
 
     r.sampler = r.device->create_sampler({.max_anisotropy = 8.0f});
-    if (!render::create_fallback_textures(*r.device, r.fallbacks) || r.sampler == nullptr) {
+    if (!render::create_fallback_textures(*r.device, r.fallbacks) || !r.sampler) {
         std::fprintf(stderr, "gpu     fallback textures or sampler failed: %s\n", platform::last_error());
         return r;
     }
@@ -526,8 +567,8 @@ Renderer create_renderer(platform::Window& window, const render::ModelData* mode
             std::fprintf(stderr, "gpu     model upload failed: %s\n", platform::last_error());
         } else {
             std::size_t uploaded = 0;
-            for (const rhi::Texture* t : r.model.textures) {
-                uploaded += t != nullptr ? 1 : 0;
+            for (const rhi::TextureHandle t : r.model.textures) {
+                uploaded += t ? 1 : 0;
             }
             std::printf("gpu     %zu of %zu textures uploaded with mipmaps in %.2f s\n", uploaded,
                         r.model.textures.size(), platform::now_seconds() - t0);
@@ -571,11 +612,16 @@ int main(int argc, char** argv) {
                                      ? "tracy instrumentation compiled in; connect the Tracy GUI to 127.0.0.1"
                                      : "off (TYNIMA_PROFILE=OFF)");
 
+    tynima::core::JobSystem jobs;
+    std::printf("jobs    %u worker thread(s) + main, for %u performance cores\n", jobs.worker_count(),
+                tynima::core::JobSystem::performance_core_count());
+
     // The model loads on the CPU in every mode, so the headless run covers the importer too.
     render::ModelData model_data;
     std::string import_error;
     const double import_start = platform::now_seconds();
-    const bool has_model = assets::import_gltf_file(options.model.c_str(), model_data, import_error);
+    const bool has_model =
+        assets::import_gltf_file(options.model.c_str(), model_data, import_error, {.jobs = &jobs});
     const render::MeshData& mesh_data = model_data.mesh;
     if (has_model) {
         const Vec3 size = mesh_data.bounds_max - mesh_data.bounds_min;
@@ -598,15 +644,46 @@ int main(int argc, char** argv) {
     Renderer renderer = options.headless ? Renderer{} : create_renderer(*window, has_model ? &model_data : nullptr);
     bool reported_swapchain = false;
 
+    // The scene: a grid of the model as entities. Systems run over the World
+    // each frame; the renderer draws what the World says is there.
+    scene::World world(4096);
+    Vec3 scene_min{0.0f};
+    Vec3 scene_max{0.0f};
+    if (has_model) {
+        populate_grid(world, mesh_data, 5, scene_min, scene_max);
+        std::printf("scene   %u entities in %u archetype(s), %u chunk(s)\n", world.entity_count(),
+                    world.archetype_count(), world.chunk_count());
+    }
+
     Shading shading;
     FlyCamera fly;
     if (has_model) {
-        const Vec3 center = (mesh_data.bounds_min + mesh_data.bounds_max) * 0.5f;
-        fly.frame(center, length(mesh_data.bounds_max - mesh_data.bounds_min) * 0.5f);
+        const Vec3 center = (scene_min + scene_max) * 0.5f;
+        fly.frame(center, length(scene_max - scene_min) * 0.5f);
     }
+
+    // Per-frame scratch memory: reset at the top of every frame, never freed
+    // piecemeal. Nothing uses it yet; the ECS and render packets will.
+    tynima::core::Arena frame_arena(4 * 1024 * 1024);
 
     platform::Input input;
     std::vector<platform::Event> events;
+    events.reserve(64); // a frame's worth; growing later would count as a frame allocation
+
+    // The game module owns the systems that make the scene move. It is a
+    // shared library, and it is swapped for a new build whenever one appears.
+    tynima_engine engine_context;
+    engine_context.world = &world;
+    engine_context.input = &input;
+    engine_context.log = game_log;
+    tynima::sdk::GameModule game(TYNIMA_SANDBOX_GAME_MODULE);
+    if (game.load(engine_context)) {
+        std::printf("game    %s\n        edit apps/sandbox/game/src/game.cpp, then: cmake --build --preset "
+                    "macos-debug --target tynima_sandbox_game\n",
+                    game.path().c_str());
+    } else {
+        std::fprintf(stderr, "game    %s - the scene will not move\n", game.last_error());
+    }
     long frame_count = 0;
     double last_time = platform::now_seconds();
     double last_report = last_time;
@@ -614,6 +691,8 @@ int main(int argc, char** argv) {
     bool running = true;
 
     while (running) {
+        frame_arena.reset();
+        const tynima::core::HeapAllocationScope heap_scope;
         {
             TY_PROFILE_SCOPE_NAMED("events");
             platform::pump_events(input, events);
@@ -644,6 +723,14 @@ int main(int argc, char** argv) {
         fly.update(input, *window, dt);
         shading.update(input, dt);
 
+        engine_context.time_seconds = now;
+        const bool reloaded = game.poll(engine_context); // a reload allocates; that frame is exempt below
+        {
+            TY_PROFILE_SCOPE_NAMED("systems");
+            game.update(engine_context, dt);
+            scene::update_transforms(world);
+        }
+
         if (renderer.device != nullptr) {
             TY_PROFILE_SCOPE_NAMED("render");
             // begin_frame() blocks for vsync, which is what paces the loop.
@@ -653,13 +740,12 @@ int main(int argc, char** argv) {
                         std::printf("swap    %ux%u pixels\n", frame->width(), frame->height());
                         reported_swapchain = true;
                     }
-                    rhi::Texture* depth = renderer.depth_for(frame->width(), frame->height());
+                    const rhi::TextureHandle depth = renderer.depth_for(frame->width(), frame->height());
                     if (auto pass = frame->begin_swapchain_pass({.r = 0.09f, .g = 0.10f, .b = 0.12f}, depth, 0.0f)) {
-                        if (renderer.model.mesh.index_count > 0 && renderer.mesh_pipeline != nullptr) {
+                        if (renderer.model.mesh.index_count > 0 && renderer.mesh_pipeline) {
                             const float aspect = static_cast<float>(frame->width()) / static_cast<float>(frame->height());
-                            const MeshUniforms uniforms{fly.camera.view_projection(aspect), Mat4::identity()};
-                            pass->bind_pipeline(*renderer.mesh_pipeline);
-                            pass->push_vertex_uniforms(0, &uniforms, sizeof(uniforms));
+                            const Mat4 view_projection = fly.camera.view_projection(aspect);
+                            pass->bind_pipeline(renderer.mesh_pipeline);
                             render::bind_mesh(*pass, renderer.model.mesh);
                             const Vec3 light = shading.light_direction();
                             const FrameUniforms frame_uniforms{
@@ -669,23 +755,33 @@ int main(int argc, char** argv) {
                                 {renderer.device->swapchain_is_linear() ? 0.0f : 1.0f, static_cast<float>(shading.model),
                                  static_cast<float>(shading.debug_view), shading.tonemap ? 1.0f : 0.0f}};
                             pass->push_fragment_uniforms(0, &frame_uniforms, sizeof(frame_uniforms));
-                            for (const render::Submesh& sub : renderer.model.mesh.submeshes) {
-                                const render::Material& material = renderer.model.materials[sub.material];
-                                const MaterialUniforms material_uniforms{
-                                    material.base_color_factor,
-                                    {material.metallic_factor, material.roughness_factor, material.occlusion_strength,
-                                     material.normal_scale},
-                                    {material.emissive_factor, 0.0f}};
-                                pass->bind_fragment_texture(0, *material.base_color, *renderer.sampler);
-                                pass->bind_fragment_texture(1, *material.metallic_roughness, *renderer.sampler);
-                                pass->bind_fragment_texture(2, *material.occlusion, *renderer.sampler);
-                                pass->bind_fragment_texture(3, *material.emissive, *renderer.sampler);
-                                pass->bind_fragment_texture(4, *material.normal, *renderer.sampler);
-                                pass->push_fragment_uniforms(1, &material_uniforms, sizeof(material_uniforms));
-                                pass->draw_indexed(sub.index_count, sub.first_index);
-                            }
-                        } else if (renderer.triangle_pipeline != nullptr) {
-                            pass->bind_pipeline(*renderer.triangle_pipeline);
+                            // One draw per submesh per entity that has something to draw.
+                            world.each<scene::LocalToWorld, scene::MeshRenderer>(
+                                [&](scene::Entity, scene::LocalToWorld& local_to_world, scene::MeshRenderer& mr) {
+                                    if (!mr.visible || mr.model != 0) {
+                                        return; // the sandbox keeps exactly one model
+                                    }
+                                    const MeshUniforms uniforms{view_projection * local_to_world.matrix,
+                                                                local_to_world.matrix};
+                                    pass->push_vertex_uniforms(0, &uniforms, sizeof(uniforms));
+                                    for (const render::Submesh& sub : renderer.model.mesh.submeshes) {
+                                        const render::Material& material = renderer.model.materials[sub.material];
+                                        const MaterialUniforms material_uniforms{
+                                            material.base_color_factor,
+                                            {material.metallic_factor, material.roughness_factor,
+                                             material.occlusion_strength, material.normal_scale},
+                                            {material.emissive_factor, 0.0f}};
+                                        pass->bind_fragment_texture(0, material.base_color, renderer.sampler);
+                                        pass->bind_fragment_texture(1, material.metallic_roughness, renderer.sampler);
+                                        pass->bind_fragment_texture(2, material.occlusion, renderer.sampler);
+                                        pass->bind_fragment_texture(3, material.emissive, renderer.sampler);
+                                        pass->bind_fragment_texture(4, material.normal, renderer.sampler);
+                                        pass->push_fragment_uniforms(1, &material_uniforms, sizeof(material_uniforms));
+                                        pass->draw_indexed(sub.index_count, sub.first_index);
+                                    }
+                                });
+                        } else if (renderer.triangle_pipeline) {
+                            pass->bind_pipeline(renderer.triangle_pipeline);
                             pass->draw(3);
                         }
                         pass->end();
@@ -699,6 +795,25 @@ int main(int argc, char** argv) {
         } else {
             // Nothing to draw and nothing to wait on: pace the loop by hand.
             platform::sleep_ns(4'000'000);
+        }
+
+        // The rule from the roadmap, enforced: after warm-up, engine code
+        // allocates nothing on the heap during a frame. The GPU driver and the
+        // OS allocate plenty inside the calls we make; that is reported, not judged.
+        const std::uint64_t engine_allocations = heap_scope.allocations();
+        const std::uint64_t external_allocations = heap_scope.total() - engine_allocations;
+        TY_PROFILE_PLOT("engine heap allocations / frame", static_cast<std::int64_t>(engine_allocations));
+        TY_PROFILE_PLOT("external heap allocations / frame", static_cast<std::int64_t>(external_allocations));
+        TY_PROFILE_PLOT("frame arena bytes", static_cast<std::int64_t>(frame_arena.used()));
+        if (frame_count == 60) {
+            std::printf("heap    per frame: engine %llu, external (driver/OS) %llu\n",
+                        static_cast<unsigned long long>(engine_allocations),
+                        static_cast<unsigned long long>(external_allocations));
+        }
+        if (frame_count >= 10 && engine_allocations > 0 && !reloaded) {
+            std::fprintf(stderr, "frame %ld: engine code made %llu heap allocation(s)\n", frame_count,
+                         static_cast<unsigned long long>(engine_allocations));
+            TY_ASSERT(engine_allocations == 0, "a frame allocated on the heap from engine code");
         }
 
         TY_PROFILE_FRAME();
@@ -715,6 +830,7 @@ int main(int argc, char** argv) {
     }
 
     std::printf("ran %ld frames\n", frame_count);
+    game.unload(engine_context);
     renderer.destroy(); // GPU objects go before the window they present to
     window.reset();
     platform::shutdown();

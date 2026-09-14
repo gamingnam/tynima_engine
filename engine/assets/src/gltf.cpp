@@ -126,6 +126,7 @@ struct Importer {
     render::ModelData& model;
     render::MeshData& out;
     std::string& error;
+    core::JobSystem* jobs;
     std::vector<float> scratch;
 
     bool import_primitive(const cgltf_mesh& mesh, cgltf_size prim_index, const math::Mat4& world) {
@@ -277,15 +278,28 @@ struct Importer {
                 }
             }
         }
-        std::vector<unsigned char> bytes;
-        for (cgltf_size i = 0; i < data.images_count; ++i) {
+        auto decode_one = [&](std::size_t i) {
             TY_PROFILE_SCOPE_NAMED("decode image");
-            bytes.clear();
+            std::vector<unsigned char> bytes;
             std::string image_error;
             if (!read_image_bytes(data.images[i], gltf_path, bytes, image_error) ||
                 !decode_image(bytes.data(), bytes.size(), model.images[i], image_error)) {
-                std::fprintf(stderr, "gltf: image %zu: %s\n", static_cast<std::size_t>(i), image_error.c_str());
+                std::fprintf(stderr, "gltf: image %zu: %s\n", i, image_error.c_str());
                 model.images[i].pixels.clear();
+            }
+        };
+        // Each image is independent: one job per image when a job system is
+        // available, so a texture-heavy file loads on every core at once.
+        if (jobs != nullptr && data.images_count > 1) {
+            jobs->parallel_for(static_cast<std::uint32_t>(data.images_count), 1,
+                               [&](std::uint32_t begin, std::uint32_t end) {
+                                   for (std::uint32_t i = begin; i < end; ++i) {
+                                       decode_one(i);
+                                   }
+                               });
+        } else {
+            for (cgltf_size i = 0; i < data.images_count; ++i) {
+                decode_one(i);
             }
         }
     }
@@ -317,15 +331,16 @@ struct Importer {
     }
 };
 
-bool import_parsed(cgltf_data* data, const char* path, render::ModelData& out, std::string& error) {
-    cgltf_options options{};
-    const cgltf_result loaded = cgltf_load_buffers(&options, data, path);
+bool import_parsed(cgltf_data* data, const char* path, render::ModelData& out, std::string& error,
+                   const ImportOptions& options) {
+    cgltf_options cgltf_opts{};
+    const cgltf_result loaded = cgltf_load_buffers(&cgltf_opts, data, path);
     if (loaded != cgltf_result_success) {
         error = std::string("loading glTF buffers failed: ") + result_name(loaded);
         cgltf_free(data);
         return false;
     }
-    Importer importer{*data, path, out, out.mesh, error, {}};
+    Importer importer{*data, path, out, out.mesh, error, options.jobs, {}};
     const bool ok = importer.run();
     cgltf_free(data);
     return ok;
@@ -333,28 +348,29 @@ bool import_parsed(cgltf_data* data, const char* path, render::ModelData& out, s
 
 } // namespace
 
-bool import_gltf_file(const char* path, render::ModelData& out, std::string& error) {
+bool import_gltf_file(const char* path, render::ModelData& out, std::string& error, const ImportOptions& options) {
     TY_PROFILE_SCOPE_NAMED("assets::import_gltf_file");
-    cgltf_options options{};
+    cgltf_options cgltf_opts{};
     cgltf_data* data = nullptr;
-    const cgltf_result parsed = cgltf_parse_file(&options, path, &data);
+    const cgltf_result parsed = cgltf_parse_file(&cgltf_opts, path, &data);
     if (parsed != cgltf_result_success) {
         error = std::string("parsing '") + path + "' failed: " + result_name(parsed);
         return false;
     }
-    return import_parsed(data, path, out, error);
+    return import_parsed(data, path, out, error, options);
 }
 
-bool import_gltf_memory(const void* bytes, std::size_t size, render::ModelData& out, std::string& error) {
+bool import_gltf_memory(const void* bytes, std::size_t size, render::ModelData& out, std::string& error,
+                        const ImportOptions& options) {
     TY_PROFILE_SCOPE_NAMED("assets::import_gltf_memory");
-    cgltf_options options{};
+    cgltf_options cgltf_opts{};
     cgltf_data* data = nullptr;
-    const cgltf_result parsed = cgltf_parse(&options, bytes, size, &data);
+    const cgltf_result parsed = cgltf_parse(&cgltf_opts, bytes, size, &data);
     if (parsed != cgltf_result_success) {
         error = std::string("parsing glTF failed: ") + result_name(parsed);
         return false;
     }
-    return import_parsed(data, nullptr, out, error);
+    return import_parsed(data, nullptr, out, error, options);
 }
 
 } // namespace tynima::assets

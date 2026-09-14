@@ -95,3 +95,34 @@ function(tynima_add_app)
     target_link_libraries(${target} PRIVATE ${lib})
   endforeach()
 endfunction()
+
+# tynima_add_game_module(NAME <name> [DEPENDS <module>...])
+#
+# A hot-reloadable game module: a shared library loaded by the engine at run
+# time through sdk::GameModule. It gets the *headers* of the modules it names
+# but links none of them — the engine has exactly one copy of everything, in
+# the host — and talks to the engine through the C API in tynima.h.
+function(tynima_add_game_module)
+  cmake_parse_arguments(ARG "" "NAME" "DEPENDS" ${ARGN})
+  if(NOT ARG_NAME)
+    message(FATAL_ERROR "tynima_add_game_module: NAME is required")
+  endif()
+
+  set(target tynima_${ARG_NAME})
+  set(dir ${CMAKE_CURRENT_SOURCE_DIR})
+  file(GLOB_RECURSE sources CONFIGURE_DEPENDS ${dir}/src/*.cpp ${dir}/src/*.c)
+  if(NOT sources)
+    message(FATAL_ERROR "tynima_add_game_module(${ARG_NAME}): no sources under ${dir}/src")
+  endif()
+
+  add_library(${target} MODULE ${sources})
+  set_target_properties(${target} PROPERTIES OUTPUT_NAME ${ARG_NAME} PREFIX "" FOLDER "games"
+                                             CXX_VISIBILITY_PRESET hidden VISIBILITY_INLINES_HIDDEN ON)
+  target_include_directories(${target} PRIVATE ${dir}/src ${dir}/include)
+  target_compile_features(${target} PRIVATE cxx_std_20)
+  target_compile_definitions(${target} PRIVATE TYNIMA_GAME_MODULE=1)
+  tynima_apply_warnings(${target})
+  foreach(dep IN LISTS ARG_DEPENDS)
+    target_include_directories(${target} PRIVATE $<TARGET_PROPERTY:tynima_${dep},INTERFACE_INCLUDE_DIRECTORIES>)
+  endforeach()
+endfunction()

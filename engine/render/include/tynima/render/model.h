@@ -51,29 +51,29 @@ struct ModelData {
 // in R of occlusion, emissive RGB (sRGB), normal XYZ in tangent space.
 struct Material {
     math::Vec4 base_color_factor{1.0f, 1.0f, 1.0f, 1.0f};
-    rhi::Texture* base_color = nullptr;
+    rhi::TextureHandle base_color;
     float metallic_factor = 1.0f;
     float roughness_factor = 1.0f;
-    rhi::Texture* metallic_roughness = nullptr;
-    rhi::Texture* normal = nullptr;
+    rhi::TextureHandle metallic_roughness;
+    rhi::TextureHandle normal;
     float normal_scale = 1.0f;
-    rhi::Texture* occlusion = nullptr;
+    rhi::TextureHandle occlusion;
     float occlusion_strength = 1.0f;
     math::Vec3 emissive_factor{0.0f};
-    rhi::Texture* emissive = nullptr;
+    rhi::TextureHandle emissive;
     bool double_sided = false;
 };
 
 struct Model {
     Mesh mesh;
-    std::vector<Material> materials;    // indexed by Submesh::material
-    std::vector<rhi::Texture*> textures; // owned, one per ModelData::images entry (nullptr if it failed)
+    std::vector<Material> materials;          // indexed by Submesh::material
+    std::vector<rhi::TextureHandle> textures; // owned, one per ModelData::images entry (null if it failed)
 };
 
 // The device-wide fallback textures every Model borrows from.
 struct FallbackTextures {
-    rhi::Texture* white = nullptr;       // 1x1 (255,255,255,255): a missing map multiplies out to its factor
-    rhi::Texture* flat_normal = nullptr; // 1x1 (128,128,255,255): "straight up" in tangent space
+    rhi::TextureHandle white;       // 1x1 (255,255,255,255): a missing map multiplies out to its factor
+    rhi::TextureHandle flat_normal; // 1x1 (128,128,255,255): "straight up" in tangent space
 };
 [[nodiscard]] bool create_fallback_textures(rhi::Device& device, FallbackTextures& out) noexcept;
 void destroy_fallback_textures(rhi::Device& device, FallbackTextures& textures) noexcept;

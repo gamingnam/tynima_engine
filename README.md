@@ -26,6 +26,7 @@ past that declaration.
 | `engine/platform/`| `core`                               | Window, input, filesystem, time, threads (wraps SDL3)       |
 | `engine/core/`    | —                                    | Allocators, containers, math, jobs, logging, reflection     |
 | `apps/sandbox/`   | any engine module                    | Engine developer's playground — a test bed, not a template  |
+| `apps/sandbox/game/` | `tynima.h` only (headers of sdk/scene/core) | The sandbox's hot-reloadable game module            |
 
 Transitive dependencies don't count: if a file includes `tynima/rhi/...`, its
 module must declare `rhi`. Nothing may depend on an app, and `editor` may depend
@@ -72,6 +73,27 @@ and `ctest --preset windows-debug`.
 
 Options (`-D` at configure time): `TYNIMA_BUILD_TESTS`, `TYNIMA_BUILD_EDITOR`,
 `TYNIMA_BUILD_APPS`, `TYNIMA_FETCH_SDL3`, `TYNIMA_WARNINGS_AS_ERRORS` (on in CI).
+
+## Game modules and hot reload
+
+Game code is a shared library the engine loads at run time
+(`sdk::GameModule`) and talks to only through the C API in
+[`sdk/include/tynima.h`](sdk/include/tynima.h): a table of function pointers
+for components (by name), entities, chunk iteration, keys, time and logging.
+The module links nothing from the engine, so the engine has exactly one copy
+of its state, and all game state lives in the World — which is what lets the
+engine swap the library for a new build while everything keeps running.
+
+To see it: run the sandbox, edit `apps/sandbox/game/src/game.cpp` (the spin
+axis or speed, say), and rebuild only the module:
+
+```sh
+cmake --build --preset macos-debug --target tynima_sandbox_game
+```
+
+The sandbox notices the new file, unloads the old code, loads the new, and
+the bottles change behaviour — same world, same camera, no restart. Holding
+Space while it runs spins them faster, an example of input through the API.
 
 ## Profiling
 
@@ -124,4 +146,7 @@ depended on before it has code. Tests under `tests/` become
 
 ## License
 
-Not chosen yet — see "Decide early" in the roadmap.
+MIT — see [LICENSE](LICENSE). Sample content downloaded at configure time
+(Khronos glTF-Sample-Assets) is CC0. Third-party code fetched by the build
+keeps its own license: SDL3 (zlib), doctest (MIT), Tracy (BSD-3), cgltf (MIT),
+stb (MIT / public domain).

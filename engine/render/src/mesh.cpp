@@ -117,7 +117,7 @@ bool upload_mesh(rhi::Device& device, const MeshData& data, Mesh& out) noexcept 
     out.index_buffer = device.create_buffer_with_data(
         rhi::BufferUsage::Index, data.indices.data(),
         static_cast<std::uint32_t>(data.indices.size() * sizeof(std::uint32_t)));
-    if (out.vertex_buffer == nullptr || out.index_buffer == nullptr) {
+    if (!out.vertex_buffer || !out.index_buffer) {
         destroy_mesh(device, out);
         return false;
     }
@@ -138,14 +138,14 @@ void destroy_mesh(rhi::Device& device, Mesh& mesh) noexcept {
 }
 
 void bind_mesh(rhi::RenderPass& pass, const Mesh& mesh) noexcept {
-    if (mesh.vertex_buffer != nullptr && mesh.index_buffer != nullptr) {
-        pass.bind_vertex_buffer(*mesh.vertex_buffer);
-        pass.bind_index_buffer(*mesh.index_buffer, rhi::IndexType::Uint32);
+    if (mesh.vertex_buffer && mesh.index_buffer) {
+        pass.bind_vertex_buffer(mesh.vertex_buffer);
+        pass.bind_index_buffer(mesh.index_buffer, rhi::IndexType::Uint32);
     }
 }
 
 void draw_mesh(rhi::RenderPass& pass, const Mesh& mesh) noexcept {
-    if (mesh.vertex_buffer == nullptr || mesh.index_buffer == nullptr) {
+    if (!mesh.vertex_buffer || !mesh.index_buffer) {
         return;
     }
     bind_mesh(pass, mesh);

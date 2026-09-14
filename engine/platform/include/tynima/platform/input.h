@@ -8,15 +8,12 @@ namespace tynima::platform {
 
 // Physical key positions (USB HID scancodes underneath), so WASD is WASD on
 // every keyboard layout. Typed text arrives through events, never through here.
-// The enum, key_name() and the scancode table are generated from one list;
-// keep them together if you add a key.
+// The enum, key_name(), the scancode table and the C API's tynima_key all
+// read keys.def, so a key exists in every one of them or none.
 enum class Key : std::uint8_t {
-    Unknown, A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P, Q, R, S, T, U, V, W, X, Y, Z, Digit0,
-    Digit1, Digit2, Digit3, Digit4, Digit5, Digit6, Digit7, Digit8, Digit9, F1, F2, F3, F4, F5, F6,
-    F7, F8, F9, F10, F11, F12, Escape, Enter, Tab, Backspace, Space, Minus, Equals, LeftBracket,
-    RightBracket, Backslash, Semicolon, Apostrophe, Grave, Comma, Period, Slash, CapsLock, Insert,
-    Delete, Home, End, PageUp, PageDown, Left, Right, Up, Down, LeftShift, RightShift, LeftCtrl,
-    RightCtrl, LeftAlt, RightAlt, LeftSuper, RightSuper,
+#define TYNIMA_KEY(name, scancode) name,
+#include <tynima/platform/keys.def>
+#undef TYNIMA_KEY
     Count
 };
 inline constexpr std::size_t kKeyCount = static_cast<std::size_t>(Key::Count);

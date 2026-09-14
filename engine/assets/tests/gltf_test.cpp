@@ -1,6 +1,7 @@
 #include <doctest/doctest.h>
 #include <tynima/assets/gltf.h>
 #include <tynima/assets/image.h>
+#include <tynima/core/jobs.h>
 
 #include <cstring>
 #include <string>
@@ -129,6 +130,21 @@ TEST_CASE("glTF import carries materials and decodes their images") {
     CHECK(data_map.pixels[0] == 128); // R: occlusion
     CHECK(data_map.pixels[1] == 64);  // G: roughness
     CHECK(data_map.pixels[2] == 255); // B: metallic
+}
+
+TEST_CASE("glTF import decodes images on the job system with the same result") {
+    tynima::core::JobSystem jobs;
+    render::ModelData serial;
+    render::ModelData parallel;
+    std::string error;
+    REQUIRE(assets::import_gltf_memory(kGltf, std::strlen(kGltf), serial, error));
+    REQUIRE_MESSAGE(assets::import_gltf_memory(kGltf, std::strlen(kGltf), parallel, error, {.jobs = &jobs}), error);
+    REQUIRE(parallel.images.size() == serial.images.size());
+    for (std::size_t i = 0; i < serial.images.size(); ++i) {
+        CHECK(parallel.images[i].width == serial.images[i].width);
+        CHECK(parallel.images[i].srgb == serial.images[i].srgb);
+        CHECK(parallel.images[i].pixels == serial.images[i].pixels);
+    }
 }
 
 TEST_CASE("glTF import fails with a reason, not a crash") {

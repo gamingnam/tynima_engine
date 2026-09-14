@@ -13,7 +13,7 @@ bool upload_model(rhi::Device& device, const ModelData& data, const FallbackText
 
     out.textures.reserve(data.images.size());
     for (const ImageData& image : data.images) {
-        rhi::Texture* texture = nullptr;
+        rhi::TextureHandle texture;
         if (!image.pixels.empty()) {
             texture = device.create_texture_with_data(
                 image.srgb ? rhi::TextureFormat::Rgba8Srgb : rhi::TextureFormat::Rgba8Unorm, image.width, image.height,
@@ -22,8 +22,8 @@ bool upload_model(rhi::Device& device, const ModelData& data, const FallbackText
         out.textures.push_back(texture);
     }
 
-    auto texture_or = [&](std::int32_t index, rhi::Texture* fallback) -> rhi::Texture* {
-        if (index >= 0 && static_cast<std::size_t>(index) < out.textures.size() && out.textures[index] != nullptr) {
+    auto texture_or = [&](std::int32_t index, rhi::TextureHandle fallback) -> rhi::TextureHandle {
+        if (index >= 0 && static_cast<std::size_t>(index) < out.textures.size() && out.textures[index]) {
             return out.textures[index];
         }
         return fallback;
@@ -65,7 +65,7 @@ bool upload_model(rhi::Device& device, const ModelData& data, const FallbackText
 
 void destroy_model(rhi::Device& device, Model& model) noexcept {
     destroy_mesh(device, model.mesh);
-    for (rhi::Texture* texture : model.textures) {
+    for (const rhi::TextureHandle texture : model.textures) {
         device.destroy_texture(texture);
     }
     model = Model{};
@@ -76,7 +76,7 @@ bool create_fallback_textures(rhi::Device& device, FallbackTextures& out) noexce
     const std::uint8_t flat[4] = {128, 128, 255, 255};
     out.white = device.create_texture_with_data(rhi::TextureFormat::Rgba8Unorm, 1, 1, white, sizeof(white), false);
     out.flat_normal = device.create_texture_with_data(rhi::TextureFormat::Rgba8Unorm, 1, 1, flat, sizeof(flat), false);
-    if (out.white == nullptr || out.flat_normal == nullptr) {
+    if (!out.white || !out.flat_normal) {
         destroy_fallback_textures(device, out);
         return false;
     }

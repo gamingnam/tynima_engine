@@ -52,8 +52,8 @@ struct MeshData {
 
 // GPU-side mesh: buffers owned by the Device that uploaded them.
 struct Mesh {
-    rhi::Buffer* vertex_buffer = nullptr;
-    rhi::Buffer* index_buffer = nullptr;
+    rhi::BufferHandle vertex_buffer;
+    rhi::BufferHandle index_buffer;
     std::uint32_t index_count = 0;
     std::vector<Submesh> submeshes;
     math::Vec3 bounds_min{0.0f};

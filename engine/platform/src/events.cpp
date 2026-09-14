@@ -1,5 +1,6 @@
 #include <tynima/platform/events.h>
 
+#include <tynima/core/memory.h>
 #include <tynima/core/profile.h>
 #include <tynima/platform/input.h>
 
@@ -31,6 +32,7 @@ Event window_event(EventType type, const SDL_WindowEvent& w) noexcept {
 
 void pump_events(Input& input, std::vector<Event>& events) {
     TY_PROFILE_SCOPE_NAMED("platform::pump_events");
+    TY_EXTERNAL_ALLOCATIONS(); // Cocoa/Win32 event delivery allocates; that is not ours
     events.clear();
     Input::Writer::begin_frame(input);
 

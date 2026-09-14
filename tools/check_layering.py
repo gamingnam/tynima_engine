@@ -5,6 +5,7 @@ Every module declares its *direct* dependencies in its CMakeLists.txt:
 
     tynima_add_module(NAME scene DEPENDS core render physics)
     tynima_add_app(NAME editor DEPENDS sdk)
+    tynima_add_game_module(NAME sandbox_game DEPENDS sdk scene core)
 
 That declaration is the single source of truth. This script reads it and
 checks every C/C++ source under the module against four rules:
@@ -47,7 +48,7 @@ SOURCE_SUFFIXES = {".h", ".hpp", ".inl", ".c", ".cc", ".cpp", ".cxx", ".m", ".mm
 # the modules allowed to include it. Everything else goes through those.
 THIRD_PARTY = {"SDL3/": {"platform", "rhi"}, "tracy/": {"core"}, "cgltf.h": {"assets"}, "stb_": {"assets"}}
 
-DECLARATION_RE = re.compile(r"tynima_add_(module|app)\s*\(\s*NAME\s+(\w+)(.*?)\)", re.S)
+DECLARATION_RE = re.compile(r"tynima_add_(module|app|game_module)\s*\(\s*NAME\s+(\w+)(.*?)\)", re.S)
 # <tynima/core/version.h>, "tynima/rhi/device.h", or the C ABI header <tynima.h>.
 INCLUDE_RE = re.compile(r'^\s*#\s*include\s*[<"](tynima\.h|tynima/([\w-]+)/[^>"]*)[>"]', re.M)
 THIRD_PARTY_RE = re.compile(r'^\s*#\s*include\s*[<"](' + "|".join(map(re.escape, THIRD_PARTY)) + r')', re.M)
@@ -99,6 +100,8 @@ def discover_modules(root: Path) -> tuple[dict[str, Module], list[Violation]]:
                 if name in modules:
                     problems.append(Violation(cmake_file, 0, f"module '{name}' is declared twice"))
                     continue
+                if kind == "game_module":
+                    kind = "app" # loaded at run time, but for layering it sits on top like an app
                 if kind == "module" and name not in LAYERS:
                     problems.append(
                         Violation(cmake_file, 0, f"module '{name}' is not in the layer order; add it to LAYERS in {Path(__file__).name}")

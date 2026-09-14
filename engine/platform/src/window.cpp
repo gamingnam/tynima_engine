@@ -1,5 +1,6 @@
 #include <tynima/platform/window.h>
 
+#include <tynima/core/memory.h>
 #include <tynima/platform/platform.h>
 
 #include "sdl.h"
@@ -7,6 +8,7 @@
 namespace tynima::platform {
 
 std::unique_ptr<Window> Window::create(const WindowDesc& desc) {
+    TY_EXTERNAL_ALLOCATIONS();
     if (!is_initialized()) {
         SDL_SetError("platform::init() has not been called");
         return nullptr;
@@ -26,6 +28,7 @@ std::unique_ptr<Window> Window::create(const WindowDesc& desc) {
 }
 
 Window::~Window() {
+    TY_EXTERNAL_ALLOCATIONS();
     SDL_DestroyWindow(handle_);
 }
 
@@ -63,10 +66,12 @@ float Window::pixel_density() const noexcept {
 }
 
 void Window::set_title(const char* title) noexcept {
+    TY_EXTERNAL_ALLOCATIONS();
     SDL_SetWindowTitle(handle_, title);
 }
 
 void Window::set_relative_mouse_mode(bool enabled) noexcept {
+    TY_EXTERNAL_ALLOCATIONS();
     SDL_SetWindowRelativeMouseMode(handle_, enabled);
 }
 
