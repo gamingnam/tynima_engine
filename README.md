@@ -113,6 +113,18 @@ Entities follow bodies through the `RigidBody` component and
 `scene::update_bodies()`, run after the step and before `update_transforms()`.
 The sandbox drops a pile of a hundred bottles on a floor; R drops it again.
 
+The pieces of our own solver arrive behind their own interfaces, each tested
+against a brute-force reference and timed on the pile's real trajectories
+sampled from Jolt (`ctest` prints the numbers). So far:
+
+- **Broadphase** ([`broadphase.h`](engine/physics/include/tynima/physics/broadphase.h)):
+  proxies (a box and a value), `find_pairs`, box and ray queries.
+  `create_brute_force_broadphase` is the reference; `create_sweep_and_prune`
+  keeps interval endpoints sorted along whichever axis the scene spreads on;
+  `create_aabb_tree` is a Box2D-style dynamic tree with fat boxes and
+  rotations, the spatial index the rest of the engine will query. All three
+  return identical pair sets.
+
 ## Logging and asserts
 
 Every message is an event — level, category, source location, thread, time —

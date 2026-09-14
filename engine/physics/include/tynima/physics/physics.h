@@ -118,6 +118,8 @@ public:
 
     // A default BodyState for a stale handle.
     [[nodiscard]] virtual BodyState body_state(BodyHandle body) const = 0;
+    // The world-space box around the body's shape right now; empty for a stale handle.
+    [[nodiscard]] virtual math::Aabb body_bounds(BodyHandle body) const = 0;
     [[nodiscard]] virtual std::uint64_t user_data(BodyHandle body) const = 0;
 
     // Teleports; wakes the body. For kinematic bodies this is how they move.

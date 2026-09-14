@@ -421,6 +421,19 @@ public:
         return state;
     }
 
+    math::Aabb body_bounds(BodyHandle handle) const override {
+        const BodyRecord* record = bodies_.get(handle);
+        if (record == nullptr) {
+            return math::Aabb::empty();
+        }
+        const JPH::BodyLockRead lock(system_.GetBodyLockInterface(), record->id);
+        if (!lock.Succeeded()) {
+            return math::Aabb::empty();
+        }
+        const JPH::AABox& bounds = lock.GetBody().GetWorldSpaceBounds();
+        return math::Aabb{from_jolt(bounds.mMin), from_jolt(bounds.mMax)};
+    }
+
     std::uint64_t user_data(BodyHandle handle) const override {
         const BodyRecord* record = bodies_.get(handle);
         return record != nullptr ? record->user_data : 0;
