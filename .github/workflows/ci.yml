@@ -10,7 +10,7 @@ jobs:
     name: Layering check
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - run: python3 tools/check_layering.py
 
   build:
@@ -23,7 +23,7 @@ jobs:
           - { name: "Windows (MSVC)",        os: windows-latest, preset: ci-windows }
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Install Ninja
         if: runner.os == 'macOS'
         run: brew install ninja
