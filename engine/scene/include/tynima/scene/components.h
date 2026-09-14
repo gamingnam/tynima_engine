@@ -1,6 +1,7 @@
 #pragma once
 
 #include <tynima/core/math.h>
+#include <tynima/physics/physics.h>
 #include <tynima/scene/entity.h>
 
 #include <cstdint>
@@ -39,6 +40,14 @@ struct MeshRenderer {
     static constexpr const char* kName = "MeshRenderer";
     std::uint32_t model = 0;
     bool visible = true;
+};
+
+// Ties the entity to a body in the application's PhysicsWorld. The body
+// drives the Transform: update_bodies() copies its pose in after every step.
+// The handle is only meaningful in the world that made it.
+struct RigidBody {
+    static constexpr const char* kName = "RigidBody";
+    physics::BodyHandle body;
 };
 
 } // namespace tynima::scene

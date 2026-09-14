@@ -58,6 +58,37 @@ add_library(stb INTERFACE)
 target_include_directories(stb SYSTEM INTERFACE ${stb_SOURCE_DIR})
 add_library(stb::stb ALIAS stb)
 
+# Jolt Physics: the reference the Phase 3 solver is measured against, behind
+# physics::PhysicsWorld. Built as plain CPU physics — no GPU compute back
+# ends, no object streams, no built-in profiler or debug renderer — and
+# cross-platform deterministic, so a simulation state hash means the same
+# thing on every CI runner. Its asserts are on in Debug builds.
+set(USE_STATIC_MSVC_RUNTIME_LIBRARY OFF CACHE BOOL "" FORCE) # match the rest of the build (/MD)
+set(CPP_RTTI_ENABLED ON CACHE BOOL "" FORCE)                 # physics/ derives from Jolt classes with RTTI on
+set(ENABLE_ALL_WARNINGS OFF CACHE BOOL "" FORCE)             # no -Werror inside a dependency
+set(INTERPROCEDURAL_OPTIMIZATION OFF CACHE BOOL "" FORCE)
+set(CROSS_PLATFORM_DETERMINISTIC ON CACHE BOOL "" FORCE)
+set(FLOATING_POINT_EXCEPTIONS_ENABLED OFF CACHE BOOL "" FORCE)
+set(DEBUG_RENDERER_IN_DEBUG_AND_RELEASE OFF CACHE BOOL "" FORCE)
+set(PROFILER_IN_DEBUG_AND_RELEASE OFF CACHE BOOL "" FORCE)
+set(ENABLE_OBJECT_STREAM OFF CACHE BOOL "" FORCE)
+set(ENABLE_INSTALL OFF CACHE BOOL "" FORCE)
+set(JPH_USE_DX12 OFF CACHE BOOL "" FORCE)
+set(JPH_USE_VK OFF CACHE BOOL "" FORCE)
+set(JPH_USE_MTL OFF CACHE BOOL "" FORCE)
+set(JPH_USE_CPU_COMPUTE OFF CACHE BOOL "" FORCE)
+if(CMAKE_BUILD_TYPE STREQUAL "Debug")
+  set(USE_ASSERTS ON CACHE BOOL "" FORCE)
+else()
+  set(USE_ASSERTS OFF CACHE BOOL "" FORCE)
+endif()
+FetchContent_Declare(jolt
+  URL      https://github.com/jrouwe/JoltPhysics/archive/refs/tags/v5.6.0.tar.gz
+  URL_HASH SHA256=6e069ee0172478cc78182047aac87e5310ba14a67a53348ae14cc37801fd3f8e
+  SOURCE_SUBDIR Build
+  EXCLUDE_FROM_ALL SYSTEM)
+FetchContent_MakeAvailable(jolt)
+
 if(TYNIMA_PROFILE)
   # The client must match the profiler GUI's version: 0.13.1 is what
   # `brew install tracy` ships. Bump both together.

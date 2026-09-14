@@ -1,12 +1,13 @@
-// Engine developer's playground. A grid of glTF models as entities in the
-// scene World, lit with Cook-Torrance, a reverse-Z depth buffer, an sRGB
-// swapchain, and a fly camera. Falls back to Phase 0's triangle when there is
-// no model.
+// Engine developer's playground. A pile of glTF models dropped on a floor
+// by the physics world, as entities in the scene World, lit with
+// Cook-Torrance, a reverse-Z depth buffer, an sRGB swapchain, and a fly
+// camera. Falls back to Phase 0's triangle when there is no model.
 //
 //   tynima-sandbox [--headless] [--frames N] [--model path.glb]
 //
 // Controls: hold the right mouse button to look; W/A/S/D move, Q/E descend
-// and climb, Shift runs; Escape quits.
+// and climb, Shift runs; R drops the pile again; Space (the game module)
+// launches it; Escape quits.
 #include <tynima/assets/gltf.h>
 #include <tynima/core/arena.h>
 #include <tynima/core/assert.h>
@@ -15,6 +16,7 @@
 #include <tynima/core/memory.h>
 #include <tynima/core/profile.h>
 #include <tynima/core/version.h>
+#include <tynima/physics/physics.h>
 #include <tynima/platform/events.h>
 #include <tynima/platform/input.h>
 #include <tynima/platform/platform.h>
@@ -29,12 +31,9 @@
 #include <tynima/scene/world.h>
 #include <tynima/sdk/game_module.h>
 
-#include "spin.h"
-
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
-#include <limits>
 #include <cstdlib>
 #include <cstring>
 #include <memory>
@@ -47,28 +46,180 @@ namespace rhi = tynima::rhi;
 namespace render = tynima::render;
 namespace assets = tynima::assets;
 namespace scene = tynima::scene;
+namespace physics = tynima::physics;
 using namespace tynima::math;
 
 namespace {
 
-// Lays out a grid of the model, spaced by its footprint, with a spin that
-// varies across the grid. Returns the world-space bounds of the whole grid.
-void populate_grid(scene::World& world, const render::MeshData& mesh, int side, Vec3& bounds_min, Vec3& bounds_max) {
+// Model slots the MeshRenderer component indexes into.
+constexpr std::uint32_t kModelBottle = 0;
+constexpr std::uint32_t kModelFloor = 1;
+
+constexpr float kFloorHalfWidth = 6.0f;
+constexpr float kFloorHalfThickness = 0.25f;
+
+// The pile: the model dropped over a 5x5 footprint in four waves, every one
+// shoved sideways, tilted and given a little spin, so they hit each other on
+// the way down and end up in a heap rather than in neat standing stacks.
+struct Pile {
+    static constexpr int kSide = 5;
+    static constexpr int kLayers = 4;
+    std::vector<scene::Entity> entities;
+    std::vector<scene::Transform> rest_poses; // where R puts them back
+    float footprint = 1.0f;                   // half the width of the drop area, metres
+    float drop_height = 1.0f;                 // the top of the highest wave
+};
+
+// Deterministic noise in [0, 1): the same pile drops the same way every run,
+// which is what makes the headless run and the determinism work of task 7
+// meaningful.
+float noise(std::uint32_t n, std::uint32_t salt) {
+    std::uint32_t h = n * 2654435761u + salt * 40503u;
+    h ^= h >> 15;
+    h *= 2246822519u;
+    h ^= h >> 13;
+    return static_cast<float>(h & 0xFFFFFFu) / static_cast<float>(0x1000000u);
+}
+
+// Every body is a box around the mesh's bounds, offset from the entity's
+// origin the way the mesh is; the entity's Transform is the body's pose.
+Pile populate_pile(scene::World& world, physics::PhysicsWorld& physics, const render::MeshData& mesh) {
+    Pile pile;
     const Vec3 size = mesh.bounds_max - mesh.bounds_min;
-    const float spacing = std::max(size.x, size.z) * 1.8f;
-    const float half = static_cast<float>(side - 1) * 0.5f;
-    bounds_min = Vec3{std::numeric_limits<float>::max()};
-    bounds_max = Vec3{std::numeric_limits<float>::lowest()};
-    for (int z = 0; z < side; ++z) {
-        for (int x = 0; x < side; ++x) {
-            const Vec3 position{(static_cast<float>(x) - half) * spacing, 0.0f, (static_cast<float>(z) - half) * spacing};
-            const float spin = (static_cast<float>(x + z) - 2.0f * half) * 0.35f; // centre still, edges opposite ways
-            (void)world.create(scene::Transform{.position = position}, scene::LocalToWorld{},
-                               scene::MeshRenderer{.model = 0}, Spin{spin});
-            bounds_min = min(bounds_min, position + mesh.bounds_min);
-            bounds_max = max(bounds_max, position + mesh.bounds_max);
+    const Vec3 half_extents = size * 0.5f;
+    const Vec3 center = (mesh.bounds_min + mesh.bounds_max) * 0.5f;
+    const float spacing = std::max(size.x, size.z) * 1.4f;
+    const float wave_height = size.y * 1.8f;
+    const float half = static_cast<float>(Pile::kSide - 1) * 0.5f;
+    pile.footprint = (half + 0.5f) * spacing;
+    pile.drop_height = size.y * 2.0f + static_cast<float>(Pile::kLayers) * wave_height;
+    for (int layer = 0; layer < Pile::kLayers; ++layer) {
+        for (int z = 0; z < Pile::kSide; ++z) {
+            for (int x = 0; x < Pile::kSide; ++x) {
+                const auto n = static_cast<std::uint32_t>((layer * Pile::kSide + z) * Pile::kSide + x);
+                // Up to nearly half a slot sideways: a bottle often lands on
+                // the edge of the one below, or between two, and topples.
+                const float shove_x = (noise(n, 1) - 0.5f) * spacing * 0.9f;
+                const float shove_z = (noise(n, 2) - 0.5f) * spacing * 0.9f;
+                const float lift = noise(n, 3) * wave_height * 0.5f; // no two in a column arrive together
+                const Vec3 position{(static_cast<float>(x) - half) * spacing + shove_x,
+                                    size.y * 2.0f + static_cast<float>(layer) * wave_height + lift -
+                                        mesh.bounds_min.y,
+                                    (static_cast<float>(z) - half) * spacing + shove_z};
+                // A tilt of up to ~30 degrees about a random horizontal axis, then a random yaw.
+                const float tilt_direction = noise(n, 4) * kTwoPi;
+                const Vec3 tilt_axis{std::cos(tilt_direction), 0.0f, std::sin(tilt_direction)};
+                const Quat rotation = Quat::from_axis_angle(Vec3::unit_y(), noise(n, 5) * kTwoPi) *
+                                      Quat::from_axis_angle(tilt_axis, (noise(n, 6) - 0.5f) * 1.0f);
+                physics::BodyDesc body;
+                body.shape = physics::Shape::box(half_extents, center);
+                body.position = position;
+                body.rotation = rotation;
+                body.angular_velocity =
+                    Vec3{noise(n, 7) - 0.5f, noise(n, 8) - 0.5f, noise(n, 9) - 0.5f} * 3.0f; // a little spin
+                body.mass = 0.6f; // a full 0.6 l bottle
+                body.friction = 0.5f;
+                body.restitution = 0.1f;
+                const physics::BodyHandle handle = physics.create_body(body);
+                const scene::Transform pose{.position = position, .rotation = rotation};
+                const scene::Entity entity = world.create(pose, scene::LocalToWorld{},
+                                                          scene::MeshRenderer{.model = kModelBottle},
+                                                          scene::RigidBody{handle});
+                pile.entities.push_back(entity);
+                pile.rest_poses.push_back(pose);
+            }
         }
     }
+    return pile;
+}
+
+// Puts every body back where the pile started and lets it fall again, with
+// the same spins as the first time: R replays the drop exactly.
+void reset_pile(scene::World& world, physics::PhysicsWorld& physics, const Pile& pile) {
+    for (std::size_t i = 0; i < pile.entities.size(); ++i) {
+        if (const auto* body = world.get<scene::RigidBody>(pile.entities[i])) {
+            const auto n = static_cast<std::uint32_t>(i);
+            physics.set_velocity(body->body, Vec3{0.0f},
+                                 Vec3{noise(n, 7) - 0.5f, noise(n, 8) - 0.5f, noise(n, 9) - 0.5f} * 3.0f);
+            physics.set_transform(body->body, pile.rest_poses[i].position, pile.rest_poses[i].rotation);
+        }
+    }
+}
+
+// How the pile ended up: how many bottles still stand, how far it spread,
+// how high it is. One line to compare a run against another — the same
+// scene through our own solver later must come out about the same.
+void report_pile(scene::World& world, const Pile& pile) {
+    std::uint32_t upright = 0, toppled = 0;
+    float spread = 0.0f, top = 0.0f;
+    for (const scene::Entity entity : pile.entities) {
+        const auto* transform = world.get<scene::Transform>(entity);
+        if (transform == nullptr) {
+            continue;
+        }
+        const Vec3 up = transform->rotation.rotate(Vec3::unit_y());
+        (up.y > 0.7f ? upright : toppled)++;
+        spread = std::max(spread, std::sqrt(transform->position.x * transform->position.x +
+                                            transform->position.z * transform->position.z));
+        top = std::max(top, transform->position.y);
+    }
+    TY_LOG_INFO("scene", "pile: %u upright, %u toppled, spread %.2f m, top at %.2f m", upright, toppled,
+                static_cast<double>(spread), static_cast<double>(top));
+}
+
+// A closed box with hard edges: 24 vertices, 6 quads, UVs per face, tangents
+// from those. The floor is one of these, stretched.
+render::MeshData make_box_mesh(const Vec3& half_extents) {
+    render::MeshData mesh;
+    const Vec3 h = half_extents;
+    struct Face {
+        Vec3 normal, u_axis, v_axis;
+    };
+    const Face faces[6] = {
+        {{0, 1, 0}, {1, 0, 0}, {0, 0, -1}},  // top
+        {{0, -1, 0}, {1, 0, 0}, {0, 0, 1}},  // bottom
+        {{1, 0, 0}, {0, 0, -1}, {0, 1, 0}},  // +x
+        {{-1, 0, 0}, {0, 0, 1}, {0, 1, 0}},  // -x
+        {{0, 0, 1}, {1, 0, 0}, {0, 1, 0}},   // +z
+        {{0, 0, -1}, {-1, 0, 0}, {0, 1, 0}}, // -z
+    };
+    for (const Face& face : faces) {
+        const auto base = static_cast<std::uint32_t>(mesh.vertices.size());
+        // Each axis is a signed unit vector: scaling it component-wise by the
+        // half extents gives the face centre and its two half-edges.
+        const Vec3 origin = face.normal * h;
+        const Vec3 du = face.u_axis * h;
+        const Vec3 dv = face.v_axis * h;
+        const float tile = 2.0f; // UV repeats per metre, so a big floor still shows texture
+        const Vec2 uv_scale{length(du) * tile, length(dv) * tile};
+        for (int corner = 0; corner < 4; ++corner) {
+            const float su = (corner == 1 || corner == 2) ? 1.0f : -1.0f;
+            const float sv = (corner >= 2) ? 1.0f : -1.0f;
+            const Vec2 uv{(su + 1.0f) * 0.5f * uv_scale.x, (1.0f - sv) * 0.5f * uv_scale.y};
+            mesh.vertices.push_back({.position = origin + du * su + dv * sv,
+                                     .normal = face.normal,
+                                     .uv = uv,
+                                     .tangent = Vec4{face.u_axis, 1.0f}});
+        }
+        for (const std::uint32_t i : {0u, 1u, 2u, 0u, 2u, 3u}) {
+            mesh.indices.push_back(base + i);
+        }
+    }
+    mesh.submeshes.push_back(
+        {.first_index = 0, .index_count = static_cast<std::uint32_t>(mesh.indices.size()), .material = 0});
+    mesh.compute_bounds();
+    return mesh;
+}
+
+render::ModelData make_floor_model() {
+    render::ModelData floor;
+    floor.mesh = make_box_mesh(Vec3{kFloorHalfWidth, kFloorHalfThickness, kFloorHalfWidth});
+    render::MaterialData material;
+    material.base_color_factor = Vec4{0.42f, 0.42f, 0.40f, 1.0f};
+    material.metallic_factor = 0.0f;
+    material.roughness_factor = 0.85f;
+    floor.materials.push_back(material);
+    return floor;
 }
 
 #ifndef TYNIMA_SANDBOX_GAME_MODULE
@@ -442,14 +593,16 @@ struct Renderer {
     rhi::TextureHandle depth;
     render::FallbackTextures fallbacks;
     rhi::SamplerHandle sampler;
-    render::Model model;
+    render::Model models[2]; // kModelBottle, kModelFloor
 
     Renderer() = default;
     Renderer(Renderer&& other) noexcept
         : device(std::move(other.device)), mesh_pipeline(std::exchange(other.mesh_pipeline, {})),
           triangle_pipeline(std::exchange(other.triangle_pipeline, {})), depth(std::exchange(other.depth, {})),
           fallbacks(std::exchange(other.fallbacks, render::FallbackTextures{})),
-          sampler(std::exchange(other.sampler, {})), model(std::exchange(other.model, render::Model{})) {}
+          sampler(std::exchange(other.sampler, {})),
+          models{std::exchange(other.models[0], render::Model{}),
+                 std::exchange(other.models[1], render::Model{})} {}
     Renderer& operator=(Renderer&&) = delete;
     ~Renderer() { destroy(); }
 
@@ -473,7 +626,9 @@ struct Renderer {
     // GPU objects go before their device, and the device before the window.
     void destroy() noexcept {
         if (device != nullptr) {
-            render::destroy_model(*device, model);
+            for (render::Model& model : models) {
+                render::destroy_model(*device, model);
+            }
             device->destroy_sampler(sampler);
             render::destroy_fallback_textures(*device, fallbacks);
             device->destroy_graphics_pipeline(mesh_pipeline);
@@ -560,15 +715,19 @@ Renderer create_renderer(platform::Window& window, const render::ModelData* mode
     }
     if (model_data != nullptr) {
         const double t0 = platform::now_seconds();
-        if (!render::upload_model(*r.device, *model_data, r.fallbacks, r.model)) {
+        if (!render::upload_model(*r.device, *model_data, r.fallbacks, r.models[kModelBottle])) {
             TY_LOG_ERROR("gpu", "model upload failed: %s", platform::last_error());
         } else {
             std::size_t uploaded = 0;
-            for (const rhi::TextureHandle t : r.model.textures) {
+            for (const rhi::TextureHandle t : r.models[kModelBottle].textures) {
                 uploaded += t ? 1 : 0;
             }
             TY_LOG_INFO("gpu", "%zu of %zu textures uploaded with mipmaps in %.2f s", uploaded,
-                        r.model.textures.size(), platform::now_seconds() - t0);
+                        r.models[kModelBottle].textures.size(), platform::now_seconds() - t0);
+        }
+        const render::ModelData floor = make_floor_model();
+        if (!render::upload_model(*r.device, floor, r.fallbacks, r.models[kModelFloor])) {
+            TY_LOG_ERROR("gpu", "floor upload failed: %s", platform::last_error());
         }
     }
     return r;
@@ -614,6 +773,18 @@ int main(int argc, char** argv) {
     TY_LOG_INFO("jobs", "%u worker thread(s) + main, for %u performance cores", jobs.worker_count(),
                 tynima::core::JobSystem::performance_core_count());
 
+    // Physics steps on the same job system; bodies drive entity Transforms.
+    auto physics = physics::create_jolt_world({.max_bodies = 1024, .jobs = &jobs});
+    TY_LOG_INFO("physics", "%s, %u worker thread(s)", physics->backend_name(), jobs.worker_count());
+    {
+        physics::BodyDesc floor;
+        floor.shape = physics::Shape::box(Vec3{kFloorHalfWidth, kFloorHalfThickness, kFloorHalfWidth});
+        floor.position = Vec3{0.0f, -kFloorHalfThickness, 0.0f}; // top face at y = 0
+        floor.motion = physics::MotionType::Static;
+        floor.friction = 0.6f;
+        (void)physics->create_body(floor);
+    }
+
     // The model loads on the CPU in every mode, so the headless run covers the importer too.
     render::ModelData model_data;
     std::string import_error;
@@ -635,29 +806,33 @@ int main(int argc, char** argv) {
     } else {
         TY_LOG_WARN("model", "%s - showing the triangle instead", import_error.c_str());
     }
-    TY_LOG_INFO("controls", "right-drag looks, WASD/QE move, Shift runs, Escape quits");
+    TY_LOG_INFO("controls", "right-drag looks, WASD/QE move, Shift runs, R re-drops the pile, "
+                            "Space launches it, Escape quits");
     TY_LOG_INFO("controls", "1/2/3 unlit / Blinn-Phong / Cook-Torrance, N/M/O/V/B debug views, T tonemap, "
                             "arrows move the light");
 
     Renderer renderer = options.headless ? Renderer{} : create_renderer(*window, has_model ? &model_data : nullptr);
     bool reported_swapchain = false;
 
-    // The scene: a grid of the model as entities. Systems run over the World
-    // each frame; the renderer draws what the World says is there.
+    // The scene: the floor and a pile of the model, every one a rigid body.
+    // Systems run over the World each frame; the renderer draws what the
+    // World says is there.
     scene::World world(4096);
-    Vec3 scene_min{0.0f};
-    Vec3 scene_max{0.0f};
+    Pile pile;
     if (has_model) {
-        populate_grid(world, mesh_data, 5, scene_min, scene_max);
-        TY_LOG_INFO("scene", "%u entities in %u archetype(s), %u chunk(s)", world.entity_count(),
-                    world.archetype_count(), world.chunk_count());
+        (void)world.create(scene::Transform{.position = Vec3{0.0f, -kFloorHalfThickness, 0.0f}},
+                           scene::LocalToWorld{}, scene::MeshRenderer{.model = kModelFloor});
+        pile = populate_pile(world, *physics, mesh_data);
+        TY_LOG_INFO("scene", "%u entities in %u archetype(s), %u chunk(s); %u bodies", world.entity_count(),
+                    world.archetype_count(), world.chunk_count(), physics->body_count());
     }
 
     Shading shading;
     FlyCamera fly;
     if (has_model) {
-        const Vec3 center = (scene_min + scene_max) * 0.5f;
-        fly.frame(center, length(scene_max - scene_min) * 0.5f);
+        // Frame where the pile lands, with the falling column in view above it.
+        fly.frame(Vec3{0.0f, pile.drop_height * 0.3f, 0.0f},
+                  std::max(pile.footprint * 2.2f, pile.drop_height * 0.6f));
     }
 
     // Per-frame scratch memory: reset at the top of every frame, never freed
@@ -673,6 +848,7 @@ int main(int argc, char** argv) {
     tynima_engine engine_context;
     engine_context.world = &world;
     engine_context.input = &input;
+    engine_context.physics = physics.get();
     tynima::sdk::GameModule game(TYNIMA_SANDBOX_GAME_MODULE);
     TY_LOG_INFO("game", "loading %s", game.path().c_str());
     if (game.load(engine_context)) {
@@ -712,6 +888,9 @@ int main(int argc, char** argv) {
         if (input.key_pressed(platform::Key::Escape)) {
             running = false;
         }
+        if (input.key_pressed(platform::Key::R)) {
+            reset_pile(world, *physics, pile);
+        }
         report_edges(input);
 
         const double now = platform::now_seconds();
@@ -725,6 +904,8 @@ int main(int argc, char** argv) {
         {
             TY_PROFILE_SCOPE_NAMED("systems");
             game.update(engine_context, dt);
+            physics->step(dt); // variable steps until task 6 brings the fixed timestep
+            scene::update_bodies(world, *physics);
             scene::update_transforms(world);
         }
 
@@ -739,11 +920,10 @@ int main(int argc, char** argv) {
                     }
                     const rhi::TextureHandle depth = renderer.depth_for(frame->width(), frame->height());
                     if (auto pass = frame->begin_swapchain_pass({.r = 0.09f, .g = 0.10f, .b = 0.12f}, depth, 0.0f)) {
-                        if (renderer.model.mesh.index_count > 0 && renderer.mesh_pipeline) {
+                        if (renderer.models[kModelBottle].mesh.index_count > 0 && renderer.mesh_pipeline) {
                             const float aspect = static_cast<float>(frame->width()) / static_cast<float>(frame->height());
                             const Mat4 view_projection = fly.camera.view_projection(aspect);
                             pass->bind_pipeline(renderer.mesh_pipeline);
-                            render::bind_mesh(*pass, renderer.model.mesh);
                             const Vec3 light = shading.light_direction();
                             const FrameUniforms frame_uniforms{
                                 {fly.camera.position, 1.0f},
@@ -753,16 +933,23 @@ int main(int argc, char** argv) {
                                  static_cast<float>(shading.debug_view), shading.tonemap ? 1.0f : 0.0f}};
                             pass->push_fragment_uniforms(0, &frame_uniforms, sizeof(frame_uniforms));
                             // One draw per submesh per entity that has something to draw.
+                            std::uint32_t bound_model = 0xFFFFFFFFu;
                             world.each<scene::LocalToWorld, scene::MeshRenderer>(
                                 [&](scene::Entity, scene::LocalToWorld& local_to_world, scene::MeshRenderer& mr) {
-                                    if (!mr.visible || mr.model != 0) {
-                                        return; // the sandbox keeps exactly one model
+                                    if (!mr.visible || mr.model > kModelFloor ||
+                                        renderer.models[mr.model].mesh.index_count == 0) {
+                                        return;
+                                    }
+                                    const render::Model& model = renderer.models[mr.model];
+                                    if (bound_model != mr.model) {
+                                        render::bind_mesh(*pass, model.mesh);
+                                        bound_model = mr.model;
                                     }
                                     const MeshUniforms uniforms{view_projection * local_to_world.matrix,
                                                                 local_to_world.matrix};
                                     pass->push_vertex_uniforms(0, &uniforms, sizeof(uniforms));
-                                    for (const render::Submesh& sub : renderer.model.mesh.submeshes) {
-                                        const render::Material& material = renderer.model.materials[sub.material];
+                                    for (const render::Submesh& sub : model.mesh.submeshes) {
+                                        const render::Material& material = model.materials[sub.material];
                                         const MaterialUniforms material_uniforms{
                                             material.base_color_factor,
                                             {material.metallic_factor, material.roughness_factor,
@@ -803,7 +990,7 @@ int main(int argc, char** argv) {
         TY_PROFILE_PLOT("external heap allocations / frame", static_cast<std::int64_t>(external_allocations));
         TY_PROFILE_PLOT("frame arena bytes", static_cast<std::int64_t>(frame_arena.used()));
         if (frame_count == 60) {
-            TY_LOG_INFO("heap", "per frame: engine %llu, external (driver/OS) %llu",
+            TY_LOG_INFO("heap", "per frame: engine %llu, external (driver, OS, Jolt) %llu",
                         static_cast<unsigned long long>(engine_allocations),
                         static_cast<unsigned long long>(external_allocations));
         }
@@ -827,7 +1014,10 @@ int main(int argc, char** argv) {
         }
     }
 
-    TY_LOG_INFO("sandbox", "ran %ld frames", frame_count);
+    TY_LOG_INFO("sandbox", "ran %ld frames, %u bodies awake", frame_count, physics->active_body_count());
+    if (has_model) {
+        report_pile(world, pile);
+    }
     game.unload(engine_context);
     renderer.destroy(); // GPU objects go before the window they present to
     window.reset();

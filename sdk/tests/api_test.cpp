@@ -1,5 +1,6 @@
 #include <doctest/doctest.h>
 #include <tynima.h>
+#include <tynima/physics/physics.h>
 #include <tynima/platform/input.h>
 #include <tynima/scene/components.h>
 #include <tynima/scene/world.h>
@@ -91,6 +92,38 @@ TEST_CASE("the C API drives the World, and agrees with the C++ API by name") {
     CHECK_FALSE(api.entity_alive(&engine, e));
     CHECK(api.get_component(&engine, e, pos) == nullptr);
     CHECK_FALSE(api.destroy_entity(&engine, e));
+}
+
+TEST_CASE("physics through the C API: impulses reach the body, and nothing else is required") {
+    scene::World world(8);
+    tynima_engine engine;
+    engine.world = &world;
+    const tynima_api& api = tynima::sdk::api();
+
+    // No physics world attached: a harmless no-op.
+    api.body_add_impulse(&engine, tynima_body{1, 1}, tynima_vec3{0, 1, 0});
+
+    auto physics = tynima::physics::create_jolt_world({.gravity = tynima::math::Vec3{0.0f}});
+    engine.physics = physics.get();
+    tynima::physics::BodyDesc box;
+    box.shape = tynima::physics::Shape::box(tynima::math::Vec3{0.5f});
+    box.mass = 1.0f;
+    const tynima::physics::BodyHandle body = physics->create_body(box);
+    REQUIRE(body);
+
+    // The component's handle is the same bits the C side passes around.
+    const scene::Entity e = world.create(scene::RigidBody{body});
+    const auto* rb = world.get<scene::RigidBody>(e);
+    const tynima_body c_body{rb->body.index, rb->body.generation};
+    api.body_add_impulse(&engine, c_body, tynima_vec3{3.0f, 0.0f, 0.0f});
+    api.body_add_impulse_at(&engine, c_body, tynima_vec3{0.0f, 0.0f, 1.0f}, tynima_vec3{0.5f, 0.0f, 0.0f});
+    physics->step(1.0f / 60.0f);
+    const tynima::physics::BodyState state = physics->body_state(body);
+    CHECK(state.linear_velocity.x == doctest::Approx(3.0f).epsilon(0.01));
+    CHECK(state.angular_velocity.y != 0.0f); // the off-centre impulse spun it
+
+    api.body_add_impulse(&engine, tynima_body{99, 99}, tynima_vec3{0, 1, 0}); // stale: ignored
+    engine.physics = nullptr;
 }
 
 TEST_CASE("a missing game module fails to load with a reason") {

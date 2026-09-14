@@ -1,6 +1,7 @@
-# sandbox — the engine developer's playground: a loaded glTF model, a depth
-# buffer and a fly camera. Unlike the editor and games it may reach into
-# engine modules directly. It is a test bed, not a template for anything.
+# sandbox — the engine developer's playground: a pile of a loaded glTF model
+# in the physics world, a depth buffer and a fly camera. Unlike the editor and
+# games it may reach into engine modules directly. It is a test bed, not a
+# template for anything.
 tynima_add_app(NAME sandbox
   DEPENDS core platform rhi render physics scene assets script sdk)
 
@@ -8,7 +9,6 @@ tynima_add_app(NAME sandbox
 # sandbox knows where the build puts it and rebuilds it alongside itself.
 add_subdirectory(game)
 add_dependencies(tynima_sandbox tynima_sandbox_game)
-target_include_directories(tynima_sandbox PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/game/include)
 target_compile_definitions(tynima_sandbox PRIVATE TYNIMA_SANDBOX_GAME_MODULE="$<TARGET_FILE:tynima_sandbox_game>")
 
 # Sample content, downloaded once into the build tree rather than vendored.

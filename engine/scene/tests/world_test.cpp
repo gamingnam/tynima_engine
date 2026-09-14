@@ -239,3 +239,31 @@ TEST_CASE("update_transforms composes through Parent chains") {
     scene::update_transforms(world);
     CHECK(approx_equal(world.get<LocalToWorld>(child)->matrix.translation(), Vec3{0, 1, 0}));
 }
+
+TEST_CASE("update_bodies moves entities with their physics bodies") {
+    using scene::RigidBody;
+    using scene::Transform;
+    auto physics = physics::create_jolt_world({});
+    physics::BodyDesc box;
+    box.shape = physics::Shape::box(Vec3{0.5f});
+    box.position = Vec3{0, 5, 0};
+    const physics::BodyHandle body = physics->create_body(box);
+    REQUIRE(body);
+
+    World world(64);
+    const Entity falling =
+        world.create(Transform{.position = {0, 5, 0}, .scale = Vec3{3.0f}}, RigidBody{body});
+    const Entity stale = world.create(Transform{.position = {1, 1, 1}}, RigidBody{physics::BodyHandle{7, 9}});
+    const Entity bodiless = world.create(Transform{.position = {2, 2, 2}});
+
+    for (int i = 0; i < 30; ++i) {
+        physics->step(1.0f / 60.0f);
+    }
+    scene::update_bodies(world, *physics);
+    const Transform& moved = *world.get<Transform>(falling);
+    CHECK(moved.position.y < 4.0f);   // half a second of falling
+    CHECK(moved.scale.x == 3.0f);     // scale is the entity's, not the body's
+    CHECK(approx_equal(world.get<Transform>(stale)->position, Vec3{1, 1, 1}));
+    CHECK(approx_equal(world.get<Transform>(bodiless)->position, Vec3{2, 2, 2}));
+    CHECK(world.alive(stale));
+}

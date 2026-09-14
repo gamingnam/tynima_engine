@@ -4,16 +4,19 @@
 #include <tynima.h>
 
 #include <tynima/core/log.h>
+#include <tynima/physics/physics.h>
 #include <tynima/scene/world.h>
 #include <tynima/sdk/game_module.h>
 
 namespace {
 
 using tynima::core::LogLevel;
+using tynima::physics::BodyHandle;
 using tynima::scene::ChunkView;
 using tynima::scene::Entity;
 
 static_assert(sizeof(tynima_entity) == sizeof(Entity), "tynima_entity mirrors scene::Entity");
+static_assert(sizeof(tynima_body) == sizeof(BodyHandle), "tynima_body mirrors physics::BodyHandle");
 static_assert(static_cast<int>(TYNIMA_KEY_COUNT) == static_cast<int>(tynima::platform::Key::Count),
               "tynima_key mirrors platform::Key");
 static_assert(static_cast<int>(TYNIMA_KEY_Escape) == static_cast<int>(tynima::platform::Key::Escape));
@@ -30,6 +33,12 @@ tynima_entity from_entity(Entity e) noexcept {
 }
 tynima::platform::Key to_key(tynima_key key) noexcept {
     return static_cast<tynima::platform::Key>(key);
+}
+BodyHandle to_body(tynima_body body) noexcept {
+    return BodyHandle{body.index, body.generation};
+}
+tynima::math::Vec3 to_vec3(tynima_vec3 v) noexcept {
+    return tynima::math::Vec3{v.x, v.y, v.z};
 }
 
 tynima_component_id api_register_component(tynima_engine* engine, const char* name, uint32_t size,
@@ -101,6 +110,18 @@ double api_time_seconds(tynima_engine* engine) {
     return engine->time_seconds;
 }
 
+void api_body_add_impulse(tynima_engine* engine, tynima_body body, tynima_vec3 impulse) {
+    if (engine->physics != nullptr) {
+        engine->physics->add_impulse(to_body(body), to_vec3(impulse));
+    }
+}
+void api_body_add_impulse_at(tynima_engine* engine, tynima_body body, tynima_vec3 impulse,
+                             tynima_vec3 point) {
+    if (engine->physics != nullptr) {
+        engine->physics->add_impulse_at(to_body(body), to_vec3(impulse), to_vec3(point));
+    }
+}
+
 void api_log(tynima_engine*, tynima_log_level level, const char* message) {
     // No source location: the call site is in the module, on the far side of
     // the ABI, and the module's own file names mean nothing to the engine.
@@ -113,9 +134,23 @@ void api_log(tynima_engine*, tynima_log_level level, const char* message) {
 }
 
 const tynima_api kApi{
-    TYNIMA_API_VERSION,     api_register_component, api_create_entity, api_destroy_entity, api_entity_alive,
-    api_entity_count,       api_get_component,      api_add_component, api_remove_component, api_each_chunk,
-    api_key_down,           api_key_pressed,        api_key_released,  api_time_seconds,     api_log,
+    TYNIMA_API_VERSION,
+    api_register_component,
+    api_create_entity,
+    api_destroy_entity,
+    api_entity_alive,
+    api_entity_count,
+    api_get_component,
+    api_add_component,
+    api_remove_component,
+    api_each_chunk,
+    api_key_down,
+    api_key_pressed,
+    api_key_released,
+    api_time_seconds,
+    api_body_add_impulse,
+    api_body_add_impulse_at,
+    api_log,
 };
 
 } // namespace

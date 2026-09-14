@@ -2,6 +2,7 @@
 
 #include <tynima.h>
 
+#include <tynima/physics/physics.h>
 #include <tynima/platform/input.h>
 #include <tynima/scene/world.h>
 
@@ -14,6 +15,7 @@
 struct tynima_engine {
     tynima::scene::World* world = nullptr;
     const tynima::platform::Input* input = nullptr;
+    tynima::physics::PhysicsWorld* physics = nullptr; // optional
     double time_seconds = 0.0;
 };
 

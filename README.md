@@ -20,13 +20,13 @@ past that declaration.
 | `engine/script/`  | `core scene assets`                  | Lua / C# bindings generated from reflection                 |
 | `engine/assets/`  | `core platform render scene`         | Runtime loading of cooked blobs, GPU upload, hot reload     |
 | `engine/scene/`   | `core render physics`                | Archetype ECS, transforms, the systems that drive the rest  |
-| `engine/physics/` | `core`                               | Broadphase, narrowphase, solver, joints                     |
+| `engine/physics/` | `core`                               | Rigid bodies behind `PhysicsWorld`: Jolt now, ours next     |
 | `engine/render/`  | `core rhi`                           | Frame graph, passes, materials, culling                     |
 | `engine/rhi/`     | `core platform`                      | Render hardware interface — SDL3 GPU, then native Metal     |
 | `engine/platform/`| `core`                               | Window, input, filesystem, time, threads (wraps SDL3)       |
 | `engine/core/`    | —                                    | Allocators, containers, math, jobs, logging, reflection     |
 | `apps/sandbox/`   | any engine module                    | Engine developer's playground — a test bed, not a template  |
-| `apps/sandbox/game/` | `tynima.h` only (headers of sdk/scene/core) | The sandbox's hot-reloadable game module            |
+| `apps/sandbox/game/` | `tynima.h` only (headers of sdk/scene/physics/core) | The sandbox's hot-reloadable game module    |
 
 Transitive dependencies don't count: if a file includes `tynima/rhi/...`, its
 module must declare `rhi`. Nothing may depend on an app, and `editor` may depend
@@ -35,7 +35,8 @@ on `sdk` alone.
 ## Build
 
 Requirements: CMake 3.28+, a C++20 compiler, Ninja on macOS, Visual Studio 2022+
-on Windows. The first configure fetches SDL3 and doctest from GitHub.
+on Windows. The first configure fetches SDL3, doctest, Jolt and the rest from
+GitHub as pinned tarballs.
 
 ```sh
 brew install cmake ninja            # macOS, once
@@ -84,16 +85,33 @@ The module links nothing from the engine, so the engine has exactly one copy
 of its state, and all game state lives in the World — which is what lets the
 engine swap the library for a new build while everything keeps running.
 
-To see it: run the sandbox, edit `apps/sandbox/game/src/game.cpp` (the spin
-axis or speed, say), and rebuild only the module:
+To see it: run the sandbox and press Space — the game module launches the
+pile through the API. Edit `apps/sandbox/game/src/game.cpp` (the launch
+speed or spread), and rebuild only the module:
 
 ```sh
 cmake --build --preset macos-debug --target tynima_sandbox_game
 ```
 
 The sandbox notices the new file, unloads the old code, loads the new, and
-the bottles change behaviour — same world, same camera, no restart. Holding
-Space while it runs spins them faster, an example of input through the API.
+the next Space uses the new numbers — same world, same pile, same camera, no
+restart.
+
+## Physics
+
+`physics::PhysicsWorld` ([`engine/physics/include/tynima/physics/physics.h`](engine/physics/include/tynima/physics/physics.h))
+is the one interface: bodies as generational handles, box / sphere / capsule
+shapes, static / kinematic / dynamic motion, impulses, forces, ray casts and
+`step(dt)`. `create_jolt_world()` puts [Jolt Physics](https://github.com/jrouwe/JoltPhysics)
+behind it — the reference implementation the Phase 3 solver is measured
+against, on the same scenes through the same calls. Jolt steps on the
+engine's job system, allocates through the engine's heap (visible in Tracy,
+counted as external), and is built cross-platform deterministic. Its headers
+never leave `engine/physics/`; the layering check enforces that.
+
+Entities follow bodies through the `RigidBody` component and
+`scene::update_bodies()`, run after the step and before `update_transforms()`.
+The sandbox drops a pile of a hundred bottles on a floor; R drops it again.
 
 ## Logging and asserts
 
@@ -162,6 +180,10 @@ python3 tools/check_layering.py          # exit 1 on violations, 2 on broken dec
 python3 tools/check_layering.py --graph  # the declared graph, as Mermaid
 ```
 
+Third-party headers have one home each: SDL3 in `platform` and `rhi`, Tracy in
+`core`, cgltf and stb in `assets`, Jolt in `physics`. Everything else reaches
+them through that module's own API.
+
 ## Adding a module
 
 1. Create `engine/<name>/` with `include/tynima/<name>/`, `src/` and optionally `tests/`.
@@ -178,4 +200,4 @@ depended on before it has code. Tests under `tests/` become
 MIT — see [LICENSE](LICENSE). Sample content downloaded at configure time
 (Khronos glTF-Sample-Assets) is CC0. Third-party code fetched by the build
 keeps its own license: SDL3 (zlib), doctest (MIT), Tracy (BSD-3), cgltf (MIT),
-stb (MIT / public domain).
+stb (MIT / public domain), Jolt Physics (MIT).

@@ -19,7 +19,7 @@ checks every C/C++ source under the module against four rules:
      of the public API with no special privileges.
   4. Every source file must live inside a declared module.
   5. Third-party headers with a designated home stay there: SDL3, Tracy,
-     cgltf and stb may be included only by the modules listed in THIRD_PARTY below.
+     cgltf, stb and Jolt may be included only by the modules listed in THIRD_PARTY below.
 
 Usage:
     python3 tools/check_layering.py            # check, exit 1 on violations
@@ -46,7 +46,13 @@ SOURCE_SUFFIXES = {".h", ".hpp", ".inl", ".c", ".cc", ".cpp", ".cxx", ".m", ".mm
 
 # Include path prefix (a directory with its slash, or a bare header name) ->
 # the modules allowed to include it. Everything else goes through those.
-THIRD_PARTY = {"SDL3/": {"platform", "rhi"}, "tracy/": {"core"}, "cgltf.h": {"assets"}, "stb_": {"assets"}}
+THIRD_PARTY = {
+    "SDL3/": {"platform", "rhi"},
+    "tracy/": {"core"},
+    "cgltf.h": {"assets"},
+    "stb_": {"assets"},
+    "Jolt/": {"physics"},
+}
 
 DECLARATION_RE = re.compile(r"tynima_add_(module|app|game_module)\s*\(\s*NAME\s+(\w+)(.*?)\)", re.S)
 # <tynima/core/version.h>, "tynima/rhi/device.h", or the C ABI header <tynima.h>.

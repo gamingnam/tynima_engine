@@ -13,6 +13,7 @@
  * Version history:
  *   1  components, entities, chunk iteration, keys, time, log
  *   2  log takes a level
+ *   3  physics: impulses on a RigidBody's body
  */
 #ifndef TYNIMA_H
 #define TYNIMA_H
@@ -24,7 +25,7 @@
 extern "C" {
 #endif
 
-#define TYNIMA_API_VERSION 2u
+#define TYNIMA_API_VERSION 3u
 
 /* ---- engine version ---- */
 
@@ -61,6 +62,19 @@ typedef enum tynima_key {
 #undef TYNIMA_KEY
     TYNIMA_KEY_COUNT
 } tynima_key;
+
+/* ---- physics ---- */
+
+typedef struct tynima_vec3 {
+    float x, y, z;
+} tynima_vec3;
+
+/* A physics body handle: the same bits as physics::BodyHandle, and what the
+ * RigidBody component holds. Generation 0 is the null handle. */
+typedef struct tynima_body {
+    uint32_t index;
+    uint32_t generation;
+} tynima_body;
 
 /* ---- logging ---- */
 
@@ -115,6 +129,12 @@ typedef struct tynima_api {
 
     /* Seconds since the engine started. */
     double (*time_seconds)(tynima_engine* engine);
+
+    /* Physics. A stale body, or a host without a physics world, is a no-op.
+     * Impulses are newton-seconds, applied at once; the body wakes up. The
+     * second form applies it at a world-space point, which also spins the body. */
+    void (*body_add_impulse)(tynima_engine* engine, tynima_body body, tynima_vec3 impulse);
+    void (*body_add_impulse_at)(tynima_engine* engine, tynima_body body, tynima_vec3 impulse, tynima_vec3 point);
 
     /* One line to the engine's log, in the "game" category. */
     void (*log)(tynima_engine* engine, tynima_log_level level, const char* message);
