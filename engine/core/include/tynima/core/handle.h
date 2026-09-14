@@ -121,10 +121,18 @@ public:
     [[nodiscard]] std::uint32_t capacity() const noexcept { return capacity_; }
     [[nodiscard]] bool full() const noexcept { return free_head_ == kEnd; }
 
-    // Visits every live object as fn(HandleType, T&). Creating or destroying
-    // during the visit is not allowed.
+    // Visits every live object as fn(HandleType, T&), in index order.
+    // Creating or destroying during the visit is not allowed.
     template <typename Fn>
     void for_each(Fn&& fn) {
+        for (std::uint32_t i = 0; i < capacity_; ++i) {
+            if (slots_[i].live) {
+                fn(HandleType{i, slots_[i].generation}, *object(i));
+            }
+        }
+    }
+    template <typename Fn>
+    void for_each(Fn&& fn) const {
         for (std::uint32_t i = 0; i < capacity_; ++i) {
             if (slots_[i].live) {
                 fn(HandleType{i, slots_[i].generation}, *object(i));

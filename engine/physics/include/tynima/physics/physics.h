@@ -169,4 +169,8 @@ protected:
 // Jolt Physics behind the interface: the reference implementation.
 [[nodiscard]] std::unique_ptr<PhysicsWorld> create_jolt_world(const WorldDesc& desc);
 
+// The engine's own: the AABB tree, GJK/EPA manifolds and a sequential-impulse
+// solver (see tynima_world.cpp). Measured against Jolt on the same scenes.
+[[nodiscard]] std::unique_ptr<PhysicsWorld> create_tynima_world(const WorldDesc& desc);
+
 } // namespace tynima::physics

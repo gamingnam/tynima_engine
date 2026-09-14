@@ -3,7 +3,10 @@
 // Cook-Torrance, a reverse-Z depth buffer, an sRGB swapchain, and a fly
 // camera. Falls back to Phase 0's triangle when there is no model.
 //
-//   tynima-sandbox [--headless] [--frames N] [--model path.glb]
+//   tynima-sandbox [--headless] [--frames N] [--model path.glb] [--physics tynima|jolt]
+//
+// The pile runs on the engine's own physics by default; --physics jolt
+// drops the same pile through Jolt, and the report line at exit compares.
 //
 // Controls: hold the right mouse button to look; W/A/S/D move, Q/E descend
 // and climb, Shift runs; R drops the pile again; Space (the game module)
@@ -240,6 +243,7 @@ struct Options {
     bool headless = false;
     long max_frames = -1; // -1: run until closed
     std::string model = TYNIMA_SANDBOX_ASSETS_DIR "/WaterBottle.glb";
+    bool jolt = false; // the reference physics instead of the engine's own
 };
 
 Options parse_options(int argc, char** argv) {
@@ -251,8 +255,16 @@ Options parse_options(int argc, char** argv) {
             options.max_frames = std::strtol(argv[++i], nullptr, 10);
         } else if (std::strcmp(argv[i], "--model") == 0 && i + 1 < argc) {
             options.model = argv[++i];
+        } else if (std::strcmp(argv[i], "--physics") == 0 && i + 1 < argc) {
+            const char* which = argv[++i];
+            options.jolt = std::strcmp(which, "jolt") == 0;
+            if (!options.jolt && std::strcmp(which, "tynima") != 0) {
+                std::fprintf(stderr, "--physics: expected 'tynima' or 'jolt', got '%s'\n", which);
+                std::exit(2);
+            }
         } else {
-            std::fprintf(stderr, "usage: tynima-sandbox [--headless] [--frames N] [--model path.glb]\n");
+            std::fprintf(stderr, "usage: tynima-sandbox [--headless] [--frames N] [--model path.glb] "
+                                 "[--physics tynima|jolt]\n");
             std::exit(2);
         }
     }
@@ -774,8 +786,12 @@ int main(int argc, char** argv) {
                 tynima::core::JobSystem::performance_core_count());
 
     // Physics steps on the same job system; bodies drive entity Transforms.
-    auto physics = physics::create_jolt_world({.max_bodies = 1024, .jobs = &jobs});
-    TY_LOG_INFO("physics", "%s, %u worker thread(s)", physics->backend_name(), jobs.worker_count());
+    const physics::WorldDesc physics_desc{.max_bodies = 1024, .jobs = &jobs};
+    auto physics = options.jolt ? physics::create_jolt_world(physics_desc)
+                                : physics::create_tynima_world(physics_desc);
+    TY_LOG_INFO("physics", "%s%s", physics->backend_name(),
+                options.jolt ? " (the reference; the default is the engine's own)"
+                             : " (--physics jolt for the reference)");
     {
         physics::BodyDesc floor;
         floor.shape = physics::Shape::box(Vec3{kFloorHalfWidth, kFloorHalfThickness, kFloorHalfWidth});

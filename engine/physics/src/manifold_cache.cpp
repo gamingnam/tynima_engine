@@ -157,4 +157,13 @@ void ManifoldCache::each(Visitor fn, void* user) noexcept {
     }
 }
 
+void ManifoldCache::each(ConstVisitor fn, void* user) const noexcept {
+    for (std::uint32_t i = 0; i < size_; ++i) {
+        const Entry& e = entries_[i];
+        if (e.frame != 0) {
+            fn(user, e.a, e.b, e.manifold);
+        }
+    }
+}
+
 } // namespace tynima::physics

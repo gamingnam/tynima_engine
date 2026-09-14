@@ -150,7 +150,9 @@ public:
 
     // Visits every manifold as fn(user, a, b, manifold).
     using Visitor = void (*)(void* user, BodyHandle a, BodyHandle b, Manifold& manifold);
+    using ConstVisitor = void (*)(void* user, BodyHandle a, BodyHandle b, const Manifold& manifold);
     void each(Visitor fn, void* user) noexcept;
+    void each(ConstVisitor fn, void* user) const noexcept;
     template <typename Fn>
     void each(Fn&& fn) noexcept {
         each([](void* user, BodyHandle a, BodyHandle b, Manifold& m) { (*static_cast<Fn*>(user))(a, b, m); },

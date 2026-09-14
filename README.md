@@ -111,7 +111,9 @@ never leave `engine/physics/`; the layering check enforces that.
 
 Entities follow bodies through the `RigidBody` component and
 `scene::update_bodies()`, run after the step and before `update_transforms()`.
-The sandbox drops a pile of a hundred bottles on a floor; R drops it again.
+The sandbox drops a pile of a hundred bottles on a floor — through the
+engine's own solver by default, through Jolt with `--physics jolt` — and R
+drops it again.
 
 The pieces of our own solver arrive behind their own interfaces, each tested
 against a brute-force reference and timed on the pile's real trajectories
@@ -135,6 +137,16 @@ sampled from Jolt (`ctest` prints the numbers). So far:
   Jolt reports on a pile of spheres and capsules is found by `collide()`
   with the same normal and depth to a twentieth of a millimetre; boxes agree
   to within the rounding Jolt puts on their edges.
+- **Solver** ([`tynima_world.cpp`](engine/physics/src/tynima_world.cpp)):
+  `create_tynima_world()` is the engine's own `PhysicsWorld` — the tree, the
+  manifolds, and a sequential-impulse solver in Box2D's shape: warm-started
+  velocity iterations with friction and restitution, then non-linear
+  Gauss-Seidel position iterations against fresh anchors, so penetration is
+  fixed without pumping energy in. Bodies sleep after half a second of
+  stillness and are woken by anything moving into them. Every scene in the
+  world tests runs through both worlds with the same expectations, and the
+  sandbox's pile is dropped through both (`--physics jolt` for the
+  reference); nothing in a step allocates.
 
 ## Logging and asserts
 
