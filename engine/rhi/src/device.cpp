@@ -6,6 +6,7 @@
 #include <SDL3/SDL.h>
 
 #include <cstring>
+#include <initializer_list>
 #include <utility>
 
 namespace tynima::rhi {
