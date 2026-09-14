@@ -124,6 +124,17 @@ sampled from Jolt (`ctest` prints the numbers). So far:
   `create_aabb_tree` is a Box2D-style dynamic tree with fat boxes and
   rotations, the spatial index the rest of the engine will query. All three
   return identical pair sets.
+- **Narrowphase** ([`collision.h`](engine/physics/include/tynima/physics/collision.h)):
+  `gjk()` for the distance and closest points between two convex cores,
+  `epa()` for the way out when they overlap, and `collide()` for the whole
+  answer as a manifold of up to four points — the convex-radius trick makes
+  spheres and capsules exact and keeps EPA for boxes, and clipping the two
+  supporting faces gives a resting box all four corners in one frame.
+  `ManifoldCache` keeps manifolds across frames, matching points by where
+  they sit on each body so the solver's impulses carry over. Every contact
+  Jolt reports on a pile of spheres and capsules is found by `collide()`
+  with the same normal and depth to a twentieth of a millimetre; boxes agree
+  to within the rounding Jolt puts on their edges.
 
 ## Logging and asserts
 

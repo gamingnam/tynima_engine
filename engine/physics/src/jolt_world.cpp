@@ -25,6 +25,7 @@ JPH_SUPPRESS_WARNINGS
 #include <Jolt/Physics/Body/BodyCreationSettings.h>
 #include <Jolt/Physics/Body/BodyLock.h>
 #include <Jolt/Physics/Collision/CastResult.h>
+#include <Jolt/Physics/Collision/ContactListener.h>
 #include <Jolt/Physics/Collision/RayCast.h>
 #include <Jolt/Physics/Collision/Shape/BoxShape.h>
 #include <Jolt/Physics/Collision/Shape/CapsuleShape.h>
@@ -41,6 +42,7 @@ JPH_SUPPRESS_WARNINGS
 #include <mutex>
 #include <new>
 #include <thread>
+#include <vector>
 
 namespace tynima::physics {
 
@@ -296,6 +298,44 @@ JPH::ShapeRefC make_shape(const Shape& shape, const char*& error) {
     return created;
 }
 
+// --------------------------------------------------------------- contacts
+
+// Records every manifold Jolt reports during a step. Called from Jolt's
+// jobs, so from several threads at once.
+class ContactRecorder final : public JPH::ContactListener {
+public:
+    void OnContactAdded(const JPH::Body& body1, const JPH::Body& body2,
+                        const JPH::ContactManifold& manifold, JPH::ContactSettings&) override {
+        record(body1, body2, manifold);
+    }
+    void OnContactPersisted(const JPH::Body& body1, const JPH::Body& body2,
+                            const JPH::ContactManifold& manifold, JPH::ContactSettings&) override {
+        record(body1, body2, manifold);
+    }
+
+    void clear() noexcept { contacts_.clear(); }
+    void reserve(std::size_t count) { contacts_.reserve(count); }
+    [[nodiscard]] const std::vector<Contact>& contacts() const noexcept { return contacts_; }
+
+private:
+    void record(const JPH::Body& body1, const JPH::Body& body2, const JPH::ContactManifold& manifold) {
+        Contact c;
+        c.a = BodyHandle::from_packed(body1.GetUserData());
+        c.b = BodyHandle::from_packed(body2.GetUserData());
+        c.normal = from_jolt(manifold.mWorldSpaceNormal);
+        c.depth = manifold.mPenetrationDepth;
+        c.point_count = static_cast<std::uint32_t>(manifold.mRelativeContactPointsOn1.size());
+        if (c.point_count > 0) {
+            c.point = from_jolt(manifold.GetWorldSpaceContactPointOn1(0));
+        }
+        const std::lock_guard<std::mutex> lock(mutex_);
+        contacts_.push_back(c);
+    }
+
+    std::mutex mutex_;
+    std::vector<Contact> contacts_;
+};
+
 // ------------------------------------------------------------------ world
 
 struct BodyRecord {
@@ -319,6 +359,8 @@ public:
         system_.Init(max_bodies, 0, max_pairs, max_contacts, broad_phase_layers_, object_vs_broad_phase_,
                      object_pairs_);
         system_.SetGravity(to_jolt(desc.gravity));
+        contacts_.reserve(static_cast<std::size_t>(max_contacts));
+        system_.SetContactListener(&contacts_);
     }
 
     ~JoltWorld() override {
@@ -485,6 +527,7 @@ public:
         // Jolt wants collision steps of about 1/60 s: one per 60 Hz frame,
         // more when the caller hands it a bigger slice of time.
         const int collision_steps = std::max(1, static_cast<int>(std::ceil(dt * 60.0f - 1.0e-3f)));
+        contacts_.clear();
         const JPH::EPhysicsUpdateError error =
             system_.Update(dt, collision_steps, &temp_allocator_, job_system_);
         if (error != JPH::EPhysicsUpdateError::None && !reported_overflow_) {
@@ -492,6 +535,16 @@ public:
             TY_LOG_WARN("physics", "Jolt ran out of room for contacts (error %u); some were dropped. "
                                    "Raise WorldDesc::max_bodies.",
                         static_cast<unsigned>(error));
+        }
+    }
+
+    std::uint32_t contact_count() const noexcept override {
+        return static_cast<std::uint32_t>(contacts_.contacts().size());
+    }
+
+    void each_contact(void (*fn)(void* user, const Contact& contact), void* user) const override {
+        for (const Contact& c : contacts_.contacts()) {
+            fn(user, c);
         }
     }
 
@@ -529,6 +582,7 @@ private:
     BroadPhaseLayers broad_phase_layers_;
     ObjectVsBroadPhaseFilter object_vs_broad_phase_;
     ObjectPairFilter object_pairs_;
+    ContactRecorder contacts_;
     core::HandlePool<BodyRecord, BodyTag> bodies_;
     JPH::TempAllocatorImpl temp_allocator_;
     JPH::JobSystem* job_system_;

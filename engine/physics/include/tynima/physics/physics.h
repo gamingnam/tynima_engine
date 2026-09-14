@@ -94,6 +94,18 @@ struct RayHit {
     math::Vec3 normal{0.0f};
 };
 
+// A contact between two bodies as the last step found it: for drawing, and
+// for measuring our own narrowphase against the reference. Sleeping pairs
+// report nothing.
+struct Contact {
+    BodyHandle a;
+    BodyHandle b;
+    math::Vec3 normal{0.0f}; // from a to b
+    float depth = 0.0f;      // of the deepest point; negative while still apart (speculative)
+    math::Vec3 point{0.0f};  // the first manifold point, on a's surface
+    std::uint32_t point_count = 0;
+};
+
 struct WorldDesc {
     math::Vec3 gravity{0.0f, -9.81f, 0.0f};
     std::uint32_t max_bodies = 4096;
@@ -140,6 +152,15 @@ public:
     // The closest body along origin + direction * t, t in [0, max_distance].
     [[nodiscard]] virtual bool cast_ray(math::Vec3 origin, math::Vec3 direction, float max_distance,
                                         RayHit& hit) const = 0;
+
+    // The contacts the last step() worked with, one per touching pair.
+    [[nodiscard]] virtual std::uint32_t contact_count() const noexcept = 0;
+    virtual void each_contact(void (*fn)(void* user, const Contact& contact), void* user) const = 0;
+    template <typename Fn>
+    void each_contact(Fn&& fn) const {
+        each_contact([](void* user, const Contact& c) { (*static_cast<Fn*>(user))(c); },
+                     const_cast<void*>(static_cast<const void*>(&fn)));
+    }
 
 protected:
     PhysicsWorld() = default;
