@@ -9,10 +9,18 @@
 //   1. gravity, forces and damping into velocities
 //   2. bounds into the broadphase; pairs out of it
 //   3. narrowphase per pair into the manifold cache (impulses carried over)
-//   4. contact constraints: warm start, then velocity iterations
+//   4. joint and contact constraints: warm start, then velocity iterations
 //   5. integrate positions
-//   6. position iterations against the fresh anchors
-//   7. impulses back into the manifolds, sleep bookkeeping
+//   6. position iterations against the fresh anchors, joints first
+//   7. impulses back into the manifolds and joints, sleep bookkeeping
+//
+// Joints are the same machinery as contacts with different rows: a distance
+// joint is one bilateral row along the line between its anchors; a hinge
+// is three point-to-point rows, two angular rows that keep the axes aligned
+// and, at a limit, one inequality row along the axis — solved as one block,
+// because solved one after another they undo each other (an angular
+// impulse about the centre of mass moves the anchor) and converge so slowly
+// that a door rebounds off its stop.
 #include <tynima/physics/physics.h>
 
 #include <tynima/core/assert.h>
@@ -53,6 +61,7 @@ constexpr float kPi = math::kPi;
 struct Body {
     Shape shape;
     MotionType motion = MotionType::Dynamic;
+    bool lock_rotation = false;
     Vec3 position{0.0f}; // the body origin; the shape's centre is offset from it
     Quat rotation = Quat::identity();
     Vec3 com{0.0f}; // centre of mass, world space
@@ -86,15 +95,102 @@ struct Body {
         com = new_com;
         position = com - rotation.rotate(shape.center);
     }
-    // Turns by the small rotation vector `theta` (radians about each axis).
+    // Turns by the small rotation vector `theta` (radians about each axis)
+    // about the centre of mass, which stays put; the origin moves with it.
     void rotate_by(const Vec3& theta) noexcept {
         const Quat spin{theta.x, theta.y, theta.z, 0.0f};
         rotation = normalize(rotation + spin * rotation * 0.5f);
+        position = com - rotation.rotate(shape.center);
     }
     [[nodiscard]] Vec3 velocity_at(const Vec3& point) const noexcept {
         return linear_velocity + cross(angular_velocity, point - com);
     }
 };
+
+struct Joint {
+    JointType type = JointType::Distance;
+    BodyHandle a;
+    BodyHandle b; // null: the world
+    Vec3 anchor_a{0.0f};
+    Vec3 anchor_b{0.0f};
+    float length = 0.0f;
+    Vec3 axis_a{0.0f, 1.0f, 0.0f};
+    Vec3 axis_b{0.0f, 1.0f, 0.0f};
+    Vec3 reference_a{1.0f, 0.0f, 0.0f}; // perpendicular to the axis in each frame; the same world
+    Vec3 reference_b{1.0f, 0.0f, 0.0f}; // direction when the joint was made, so the angle starts at 0
+    bool limited = false;
+    float min_angle = -kPi;
+    float max_angle = kPi;
+    // Accumulated impulses, for warm starting.
+    float distance_impulse = 0.0f;
+    Vec3 point_impulse{0.0f};
+    float angular_impulse[2] = {0.0f, 0.0f};
+    float limit_impulse = 0.0f; // about the axis: <= 0 at the lower limit, >= 0 at the upper
+};
+
+// A small symmetric positive semi-definite system K x = b, factored (K = L
+// L^T) once per step and solved once per iteration. Rows without mass — an
+// angular row on a body that cannot turn — are dropped: they take no impulse.
+template <int N>
+struct SpdSystem {
+    float l[N][N] = {};
+    bool live[N] = {};
+
+    void factor(const float (&k)[N][N]) noexcept {
+        for (int i = 0; i < N; ++i) {
+            for (int j = 0; j <= i; ++j) {
+                float sum = k[i][j];
+                for (int p = 0; p < j; ++p) {
+                    sum -= l[i][p] * l[j][p];
+                }
+                if (i == j) {
+                    live[i] = k[i][i] > 0.0f && sum > 1e-6f * k[i][i];
+                    l[i][i] = live[i] ? std::sqrt(sum) : 0.0f;
+                } else {
+                    l[i][j] = live[j] ? sum / l[j][j] : 0.0f;
+                }
+            }
+        }
+    }
+
+    // Solves the leading n x n block in place: x holds b on the way in.
+    void solve(int n, float (&x)[N]) const noexcept {
+        for (int i = 0; i < n; ++i) {
+            if (!live[i]) {
+                x[i] = 0.0f;
+                continue;
+            }
+            float sum = x[i];
+            for (int p = 0; p < i; ++p) {
+                sum -= l[i][p] * x[p];
+            }
+            x[i] = sum / l[i][i];
+        }
+        for (int i = n - 1; i >= 0; --i) {
+            if (!live[i]) {
+                continue;
+            }
+            float sum = x[i];
+            for (int p = i + 1; p < n; ++p) {
+                sum -= l[p][i] * x[p];
+            }
+            x[i] = sum / l[i][i];
+        }
+    }
+};
+
+// [r]x as a matrix: skew(r) * v == cross(r, v).
+Mat3 skew(const Vec3& r) noexcept {
+    return Mat3{Vec3{0.0f, r.z, -r.y}, Vec3{-r.z, 0.0f, r.x}, Vec3{r.y, -r.x, 0.0f}};
+}
+
+Mat3 operator-(const Mat3& a, const Mat3& b) noexcept {
+    return Mat3{a[0] - b[0], a[1] - b[1], a[2] - b[2]};
+}
+
+Mat3 operator+(const Mat3& a, const Mat3& b) noexcept {
+    return Mat3{a[0] + b[0], a[1] + b[1], a[2] + b[2]};
+}
 
 // Mass and inertia of the uniform solid, about its centre of mass.
 struct MassProperties {
@@ -168,18 +264,101 @@ struct ContactConstraint {
     ConstraintPoint points[Manifold::kMaxPoints];
 };
 
+struct JointConstraint {
+    Joint* joint;
+    Body* a;
+    Body* b;
+    Vec3 ra, rb; // from each centre of mass to its anchor
+    // Distance: one row along the line between the anchors.
+    Vec3 n;
+    float distance_mass;
+    // Hinge: three point rows, two angular rows about the axes across the
+    // hinge (t) and one about it (h), which only acts at a limit.
+    static constexpr int kHingeRows = 6;
+    Vec3 h, t[2];
+    int limit = 0; // -1 at the lower limit, +1 at the upper, 0 free
+    SpdSystem<kHingeRows> system;
+    float limit_column[kHingeRows - 1]; // K's last column: how the limit impulse moves the other rows
+};
+
 class TynimaWorld final : public PhysicsWorld {
 public:
     explicit TynimaWorld(const WorldDesc& desc)
         : gravity_(desc.gravity), bodies_(std::max<std::uint32_t>(desc.max_bodies, 1)),
+          joints_(std::max<std::uint32_t>(desc.max_bodies, 1)),
           broadphase_(create_aabb_tree(std::max<std::uint32_t>(desc.max_bodies, 1), kBroadphaseMargin)),
           manifolds_(std::max<std::uint32_t>(desc.max_bodies, 1) * kPairsPerBody),
           max_constraints_(std::max<std::uint32_t>(desc.max_bodies, 1) * kPairsPerBody) {
         pairs_.reserve(max_constraints_);
         constraints_.reserve(max_constraints_);
+        joint_constraints_.reserve(joints_.capacity());
+        doomed_.reserve(64);
+        world_body_.motion = MotionType::Static;
+        world_body_.refresh_derived();
     }
 
     const char* backend_name() const noexcept override { return "Tynima"; }
+
+    // ----------------------------------------------------------- joints
+
+    JointHandle create_joint(const JointDesc& desc) override {
+        Body* a = bodies_.get(desc.a);
+        Body* b = desc.b ? bodies_.get(desc.b) : &world_body_;
+        if (a == nullptr || b == nullptr) {
+            return JointHandle::null();
+        }
+        Joint joint;
+        joint.type = desc.type;
+        joint.a = desc.a;
+        joint.b = desc.b;
+        joint.anchor_a = desc.anchor_a;
+        joint.anchor_b = desc.anchor_b;
+        joint.limited = desc.limited;
+        joint.min_angle = std::min(desc.min_angle, 0.0f);
+        joint.max_angle = std::max(desc.max_angle, 0.0f);
+        const Vec3 world_a = a->pose().to_world(desc.anchor_a);
+        const Vec3 world_b = b->pose().to_world(desc.anchor_b);
+        if (desc.type == JointType::Distance) {
+            joint.length = desc.length >= 0.0f ? desc.length : length(world_b - world_a);
+        } else {
+            joint.axis_a = normalize(desc.axis_a);
+            joint.axis_b = normalize(desc.axis_b);
+            // One world direction perpendicular to the axis, remembered in
+            // each body's frame: the angle between them reads zero now.
+            const Vec3 h = a->rotation.rotate(joint.axis_a);
+            Vec3 t1, t2;
+            tangent_basis(h, t1, t2);
+            joint.reference_a = a->pose().direction_to_local(t1);
+            joint.reference_b = b->pose().direction_to_local(t1);
+        }
+        const JointHandle handle = joints_.create(joint);
+        if (handle) {
+            wake(*a);
+            wake(*b);
+        }
+        return handle;
+    }
+
+    bool destroy_joint(JointHandle handle) override {
+        if (const Joint* joint = joints_.get(handle); joint != nullptr) {
+            // Cut loose, the bodies move again.
+            wake_other(*joint, joint->a);
+            wake_other(*joint, joint->b);
+        }
+        return joints_.destroy(handle);
+    }
+    bool valid(JointHandle handle) const noexcept override { return joints_.contains(handle); }
+    std::uint32_t joint_count() const noexcept override { return joints_.size(); }
+
+    float hinge_angle(JointHandle handle) const override {
+        const Joint* joint = joints_.get(handle);
+        if (joint == nullptr || joint->type != JointType::Hinge) {
+            return 0.0f;
+        }
+        const Body* a = bodies_.get(joint->a);
+        const Body* b = joint->b ? bodies_.get(joint->b) : &world_body_;
+        return a != nullptr && b != nullptr ? hinge_angle_of(*joint, *a, *b) : 0.0f;
+    }
 
     BodyHandle create_body(const BodyDesc& desc) override {
         const BodyHandle handle = bodies_.create();
@@ -197,11 +376,13 @@ public:
         body.self = handle;
         const MassProperties m = mass_properties(desc.shape, kDefaultDensity);
         body.radius = m.radius;
+        body.lock_rotation = desc.lock_rotation;
         if (desc.motion == MotionType::Dynamic) {
             const float mass = desc.mass > 0.0f ? desc.mass : m.mass;
             const Vec3 inertia = m.inertia * (mass / std::max(m.mass, 1e-12f));
             body.inv_mass = 1.0f / mass;
-            body.inv_inertia_local = Vec3{1.0f / inertia.x, 1.0f / inertia.y, 1.0f / inertia.z};
+            body.inv_inertia_local =
+                desc.lock_rotation ? Vec3{0.0f} : Vec3{1.0f / inertia.x, 1.0f / inertia.y, 1.0f / inertia.z};
             body.linear_velocity = desc.linear_velocity;
             body.angular_velocity = desc.angular_velocity;
             body.awake = desc.start_active;
@@ -226,8 +407,35 @@ public:
         if (body == nullptr) {
             return false;
         }
+        // A joint cannot outlive either of its bodies; what hung from it wakes.
+        doomed_.clear();
+        joints_.for_each([&](JointHandle joint, Joint& j) {
+            if (j.a == handle || j.b == handle) {
+                doomed_.push_back(joint);
+                wake_other(j, handle);
+            }
+        });
+        for (const JointHandle joint : doomed_) {
+            joints_.destroy(joint);
+        }
+        // Whatever rested on the body wakes too, or it would hang in the air.
+        broadphase_->query(
+            proxy_bounds(*body),
+            [](void* user, ProxyHandle, std::uint64_t user_data) {
+                auto& self = *static_cast<TynimaWorld*>(user);
+                if (Body* other = self.bodies_.get(BodyHandle::from_packed(user_data)); other != nullptr) {
+                    wake(*other);
+                }
+            },
+            this);
         broadphase_->remove(body->proxy);
         return bodies_.destroy(handle);
+    }
+
+    void wake_other(const Joint& joint, BodyHandle gone) {
+        if (Body* other = bodies_.get(joint.a == gone ? joint.b : joint.a); other != nullptr) {
+            wake(*other);
+        }
     }
 
     bool valid(BodyHandle handle) const noexcept override { return bodies_.contains(handle); }
@@ -310,6 +518,7 @@ public:
         integrate_velocities(dt);
         update_broadphase();
         find_contacts(dt);
+        prepare_joints();
         solve_velocities();
         integrate_positions(dt);
         solve_positions();
@@ -480,9 +689,251 @@ private:
         return c;
     }
 
+    // -------------------------------------------------------- joint rows
+
+    // How far A has turned about the axis relative to B: the angle from B's
+    // reference direction round to A's, right-handed about the axis.
+    [[nodiscard]] static float hinge_angle_of(const Joint& joint, const Body& a, const Body& b) noexcept {
+        const Vec3 h = a.rotation.rotate(joint.axis_a);
+        const Vec3 ua = a.rotation.rotate(joint.reference_a);
+        const Vec3 ub = b.rotation.rotate(joint.reference_b);
+        return std::atan2(dot(cross(ub, ua), h), dot(ua, ub));
+    }
+
+    void prepare_joints() {
+        TY_PROFILE_SCOPE_NAMED("joints");
+        joint_constraints_.clear();
+        joints_.for_each([&](JointHandle, Joint& joint) {
+            Body* a = bodies_.get(joint.a);
+            Body* b = joint.b ? bodies_.get(joint.b) : &world_body_;
+            if (a == nullptr || b == nullptr) {
+                return; // a body went away: the joint is inert until destroyed
+            }
+            // Joined bodies sleep and wake together.
+            if (a->moving || b->moving || (a->awake && !b->awake && b->dynamic()) ||
+                (b->awake && !a->awake && a->dynamic())) {
+                wake(*a);
+                wake(*b);
+            }
+            if (!a->moves() && !b->moves()) {
+                return;
+            }
+            JointConstraint c{};
+            c.joint = &joint;
+            c.a = a;
+            c.b = b;
+            const Vec3 pa = a->pose().to_world(joint.anchor_a);
+            const Vec3 pb = b->pose().to_world(joint.anchor_b);
+            c.ra = pa - a->com;
+            c.rb = pb - b->com;
+            const float inv_ma = effective_inv_mass(*a);
+            const float inv_mb = effective_inv_mass(*b);
+            if (joint.type == JointType::Distance) {
+                const Vec3 d = pb - pa;
+                const float len = length(d);
+                c.n = len > 1e-6f ? d * (1.0f / len) : Vec3::unit_y();
+                c.distance_mass = inverse_effective_mass(*a, *b, inv_ma, inv_mb, c.ra, c.rb, c.n);
+            } else {
+                c.h = a->rotation.rotate(joint.axis_a);
+                tangent_basis(c.h, c.t[0], c.t[1]);
+                if (joint.limited) {
+                    const float angle = hinge_angle_of(joint, *a, *b);
+                    c.limit = angle <= joint.min_angle ? -1 : (angle >= joint.max_angle ? 1 : 0);
+                }
+                if (c.limit == 0) {
+                    joint.limit_impulse = 0.0f;
+                }
+                hinge_system(*a, *b, inv_ma, inv_mb, c);
+            }
+            joint_constraints_.push_back(c);
+        });
+    }
+
+    void warm_start_joints() {
+        for (JointConstraint& c : joint_constraints_) {
+            Joint& j = *c.joint;
+            if (j.type == JointType::Distance) {
+                apply_impulse(*c.a, *c.b, c.ra, c.rb, c.n * j.distance_impulse);
+            } else {
+                apply_impulse(*c.a, *c.b, c.ra, c.rb, j.point_impulse);
+                apply_angular_impulse(*c.a, *c.b,
+                                      c.t[0] * j.angular_impulse[0] + c.t[1] * j.angular_impulse[1] +
+                                          c.h * j.limit_impulse);
+            }
+        }
+    }
+
+    void solve_joint_velocities() {
+        for (JointConstraint& c : joint_constraints_) {
+            Body& a = *c.a;
+            Body& b = *c.b;
+            Joint& j = *c.joint;
+            if (j.type == JointType::Distance) {
+                const Vec3 dv = (b.linear_velocity + cross(b.angular_velocity, c.rb)) -
+                                (a.linear_velocity + cross(a.angular_velocity, c.ra));
+                const float lambda = -c.distance_mass * dot(dv, c.n);
+                j.distance_impulse += lambda;
+                apply_impulse(a, b, c.ra, c.rb, c.n * lambda);
+                continue;
+            }
+            solve_hinge_velocity(c, a, b, j);
+        }
+    }
+
+    // K = J M^-1 J^T for the hinge's rows, in the order the impulses are
+    // applied: a point impulse P on B and its opposite on A, then angular
+    // impulses about t0, t1 and h on B and their opposites on A.
+    static void hinge_system(const Body& a, const Body& b, float inv_ma, float inv_mb,
+                             JointConstraint& c) noexcept {
+        constexpr int kRows = JointConstraint::kHingeRows;
+        const Mat3 zero{Vec3{0.0f}, Vec3{0.0f}, Vec3{0.0f}};
+        const Mat3& ia = inv_ma > 0.0f ? a.inv_inertia_world : zero;
+        const Mat3& ib = inv_mb > 0.0f ? b.inv_inertia_world : zero;
+        const Mat3 sa = skew(c.ra);
+        const Mat3 sb = skew(c.rb);
+        const Mat3 point = Mat3::scaling(Vec3{inv_ma + inv_mb}) - sa * ia * sa - sb * ib * sb;
+        // How an angular impulse about u moves the anchors apart, and how a
+        // point impulse turns the bodies: the same matrix, transposed.
+        const Mat3 coupling = (sa * ia + sb * ib) * -1.0f;
+        const Mat3 angular = ia + ib;
+        const Vec3 axes[3] = {c.t[0], c.t[1], c.h};
+        float k[kRows][kRows];
+        for (int i = 0; i < 3; ++i) {
+            for (int j = 0; j < 3; ++j) {
+                k[i][j] = point(static_cast<std::size_t>(i), static_cast<std::size_t>(j));
+            }
+            for (int u = 0; u < 3; ++u) {
+                const Vec3 column = coupling * axes[u];
+                k[i][3 + u] = column[static_cast<std::size_t>(i)];
+                k[3 + u][i] = column[static_cast<std::size_t>(i)];
+            }
+        }
+        for (int u = 0; u < 3; ++u) {
+            for (int v = 0; v < 3; ++v) {
+                k[3 + u][3 + v] = dot(axes[u], angular * axes[v]);
+            }
+        }
+        for (int i = 0; i < kRows - 1; ++i) {
+            c.limit_column[i] = k[i][kRows - 1];
+        }
+        c.system.factor(k);
+    }
+
+    // One Gauss-Seidel visit of the hinge: all its rows at once. At a limit
+    // the axis row joins in, and if that would pull the accumulated limit
+    // impulse through zero, it is pinned there and the rest re-solved
+    // without it — the block equivalent of clamping a single row.
+    static void solve_hinge_velocity(const JointConstraint& c, Body& a, Body& b, Joint& j) noexcept {
+        constexpr int kRows = JointConstraint::kHingeRows;
+        const Vec3 dv = (b.linear_velocity + cross(b.angular_velocity, c.rb)) -
+                        (a.linear_velocity + cross(a.angular_velocity, c.ra));
+        const Vec3 dw = b.angular_velocity - a.angular_velocity;
+        float x[kRows] = {-dv.x, -dv.y, -dv.z, -dot(dw, c.t[0]), -dot(dw, c.t[1]), -dot(dw, c.h)};
+        int rows = kRows - 1;
+        float limit_lambda = 0.0f;
+        if (c.limit != 0) {
+            rows = kRows;
+            c.system.solve(kRows, x);
+            // The upper limit may only ever push A back (a positive impulse
+            // on B, its opposite on A), the lower limit only forward.
+            const float total = j.limit_impulse + x[kRows - 1];
+            if ((c.limit > 0 && total < 0.0f) || (c.limit < 0 && total > 0.0f)) {
+                limit_lambda = -j.limit_impulse;
+                x[0] = -dv.x;
+                x[1] = -dv.y;
+                x[2] = -dv.z;
+                x[3] = -dot(dw, c.t[0]);
+                x[4] = -dot(dw, c.t[1]);
+                for (int i = 0; i < kRows - 1; ++i) {
+                    x[i] -= c.limit_column[i] * limit_lambda;
+                }
+                rows = kRows - 1;
+                c.system.solve(rows, x);
+            } else {
+                limit_lambda = x[kRows - 1];
+            }
+        } else {
+            c.system.solve(rows, x);
+        }
+        const Vec3 point{x[0], x[1], x[2]};
+        j.point_impulse += point;
+        j.angular_impulse[0] += x[3];
+        j.angular_impulse[1] += x[4];
+        j.limit_impulse += limit_lambda;
+        apply_impulse(a, b, c.ra, c.rb, point);
+        apply_angular_impulse(a, b, c.t[0] * x[3] + c.t[1] * x[4] + c.h * limit_lambda);
+    }
+
+    void solve_joint_positions() {
+        for (const JointConstraint& c : joint_constraints_) {
+            Body& a = *c.a;
+            Body& b = *c.b;
+            const Joint& j = *c.joint;
+            const float inv_ma = effective_inv_mass(a);
+            const float inv_mb = effective_inv_mass(b);
+            const Vec3 pa = a.pose().to_world(j.anchor_a);
+            const Vec3 pb = b.pose().to_world(j.anchor_b);
+            const Vec3 ra = pa - a.com;
+            const Vec3 rb = pb - b.com;
+            if (j.type == JointType::Distance) {
+                const Vec3 d = pb - pa;
+                const float len = length(d);
+                if (len < 1e-6f) {
+                    continue;
+                }
+                const Vec3 n = d * (1.0f / len);
+                const float error = math::clamp(len - j.length, -kMaxCorrection, kMaxCorrection);
+                const float mass = inverse_effective_mass(a, b, inv_ma, inv_mb, ra, rb, n);
+                apply_position_impulse(a, b, ra, rb, n * (-kBaumgarte * error * mass));
+                continue;
+            }
+            // Axes: rotate the bodies so B's axis meets A's.
+            const Vec3 ha = a.rotation.rotate(j.axis_a);
+            const Vec3 hb = b.rotation.rotate(j.axis_b);
+            const Vec3 misalignment = cross(ha, hb);
+            Vec3 t1, t2;
+            tangent_basis(ha, t1, t2);
+            for (const Vec3& t : {t1, t2}) {
+                const float error = math::clamp(dot(misalignment, t), -0.5f, 0.5f);
+                const float mass = angular_effective_mass(a, b, inv_ma, inv_mb, t);
+                apply_angular_position_impulse(a, b, t * (-kBaumgarte * error * mass));
+            }
+            if (j.limited) {
+                const float angle = hinge_angle_of(j, a, b);
+                float error = 0.0f;
+                if (angle < j.min_angle) {
+                    error = angle - j.min_angle;
+                } else if (angle > j.max_angle) {
+                    error = angle - j.max_angle;
+                }
+                if (error != 0.0f) {
+                    // Turn A back inside the range (the impulse lands on B, its opposite on A).
+                    const float mass = angular_effective_mass(a, b, inv_ma, inv_mb, ha);
+                    const float correction = kBaumgarte * math::clamp(error, -0.5f, 0.5f) * mass;
+                    apply_angular_position_impulse(a, b, ha * correction);
+                }
+            }
+            // The anchors, last.
+            const Vec3 pa2 = a.pose().to_world(j.anchor_a);
+            const Vec3 pb2 = b.pose().to_world(j.anchor_b);
+            const Vec3 ra2 = pa2 - a.com;
+            const Vec3 rb2 = pb2 - b.com;
+            Vec3 error = pb2 - pa2;
+            const float len = length(error);
+            if (len > kMaxCorrection) {
+                error *= kMaxCorrection / len;
+            }
+            const Mat3 mass = point_mass_matrix(a, b, inv_ma, inv_mb, ra2, rb2);
+            apply_position_impulse(a, b, ra2, rb2, mass * (error * -kBaumgarte));
+        }
+    }
+
+    // ------------------------------------------------------ the velocity solve
+
     void solve_velocities() {
         TY_PROFILE_SCOPE_NAMED("solve velocities");
         // Warm start: last frame's impulses, applied at once.
+        warm_start_joints();
         for (ContactConstraint& c : constraints_) {
             for (std::uint32_t i = 0; i < c.count; ++i) {
                 const ConstraintPoint& p = c.points[i];
@@ -492,6 +943,7 @@ private:
             }
         }
         for (int iteration = 0; iteration < kVelocityIterations; ++iteration) {
+            solve_joint_velocities();
             for (ContactConstraint& c : constraints_) {
                 Body& a = *c.a;
                 Body& b = *c.b;
@@ -540,6 +992,7 @@ private:
     void solve_positions() {
         TY_PROFILE_SCOPE_NAMED("solve positions");
         for (int iteration = 0; iteration < kPositionIterations; ++iteration) {
+            solve_joint_positions();
             for (const ContactConstraint& c : constraints_) {
                 Body& a = *c.a;
                 Body& b = *c.b;
@@ -558,15 +1011,7 @@ private:
                     const Vec3 ra = pa - a.com;
                     const Vec3 rb = pb - b.com;
                     const float mass = inverse_effective_mass(a, b, inv_ma, inv_mb, ra, rb, c.normal);
-                    const Vec3 impulse = c.normal * (-correction * mass);
-                    if (inv_ma > 0.0f) {
-                        a.set_com(a.com - impulse * inv_ma);
-                        a.rotate_by((a.inv_inertia_world * cross(ra, impulse)) * -1.0f);
-                    }
-                    if (inv_mb > 0.0f) {
-                        b.set_com(b.com + impulse * inv_mb);
-                        b.rotate_by(b.inv_inertia_world * cross(rb, impulse));
-                    }
+                    apply_position_impulse(a, b, ra, rb, c.normal * (-correction * mass));
                 }
             }
         }
@@ -646,6 +1091,66 @@ private:
                                                 const ConstraintPoint& p) noexcept {
         return (b.linear_velocity + cross(b.angular_velocity, p.rb)) -
                (a.linear_velocity + cross(a.angular_velocity, p.ra));
+    }
+
+    // Effective mass for a relative angular velocity along `axis`.
+    [[nodiscard]] static float angular_effective_mass(const Body& a, const Body& b, float inv_ma,
+                                                      float inv_mb, const Vec3& axis) noexcept {
+        float k = 0.0f;
+        if (inv_ma > 0.0f) {
+            k += dot(axis, a.inv_inertia_world * axis);
+        }
+        if (inv_mb > 0.0f) {
+            k += dot(axis, b.inv_inertia_world * axis);
+        }
+        return k > 0.0f ? 1.0f / k : 0.0f;
+    }
+
+    // The inverse of the 3x3 effective-mass matrix of a point-to-point row.
+    [[nodiscard]] static Mat3 point_mass_matrix(const Body& a, const Body& b, float inv_ma, float inv_mb,
+                                                const Vec3& ra, const Vec3& rb) noexcept {
+        Mat3 k = Mat3::scaling(Vec3{inv_ma + inv_mb});
+        if (inv_ma > 0.0f) {
+            const Mat3 s = skew(ra);
+            k = k - s * a.inv_inertia_world * s;
+        }
+        if (inv_mb > 0.0f) {
+            const Mat3 s = skew(rb);
+            k = k - s * b.inv_inertia_world * s;
+        }
+        return determinant(k) > 1e-20f ? inverse(k) : Mat3{Vec3{0.0f}, Vec3{0.0f}, Vec3{0.0f}};
+    }
+
+    // An angular impulse on B, its opposite on A.
+    static void apply_angular_impulse(Body& a, Body& b, const Vec3& impulse) noexcept {
+        if (effective_inv_mass(a) > 0.0f) {
+            a.angular_velocity -= a.inv_inertia_world * impulse;
+        }
+        if (effective_inv_mass(b) > 0.0f) {
+            b.angular_velocity += b.inv_inertia_world * impulse;
+        }
+    }
+
+    // Position-solver counterparts: straight into poses, never velocities.
+    static void apply_position_impulse(Body& a, Body& b, const Vec3& ra, const Vec3& rb,
+                                       const Vec3& impulse) noexcept {
+        if (const float inv_ma = effective_inv_mass(a); inv_ma > 0.0f) {
+            a.set_com(a.com - impulse * inv_ma);
+            a.rotate_by((a.inv_inertia_world * cross(ra, impulse)) * -1.0f);
+        }
+        if (const float inv_mb = effective_inv_mass(b); inv_mb > 0.0f) {
+            b.set_com(b.com + impulse * inv_mb);
+            b.rotate_by(b.inv_inertia_world * cross(rb, impulse));
+        }
+    }
+
+    static void apply_angular_position_impulse(Body& a, Body& b, const Vec3& impulse) noexcept {
+        if (effective_inv_mass(a) > 0.0f) {
+            a.rotate_by((a.inv_inertia_world * impulse) * -1.0f);
+        }
+        if (effective_inv_mass(b) > 0.0f) {
+            b.rotate_by(b.inv_inertia_world * impulse);
+        }
     }
 
     // `impulse` on B, its opposite on A.
@@ -786,6 +1291,10 @@ private:
 
     Vec3 gravity_;
     core::HandlePool<Body, BodyTag> bodies_;
+    core::HandlePool<Joint, JointTag> joints_;
+    Body world_body_; // what a joint to the world attaches to: static, at the origin
+    std::vector<JointConstraint> joint_constraints_;
+    std::vector<JointHandle> doomed_;
     std::unique_ptr<Broadphase> broadphase_;
     ManifoldCache manifolds_;
     std::uint32_t manifolds_count_ = 0;

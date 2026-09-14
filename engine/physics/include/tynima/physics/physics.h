@@ -22,6 +22,8 @@ namespace tynima::physics {
 
 struct BodyTag {};
 using BodyHandle = core::Handle<BodyTag>;
+struct JointTag {};
+using JointHandle = core::Handle<JointTag>;
 
 enum class ShapeType : std::uint8_t { Box, Sphere, Capsule };
 
@@ -76,7 +78,30 @@ struct BodyDesc {
     math::Vec3 linear_velocity{0.0f};
     math::Vec3 angular_velocity{0.0f};
     bool start_active = true;    // false: asleep until touched
+    bool lock_rotation = false;  // never turns: a character capsule, a puck
     std::uint64_t user_data = 0; // the application's, e.g. an Entity, packed
+};
+
+enum class JointType : std::uint8_t {
+    Distance, // keeps two anchor points a fixed distance apart: a rod, a chain link
+    Hinge,    // anchors coincide and the bodies turn about one shared axis: a door
+};
+
+// Joints connect two bodies, or one body to the world when `b` is null (then
+// anchor_b and axis_b are in world space). Anchors and axes are in each
+// body's own frame, relative to its origin.
+struct JointDesc {
+    JointType type = JointType::Distance;
+    BodyHandle a;
+    BodyHandle b;
+    math::Vec3 anchor_a{0.0f};
+    math::Vec3 anchor_b{0.0f};
+    float length = -1.0f; // Distance: the distance to keep; negative = whatever it is now
+    math::Vec3 axis_a{0.0f, 1.0f, 0.0f}; // Hinge: the axis, in each frame
+    math::Vec3 axis_b{0.0f, 1.0f, 0.0f};
+    bool limited = false;      // Hinge: keep hinge_angle() within [min_angle, max_angle]
+    float min_angle = -math::kPi; // radians; min <= 0 <= max, so the pose at creation is inside
+    float max_angle = math::kPi;
 };
 
 struct BodyState {
@@ -152,6 +177,15 @@ public:
     // The closest body along origin + direction * t, t in [0, max_distance].
     [[nodiscard]] virtual bool cast_ray(math::Vec3 origin, math::Vec3 direction, float max_distance,
                                         RayHit& hit) const = 0;
+
+    // Joints. The null handle when the world is full or a body is stale.
+    [[nodiscard]] virtual JointHandle create_joint(const JointDesc& desc) = 0;
+    virtual bool destroy_joint(JointHandle joint) = 0;
+    [[nodiscard]] virtual bool valid(JointHandle joint) const noexcept = 0;
+    [[nodiscard]] virtual std::uint32_t joint_count() const noexcept = 0;
+    // A hinge's angle: how far `a` has turned about the axis relative to `b`
+    // since the joint was made, right-handed, in radians (0 for anything else).
+    [[nodiscard]] virtual float hinge_angle(JointHandle joint) const = 0;
 
     // The contacts the last step() worked with, one per touching pair.
     [[nodiscard]] virtual std::uint32_t contact_count() const noexcept = 0;

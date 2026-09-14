@@ -1,3 +1,5 @@
+#include "backends.h"
+
 #include <doctest/doctest.h>
 #include <tynima/core/jobs.h>
 #include <tynima/core/memory.h>
@@ -16,38 +18,7 @@ using namespace tynima::physics;
 using tynima::math::Quat;
 using tynima::math::Vec3;
 
-// Every scene here runs through both implementations of PhysicsWorld: Jolt,
-// the reference, and the engine's own. Same calls, same expectations.
 namespace {
-
-constexpr float kStep = 1.0f / 60.0f;
-
-using Factory = std::unique_ptr<PhysicsWorld> (*)(const WorldDesc&);
-
-struct Backend {
-    const char* name;
-    Factory make;
-};
-
-const Backend kBackends[] = {
-    {"Jolt", &create_jolt_world},
-    {"Tynima", &create_tynima_world},
-};
-
-// A 20 m square slab whose top face is y = 0.
-BodyHandle add_floor(PhysicsWorld& world) {
-    BodyDesc floor;
-    floor.shape = Shape::box(Vec3{10.0f, 0.5f, 10.0f});
-    floor.position = Vec3{0.0f, -0.5f, 0.0f};
-    floor.motion = MotionType::Static;
-    return world.create_body(floor);
-}
-
-void run(PhysicsWorld& world, float seconds) {
-    for (float t = 0.0f; t < seconds; t += kStep) {
-        world.step(kStep);
-    }
-}
 
 struct Random {
     std::mt19937 engine{4242};
@@ -208,6 +179,30 @@ TEST_CASE("handles are generational: a destroyed body's handle stops resolving")
             world->set_velocity(first, Vec3{1.0f, 0.0f, 0.0f}, Vec3{0.0f});
             world->step(kStep);
             CHECK(world->body_state(second).linear_velocity.x == 0.0f);
+        }
+    }
+}
+
+TEST_CASE("destroying a body wakes whatever rested on it") {
+    for (const Backend& backend : kBackends) {
+        SUBCASE(backend.name) {
+            auto world = backend.make({});
+            REQUIRE(add_floor(*world));
+            BodyDesc box;
+            box.shape = Shape::box(Vec3{0.5f});
+            box.position = Vec3{0.0f, 0.5f, 0.0f};
+            const BodyHandle lower = world->create_body(box);
+            box.position = Vec3{0.0f, 1.5f, 0.0f};
+            const BodyHandle upper = world->create_body(box);
+            REQUIRE(lower);
+            REQUIRE(upper);
+            run(*world, 2.0f);
+            REQUIRE_FALSE(world->body_state(upper).active); // stacked and asleep
+
+            // The lower box goes: the upper one does not hang in the air.
+            CHECK(world->destroy_body(lower));
+            run(*world, 1.0f);
+            CHECK(world->body_state(upper).position.y == doctest::Approx(0.5f).epsilon(0.05));
         }
     }
 }
@@ -376,8 +371,9 @@ TEST_CASE("steps run on the engine job system and add no engine heap allocations
             box.shape = Shape::box(Vec3{0.25f});
             box.friction = 0.6f;
             for (int i = 0; i < 40; ++i) {
-                box.position = Vec3{static_cast<float>(i % 4) * 0.55f,
-                                    0.3f + static_cast<float>(i / 4) * 0.55f, static_cast<float>(i % 3) * 0.55f};
+                const float column = static_cast<float>(i % 4);
+                const float row = static_cast<float>(i / 4);
+                box.position = Vec3{column * 0.55f, 0.3f + row * 0.55f, static_cast<float>(i % 3) * 0.55f};
                 REQUIRE(world->create_body(box));
             }
             run(*world, 1.0f);

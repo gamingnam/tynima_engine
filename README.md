@@ -51,7 +51,10 @@ The sandbox loads a glTF model (a CC0 Khronos sample, downloaded into
 draws it with a reverse-Z depth buffer through SDL3 GPU with its Metal shaders
 compiled at runtime — sRGB textures sampled through sRGB formats, lighting in
 linear, an sRGB-encoded swapchain on the way out — and lets you fly around it: hold the right mouse button to look, W/A/S/D to move, Q/E
-to descend and climb, Shift to run, Escape to quit. `1`/`2`/`3` switch between
+to descend and climb, Shift to run, Escape to quit. `F` puts the camera
+behind the character instead: then W/A/S/D walk it, Space jumps, Shift
+runs, and it can shove bottles about, push the gate open and swing the
+hanging chain. `1`/`2`/`3` switch between
 unlit, Blinn-Phong and Cook-Torrance shading; `N`/`M`/`O`/`V`/`B` show the
 mapped normals, metallic/roughness, occlusion, vertex normals and tangents;
 `T` toggles tonemapping; the arrow keys move the light. `--model path.glb` loads
@@ -85,7 +88,7 @@ The module links nothing from the engine, so the engine has exactly one copy
 of its state, and all game state lives in the World — which is what lets the
 engine swap the library for a new build while everything keeps running.
 
-To see it: run the sandbox and press Space — the game module launches the
+To see it: run the sandbox and press L — the game module launches the
 pile through the API. Edit `apps/sandbox/game/src/game.cpp` (the launch
 speed or spread), and rebuild only the module:
 
@@ -94,15 +97,15 @@ cmake --build --preset macos-debug --target tynima_sandbox_game
 ```
 
 The sandbox notices the new file, unloads the old code, loads the new, and
-the next Space uses the new numbers — same world, same pile, same camera, no
+the next L uses the new numbers — same world, same pile, same camera, no
 restart.
 
 ## Physics
 
 `physics::PhysicsWorld` ([`engine/physics/include/tynima/physics/physics.h`](engine/physics/include/tynima/physics/physics.h))
 is the one interface: bodies as generational handles, box / sphere / capsule
-shapes, static / kinematic / dynamic motion, impulses, forces, ray casts and
-`step(dt)`. `create_jolt_world()` puts [Jolt Physics](https://github.com/jrouwe/JoltPhysics)
+shapes, static / kinematic / dynamic motion, impulses, forces, ray casts,
+distance and hinge joints, and `step(dt)`. `create_jolt_world()` puts [Jolt Physics](https://github.com/jrouwe/JoltPhysics)
 behind it — the reference implementation the Phase 3 solver is measured
 against, on the same scenes through the same calls. Jolt steps on the
 engine's job system, allocates through the engine's heap (visible in Tracy,
@@ -113,7 +116,8 @@ Entities follow bodies through the `RigidBody` component and
 `scene::update_bodies()`, run after the step and before `update_transforms()`.
 The sandbox drops a pile of a hundred bottles on a floor — through the
 engine's own solver by default, through Jolt with `--physics jolt` — and R
-drops it again.
+drops it again; beside it hang a gate on a limited hinge and a chain of
+bottles on distance joints, and a character stands ready to walk into them.
 
 The pieces of our own solver arrive behind their own interfaces, each tested
 against a brute-force reference and timed on the pile's real trajectories
@@ -143,10 +147,31 @@ sampled from Jolt (`ctest` prints the numbers). So far:
   velocity iterations with friction and restitution, then non-linear
   Gauss-Seidel position iterations against fresh anchors, so penetration is
   fixed without pumping energy in. Bodies sleep after half a second of
-  stillness and are woken by anything moving into them. Every scene in the
-  world tests runs through both worlds with the same expectations, and the
-  sandbox's pile is dropped through both (`--physics jolt` for the
-  reference); nothing in a step allocates.
+  stillness and are woken by anything moving into them — or by losing what
+  they rested on or hung from. Every scene in the world tests runs through
+  both worlds with the same expectations, and the sandbox's pile is dropped
+  through both (`--physics jolt` for the reference); nothing in a step
+  allocates.
+- **Joints** (`JointDesc` in [`physics.h`](engine/physics/include/tynima/physics/physics.h)):
+  a distance joint keeps two anchors a set length apart (a rod, a chain
+  link), a hinge keeps them together and lets the bodies turn about one
+  shared axis, optionally between limits; either can be to the world.
+  In our solver a distance joint is one bilateral row, and a hinge is six
+  rows — three for the point, two for the axis, one for the limit — solved
+  as a single 6×6 block per iteration. Row by row they undo each other (an
+  angular impulse about the centre of mass moves the anchor) and converge
+  slowly enough that a door rebounds off its stop at 5 % of its speed, which
+  is what Jolt does; as a block, the door stops dead at the limit. A
+  pendulum's period, a five-link chain's link lengths, a door's swing after
+  a push and both of its stops come out the same in both worlds.
+- **Character controller** ([`character.h`](engine/physics/include/tynima/physics/character.h)):
+  `CharacterController` is a capsule that never turns, driven by
+  `move(walk_velocity, jump, dt)` before each step: it stands on any contact
+  within its slope limit, walks along the ground plane at the asked-for
+  speed up and down slopes, holds still on them (its weight is cancelled
+  while it stands, so nothing creeps), jumps at its jump speed, keeps air
+  control, is stopped by walls and shoves light bodies aside. Walking,
+  climbing, jumping and pushing measure the same on both worlds.
 
 ## Logging and asserts
 

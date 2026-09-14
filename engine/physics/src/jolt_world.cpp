@@ -9,6 +9,7 @@
 #include <tynima/core/log.h>
 #include <tynima/core/memory.h>
 #include <tynima/core/profile.h>
+#include <tynima/physics/collision.h> // Pose
 
 #include <Jolt/Jolt.h> // first, before any other Jolt header
 
@@ -24,8 +25,11 @@ JPH_SUPPRESS_WARNINGS
 #include <Jolt/Core/TempAllocator.h>
 #include <Jolt/Physics/Body/BodyCreationSettings.h>
 #include <Jolt/Physics/Body/BodyLock.h>
+#include <Jolt/Physics/Body/BodyLockMulti.h>
 #include <Jolt/Physics/Collision/CastResult.h>
 #include <Jolt/Physics/Collision/ContactListener.h>
+#include <Jolt/Physics/Constraints/DistanceConstraint.h>
+#include <Jolt/Physics/Constraints/HingeConstraint.h>
 #include <Jolt/Physics/Collision/RayCast.h>
 #include <Jolt/Physics/Collision/Shape/BoxShape.h>
 #include <Jolt/Physics/Collision/Shape/CapsuleShape.h>
@@ -343,10 +347,22 @@ struct BodyRecord {
     std::uint64_t user_data;
 };
 
+struct JointRecord {
+    JPH::Ref<JPH::Constraint> constraint;
+    JointType type;
+    BodyHandle a;
+    BodyHandle b;
+};
+
+// Any unit vector perpendicular to `v`, for a hinge's reference direction.
+JPH::Vec3 perpendicular(JPH::Vec3Arg v) noexcept {
+    return v.GetNormalizedPerpendicular();
+}
+
 class JoltWorld final : private RuntimeReference, public PhysicsWorld {
 public:
     explicit JoltWorld(const WorldDesc& desc)
-        : bodies_(desc.max_bodies), temp_allocator_(kTempAllocatorBytes),
+        : bodies_(desc.max_bodies), joints_(desc.max_bodies), temp_allocator_(kTempAllocatorBytes),
           job_system_(desc.jobs != nullptr
                           ? static_cast<JPH::JobSystem*>(new EngineJobSystem(*desc.jobs))
                           : static_cast<JPH::JobSystem*>(new JPH::JobSystemSingleThreaded(
@@ -365,6 +381,9 @@ public:
 
     ~JoltWorld() override {
         TY_EXTERNAL_ALLOCATIONS();
+        joints_.for_each([&](JointHandle, JointRecord& record) {
+            system_.RemoveConstraint(record.constraint);
+        });
         JPH::BodyInterface& bi = system_.GetBodyInterface();
         bodies_.for_each([&](BodyHandle, BodyRecord& record) {
             bi.RemoveBody(record.id);
@@ -408,6 +427,11 @@ public:
         settings.mLinearVelocity = to_jolt(desc.linear_velocity);
         settings.mAngularVelocity = to_jolt(desc.angular_velocity);
         settings.mUserData = handle.packed(); // Jolt hands it back from queries
+        if (desc.lock_rotation) {
+            settings.mAllowedDOFs =
+                JPH::EAllowedDOFs::TranslationX | JPH::EAllowedDOFs::TranslationY |
+                JPH::EAllowedDOFs::TranslationZ;
+        }
         if (desc.mass > 0.0f && motion == JPH::EMotionType::Dynamic) {
             settings.mOverrideMassProperties = JPH::EOverrideMassProperties::CalculateInertia;
             settings.mMassPropertiesOverride.mMass = desc.mass;
@@ -432,9 +456,42 @@ public:
             return false;
         }
         JPH::BodyInterface& bi = system_.GetBodyInterface();
+        // A joint cannot outlive either of its bodies; what hung from it wakes.
+        joints_.for_each([&](JointHandle joint, JointRecord& j) {
+            if ((j.a == handle || j.b == handle) && doomed_count_ < kMaxJointsPerBody) {
+                system_.RemoveConstraint(j.constraint);
+                doomed_joints_[doomed_count_++] = joint;
+                wake_other(j, handle);
+            }
+        });
+        for (std::uint32_t i = 0; i < doomed_count_; ++i) {
+            joints_.destroy(doomed_joints_[i]);
+        }
+        doomed_count_ = 0;
+        // Whatever rested on the body wakes too, or it would hang in the air.
+        // (The bounds are read under a lock that must be gone before activating.)
+        JPH::AABox bounds;
+        bool have_bounds = false;
+        {
+            const JPH::BodyLockRead lock(system_.GetBodyLockInterface(), record->id);
+            if (lock.Succeeded()) {
+                bounds = lock.GetBody().GetWorldSpaceBounds();
+                have_bounds = true;
+            }
+        }
+        if (have_bounds) {
+            bi.ActivateBodiesInAABox(bounds, {}, {});
+        }
         bi.RemoveBody(record->id);
         bi.DestroyBody(record->id);
         return bodies_.destroy(handle);
+    }
+
+    void wake_other(const JointRecord& joint, BodyHandle gone) {
+        const BodyHandle other = joint.a == gone ? joint.b : joint.a;
+        if (const BodyRecord* record = bodies_.get(other); record != nullptr) {
+            system_.GetBodyInterface().ActivateBody(record->id);
+        }
     }
 
     bool valid(BodyHandle handle) const noexcept override { return bodies_.contains(handle); }
@@ -492,8 +549,9 @@ public:
     void set_velocity(BodyHandle handle, Vec3 linear, Vec3 angular) override {
         TY_EXTERNAL_ALLOCATIONS();
         if (const BodyRecord* record = bodies_.get(handle)) {
-            system_.GetBodyInterface().SetLinearAndAngularVelocity(record->id, to_jolt(linear),
-                                                                   to_jolt(angular));
+            JPH::BodyInterface& bi = system_.GetBodyInterface();
+            bi.SetLinearAndAngularVelocity(record->id, to_jolt(linear), to_jolt(angular));
+            bi.ActivateBody(record->id); // Jolt would let a zero velocity leave it asleep
         }
     }
 
@@ -538,6 +596,106 @@ public:
         }
     }
 
+    JointHandle create_joint(const JointDesc& desc) override {
+        TY_EXTERNAL_ALLOCATIONS();
+        const BodyRecord* record_a = bodies_.get(desc.a);
+        const BodyRecord* record_b = bodies_.get(desc.b);
+        if (record_a == nullptr || (desc.b && record_b == nullptr)) {
+            return JointHandle::null();
+        }
+        // Anchors and axes go to Jolt in world space, from where the bodies are now.
+        const BodyState state_a = body_state(desc.a);
+        const Pose pose_a{state_a.position, state_a.rotation};
+        Pose pose_b;
+        if (record_b != nullptr) {
+            const BodyState state_b = body_state(desc.b);
+            pose_b = Pose{state_b.position, state_b.rotation};
+        }
+        const JPH::Vec3 anchor_a = to_jolt(pose_a.to_world(desc.anchor_a));
+        const JPH::Vec3 anchor_b = to_jolt(pose_b.to_world(desc.anchor_b));
+
+        JPH::Ref<JPH::Constraint> constraint;
+        {
+            // The bodies are locked only while the constraint is built.
+            JPH::BodyID ids[2] = {record_a->id, record_b != nullptr ? record_b->id : JPH::BodyID()};
+            const JPH::BodyLockMultiWrite lock(system_.GetBodyLockInterface(), ids,
+                                               record_b != nullptr ? 2 : 1);
+            JPH::Body* body_a = lock.GetBody(0);
+            JPH::Body* body_b = record_b != nullptr ? lock.GetBody(1) : &JPH::Body::sFixedToWorld;
+            if (body_a == nullptr || body_b == nullptr) {
+                return JointHandle::null();
+            }
+            constraint = build_constraint(desc, pose_a, pose_b, anchor_a, anchor_b, *body_a, *body_b);
+        }
+        if (constraint == nullptr) {
+            return JointHandle::null();
+        }
+        const JointHandle handle = joints_.create(JointRecord{constraint, desc.type, desc.a, desc.b});
+        if (!handle) {
+            return handle;
+        }
+        system_.AddConstraint(constraint);
+        return handle;
+    }
+
+    static JPH::Ref<JPH::Constraint> build_constraint(const JointDesc& desc, const Pose& pose_a,
+                                                      const Pose& pose_b, JPH::Vec3Arg anchor_a,
+                                                      JPH::Vec3Arg anchor_b, JPH::Body& body_a,
+                                                      JPH::Body& body_b) {
+        switch (desc.type) {
+        case JointType::Distance: {
+            JPH::DistanceConstraintSettings settings;
+            settings.mPoint1 = anchor_a;
+            settings.mPoint2 = anchor_b;
+            settings.mMinDistance = desc.length;
+            settings.mMaxDistance = desc.length;
+            return settings.Create(body_a, body_b);
+        }
+        case JointType::Hinge: {
+            // Jolt measures its angle as body 2 relative to body 1; ours is A
+            // relative to B, so B goes in first and the angle and limits map straight across.
+            JPH::HingeConstraintSettings settings;
+            settings.mPoint1 = anchor_b;
+            settings.mPoint2 = anchor_a;
+            settings.mHingeAxis1 = to_jolt(pose_b.rotation.rotate(desc.axis_b)).Normalized();
+            settings.mHingeAxis2 = to_jolt(pose_a.rotation.rotate(desc.axis_a)).Normalized();
+            // One shared reference direction: the angle reads zero as built.
+            settings.mNormalAxis1 = perpendicular(settings.mHingeAxis1);
+            settings.mNormalAxis2 = settings.mNormalAxis1;
+            if (desc.limited) {
+                settings.mLimitsMin = std::min(desc.min_angle, 0.0f);
+                settings.mLimitsMax = std::max(desc.max_angle, 0.0f);
+            }
+            return settings.Create(body_b, body_a);
+        }
+        }
+        return nullptr;
+    }
+
+    bool destroy_joint(JointHandle handle) override {
+        TY_EXTERNAL_ALLOCATIONS();
+        const JointRecord* record = joints_.get(handle);
+        if (record == nullptr) {
+            return false;
+        }
+        system_.RemoveConstraint(record->constraint);
+        // Cut loose, the bodies move again.
+        wake_other(*record, record->a);
+        wake_other(*record, record->b);
+        return joints_.destroy(handle);
+    }
+
+    bool valid(JointHandle handle) const noexcept override { return joints_.contains(handle); }
+    std::uint32_t joint_count() const noexcept override { return joints_.size(); }
+
+    float hinge_angle(JointHandle handle) const override {
+        const JointRecord* record = joints_.get(handle);
+        if (record == nullptr || record->type != JointType::Hinge) {
+            return 0.0f;
+        }
+        return static_cast<const JPH::HingeConstraint*>(record->constraint.GetPtr())->GetCurrentAngle();
+    }
+
     std::uint32_t contact_count() const noexcept override {
         return static_cast<std::uint32_t>(contacts_.contacts().size());
     }
@@ -570,6 +728,7 @@ public:
 
 private:
     static constexpr std::size_t kTempAllocatorBytes = 8 * 1024 * 1024; // a step's scratch, never grows
+    static constexpr std::uint32_t kMaxJointsPerBody = 64;
 #define TY_STRINGIFY_(x) #x
 #define TY_STRINGIFY(x) TY_STRINGIFY_(x)
     static constexpr const char* kBackendName = "Jolt " TY_STRINGIFY(JPH_VERSION_MAJOR) "." TY_STRINGIFY(
@@ -584,6 +743,9 @@ private:
     ObjectPairFilter object_pairs_;
     ContactRecorder contacts_;
     core::HandlePool<BodyRecord, BodyTag> bodies_;
+    core::HandlePool<JointRecord, JointTag> joints_;
+    JointHandle doomed_joints_[kMaxJointsPerBody];
+    std::uint32_t doomed_count_ = 0;
     JPH::TempAllocatorImpl temp_allocator_;
     JPH::JobSystem* job_system_;
     JPH::PhysicsSystem system_;

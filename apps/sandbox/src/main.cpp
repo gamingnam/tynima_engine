@@ -25,6 +25,7 @@
 #include <tynima/platform/platform.h>
 #include <tynima/platform/time.h>
 #include <tynima/platform/window.h>
+#include <tynima/physics/character.h>
 #include <tynima/render/camera.h>
 #include <tynima/render/mesh.h>
 #include <tynima/render/model.h>
@@ -57,6 +58,9 @@ namespace {
 // Model slots the MeshRenderer component indexes into.
 constexpr std::uint32_t kModelBottle = 0;
 constexpr std::uint32_t kModelFloor = 1;
+constexpr std::uint32_t kModelCharacter = 2; // the capsule the controller walks around in
+constexpr std::uint32_t kModelGate = 3;      // a slab on a hinge
+constexpr std::uint32_t kModelCount = 4;
 
 constexpr float kFloorHalfWidth = 6.0f;
 constexpr float kFloorHalfThickness = 0.25f;
@@ -223,6 +227,172 @@ render::ModelData make_floor_model() {
     material.roughness_factor = 0.85f;
     floor.materials.push_back(material);
     return floor;
+}
+
+// A capsule standing on y: a cylinder of `half_height` each way with a
+// hemisphere on each end, `segments` around and `rings` up each cap.
+render::MeshData make_capsule_mesh(float radius, float half_height) {
+    render::MeshData mesh;
+    constexpr int kSegments = 24;
+    constexpr int kRings = 6; // per cap
+    // Rows of vertices from the bottom pole to the top pole: each cap has
+    // kRings + 1 rows, the equator rows of the two caps being the cylinder.
+    for (int cap = 0; cap < 2; ++cap) {
+        for (int ring = 0; ring <= kRings; ++ring) {
+            // Latitude from the pole (-90 degrees) to the equator for the
+            // bottom cap, the equator to the pole for the top one.
+            const float t = static_cast<float>(ring) / static_cast<float>(kRings);
+            const float latitude = cap == 0 ? -kPi * 0.5f * (1.0f - t) : kPi * 0.5f * t;
+            const float y = std::sin(latitude);
+            const float r = std::cos(latitude);
+            const float offset = cap == 0 ? -half_height : half_height;
+            for (int seg = 0; seg <= kSegments; ++seg) {
+                const float u = static_cast<float>(seg) / static_cast<float>(kSegments);
+                const float longitude = u * kTwoPi;
+                const Vec3 normal{r * std::cos(longitude), y, r * std::sin(longitude)};
+                const float height = offset + y * radius; // -half_height - radius .. half_height + radius
+                const float v = 1.0f - (height + half_height + radius) / (2.0f * (half_height + radius));
+                const Vec4 tangent{-std::sin(longitude), 0.0f, std::cos(longitude), 1.0f};
+                mesh.vertices.push_back({.position = normal * radius + Vec3{0.0f, offset, 0.0f},
+                                         .normal = normal,
+                                         .uv = Vec2{u, v},
+                                         .tangent = tangent});
+            }
+        }
+    }
+    const auto rows = static_cast<std::uint32_t>(2 * (kRings + 1));
+    const auto columns = static_cast<std::uint32_t>(kSegments + 1);
+    for (std::uint32_t row = 0; row + 1 < rows; ++row) {
+        for (std::uint32_t col = 0; col + 1 < columns; ++col) {
+            const std::uint32_t a = row * columns + col;
+            const std::uint32_t b = a + columns;
+            // Counter-clockwise seen from outside (longitude runs clockwise seen from above).
+            for (const std::uint32_t i : {a, b, a + 1, a + 1, b, b + 1}) {
+                mesh.indices.push_back(i);
+            }
+        }
+    }
+    mesh.submeshes.push_back(
+        {.first_index = 0, .index_count = static_cast<std::uint32_t>(mesh.indices.size()), .material = 0});
+    mesh.compute_bounds();
+    return mesh;
+}
+
+render::ModelData make_plain_model(render::MeshData mesh, const Vec4& color, float roughness) {
+    render::ModelData model;
+    model.mesh = std::move(mesh);
+    render::MaterialData material;
+    material.base_color_factor = color;
+    material.metallic_factor = 0.0f;
+    material.roughness_factor = roughness;
+    model.materials.push_back(material);
+    return model;
+}
+
+// ---------------------------------------------------- the rest of the scene
+
+// The character: a capsule of human proportions the controller drives, drawn
+// as one. WASD walks it (relative to the camera), Space jumps, Shift runs.
+constexpr float kCharacterRadius = 0.3f;
+constexpr float kCharacterHalfHeight = 0.5f;
+constexpr Vec3 kCharacterStart{0.0f, kCharacterRadius + kCharacterHalfHeight, 4.5f};
+constexpr float kWalkSpeed = 3.0f; // m/s; Shift doubles it
+
+// A gate on a vertical hinge beside the pile, free to swing 110 degrees each
+// way: a launched bottle knocks it, the character walks through it.
+constexpr Vec3 kGateHalf{0.05f, 0.9f, 0.6f};
+constexpr Vec3 kGatePin{2.6f, 0.9f, -0.6f}; // the hinge edge; the slab hangs off it towards +z
+constexpr float kGateSwing = radians(110.0f);
+
+// A chain of bottles hanging from a point over the floor on the other side,
+// each a short distance joint from the one above.
+constexpr Vec3 kChainTop{-2.6f, 3.2f, 0.0f};
+constexpr int kChainLinks = 4;
+constexpr float kChainGap = 0.06f;
+
+struct Rest {
+    scene::Entity character_entity;
+    physics::JointHandle gate;
+    std::vector<scene::Entity> chain;
+};
+
+Rest populate_rest(scene::World& world, physics::PhysicsWorld& physics, physics::BodyHandle character_body,
+                   const render::MeshData& bottle) {
+    Rest rest;
+    rest.character_entity = world.create(scene::Transform{.position = kCharacterStart}, scene::LocalToWorld{},
+                                         scene::MeshRenderer{.model = kModelCharacter},
+                                         scene::RigidBody{character_body});
+    {
+        physics::BodyDesc gate;
+        gate.shape = physics::Shape::box(kGateHalf);
+        gate.position = kGatePin + Vec3{0.0f, 0.0f, kGateHalf.z};
+        gate.mass = 15.0f;
+        gate.friction = 0.4f;
+        const physics::BodyHandle body = physics.create_body(gate);
+        (void)world.create(scene::Transform{.position = gate.position}, scene::LocalToWorld{},
+                           scene::MeshRenderer{.model = kModelGate}, scene::RigidBody{body});
+        physics::JointDesc hinge;
+        hinge.type = physics::JointType::Hinge;
+        hinge.a = body;
+        hinge.anchor_a = Vec3{0.0f, 0.0f, -kGateHalf.z};
+        hinge.anchor_b = kGatePin;
+        hinge.axis_a = Vec3::unit_y();
+        hinge.axis_b = Vec3::unit_y();
+        hinge.limited = true;
+        hinge.min_angle = -kGateSwing;
+        hinge.max_angle = kGateSwing;
+        rest.gate = physics.create_joint(hinge);
+    }
+    {
+        // Each bottle hangs from its top, off the bottom of the one above.
+        const Vec3 size = bottle.bounds_max - bottle.bounds_min;
+        const Vec3 center = (bottle.bounds_min + bottle.bounds_max) * 0.5f;
+        const Vec3 top{center.x, bottle.bounds_max.y, center.z};
+        const Vec3 bottom{center.x, bottle.bounds_min.y, center.z};
+        physics::BodyHandle above;
+        float hang = kChainTop.y;
+        for (int i = 0; i < kChainLinks; ++i) {
+            hang -= kChainGap;
+            physics::BodyDesc body;
+            body.shape = physics::Shape::box(size * 0.5f, center);
+            body.position = Vec3{kChainTop.x, hang - bottle.bounds_max.y, kChainTop.z};
+            body.mass = 0.6f;
+            body.friction = 0.5f;
+            const physics::BodyHandle handle = physics.create_body(body);
+            const scene::Entity entity =
+                world.create(scene::Transform{.position = body.position}, scene::LocalToWorld{},
+                             scene::MeshRenderer{.model = kModelBottle}, scene::RigidBody{handle});
+            rest.chain.push_back(entity);
+            physics::JointDesc link;
+            link.type = physics::JointType::Distance;
+            link.a = handle;
+            link.anchor_a = top;
+            link.b = above;
+            link.anchor_b = above ? bottom : kChainTop;
+            link.length = kChainGap;
+            (void)physics.create_joint(link);
+            above = handle;
+            hang -= size.y;
+        }
+    }
+    return rest;
+}
+
+void report_rest(scene::World& world, const physics::PhysicsWorld& physics,
+                 const physics::CharacterController& character, const Rest& rest) {
+    const Vec3 p = character.position();
+    TY_LOG_INFO("scene", "character at %.2f %.2f %.2f, %s", static_cast<double>(p.x),
+                static_cast<double>(p.y), static_cast<double>(p.z),
+                character.on_ground() ? "on the ground" : "in the air");
+    float lowest = kChainTop.y;
+    for (const scene::Entity entity : rest.chain) {
+        if (const auto* transform = world.get<scene::Transform>(entity)) {
+            lowest = std::min(lowest, transform->position.y);
+        }
+    }
+    const float gate_degrees = physics.hinge_angle(rest.gate) * 180.0f / kPi;
+    TY_LOG_INFO("scene", "gate at %.0f degrees, chain hangs down to %.2f m, %u joints",
+                static_cast<double>(gate_degrees), static_cast<double>(lowest), physics.joint_count());
 }
 
 #ifndef TYNIMA_SANDBOX_GAME_MODULE
@@ -554,6 +724,9 @@ struct FlyCamera {
     float pitch = 0.0f; // radians about local +x
     float speed = 1.0f; // metres per second
     bool looking = false;
+    bool follow = false; // F: hang behind the character instead of flying free
+    static constexpr float kFollowDistance = 4.0f;
+    static constexpr Vec3 kFollowFocus{0.0f, 0.5f, 0.0f}; // above the capsule's centre: head height
 
     void frame(const Vec3& center, float radius) {
         camera.position = center + Vec3{0.0f, radius * 0.35f, radius * 2.4f};
@@ -566,7 +739,24 @@ struct FlyCamera {
         speed = std::max(radius * 1.5f, 0.2f);
     }
 
-    void update(const platform::Input& input, platform::Window& window, float dt) {
+    // Where WASD point, on the ground, seen from this camera.
+    [[nodiscard]] Vec3 walk_direction(const platform::Input& input) const {
+        Vec3 forward = camera.forward();
+        forward.y = 0.0f;
+        if (length_squared(forward) < 1e-6f) {
+            forward = Quat::from_axis_angle(Vec3::unit_y(), yaw).rotate(-Vec3::unit_z());
+        }
+        forward = normalize(forward);
+        const Vec3 right = cross(forward, Vec3::unit_y());
+        Vec3 move = Vec3::zero();
+        if (input.key_down(platform::Key::W)) move += forward;
+        if (input.key_down(platform::Key::S)) move -= forward;
+        if (input.key_down(platform::Key::D)) move += right;
+        if (input.key_down(platform::Key::A)) move -= right;
+        return length_squared(move) > 0.0f ? normalize(move) : move;
+    }
+
+    void update(const platform::Input& input, platform::Window& window, float dt, const Vec3* follow_target) {
         if (input.mouse_pressed(platform::MouseButton::Right)) {
             looking = true;
             window.set_relative_mouse_mode(true);
@@ -581,6 +771,11 @@ struct FlyCamera {
             pitch = clamp(pitch - input.mouse_dy() * kSensitivity, radians(-89.0f), radians(89.0f));
         }
         camera.rotation = Quat::from_axis_angle(Vec3::unit_y(), yaw) * Quat::from_axis_angle(Vec3::unit_x(), pitch);
+        if (follow_target != nullptr) {
+            // Behind and a little above the character, looking at its head.
+            camera.position = *follow_target + kFollowFocus - camera.forward() * kFollowDistance;
+            return;
+        }
 
         Vec3 move = Vec3::zero();
         if (input.key_down(platform::Key::W)) move += camera.forward();
@@ -605,16 +800,18 @@ struct Renderer {
     rhi::TextureHandle depth;
     render::FallbackTextures fallbacks;
     rhi::SamplerHandle sampler;
-    render::Model models[2]; // kModelBottle, kModelFloor
+    render::Model models[kModelCount]; // by kModel* slot
 
     Renderer() = default;
     Renderer(Renderer&& other) noexcept
         : device(std::move(other.device)), mesh_pipeline(std::exchange(other.mesh_pipeline, {})),
           triangle_pipeline(std::exchange(other.triangle_pipeline, {})), depth(std::exchange(other.depth, {})),
           fallbacks(std::exchange(other.fallbacks, render::FallbackTextures{})),
-          sampler(std::exchange(other.sampler, {})),
-          models{std::exchange(other.models[0], render::Model{}),
-                 std::exchange(other.models[1], render::Model{})} {}
+          sampler(std::exchange(other.sampler, {})) {
+        for (std::uint32_t i = 0; i < kModelCount; ++i) {
+            models[i] = std::exchange(other.models[i], render::Model{});
+        }
+    }
     Renderer& operator=(Renderer&&) = delete;
     ~Renderer() { destroy(); }
 
@@ -741,6 +938,16 @@ Renderer create_renderer(platform::Window& window, const render::ModelData* mode
         if (!render::upload_model(*r.device, floor, r.fallbacks, r.models[kModelFloor])) {
             TY_LOG_ERROR("gpu", "floor upload failed: %s", platform::last_error());
         }
+        const render::ModelData character = make_plain_model(
+            make_capsule_mesh(kCharacterRadius, kCharacterHalfHeight), Vec4{0.20f, 0.45f, 0.85f, 1.0f}, 0.6f);
+        if (!render::upload_model(*r.device, character, r.fallbacks, r.models[kModelCharacter])) {
+            TY_LOG_ERROR("gpu", "character upload failed: %s", platform::last_error());
+        }
+        const render::ModelData gate =
+            make_plain_model(make_box_mesh(kGateHalf), Vec4{0.55f, 0.36f, 0.20f, 1.0f}, 0.8f);
+        if (!render::upload_model(*r.device, gate, r.fallbacks, r.models[kModelGate])) {
+            TY_LOG_ERROR("gpu", "gate upload failed: %s", platform::last_error());
+        }
     }
     return r;
 }
@@ -822,8 +1029,9 @@ int main(int argc, char** argv) {
     } else {
         TY_LOG_WARN("model", "%s - showing the triangle instead", import_error.c_str());
     }
-    TY_LOG_INFO("controls", "right-drag looks, WASD/QE move, Shift runs, R re-drops the pile, "
-                            "Space launches it, Escape quits");
+    TY_LOG_INFO("controls", "right-drag looks, WASD/QE fly, Shift runs, R re-drops the pile, "
+                            "L launches it, Escape quits");
+    TY_LOG_INFO("controls", "F follows the character: then WASD walk it, Space jumps, Shift runs");
     TY_LOG_INFO("controls", "1/2/3 unlit / Blinn-Phong / Cook-Torrance, N/M/O/V/B debug views, T tonemap, "
                             "arrows move the light");
 
@@ -835,12 +1043,20 @@ int main(int argc, char** argv) {
     // World says is there.
     scene::World world(4096);
     Pile pile;
+    // The character stands at the edge of the pile; the gate and the chain
+    // hang either side of it.
+    physics::CharacterController character(*physics, {.radius = kCharacterRadius,
+                                                      .half_height = kCharacterHalfHeight,
+                                                      .position = kCharacterStart});
+    Rest rest;
     if (has_model) {
         (void)world.create(scene::Transform{.position = Vec3{0.0f, -kFloorHalfThickness, 0.0f}},
                            scene::LocalToWorld{}, scene::MeshRenderer{.model = kModelFloor});
         pile = populate_pile(world, *physics, mesh_data);
-        TY_LOG_INFO("scene", "%u entities in %u archetype(s), %u chunk(s); %u bodies", world.entity_count(),
-                    world.archetype_count(), world.chunk_count(), physics->body_count());
+        rest = populate_rest(world, *physics, character.body(), mesh_data);
+        TY_LOG_INFO("scene", "%u entities in %u archetype(s), %u chunk(s); %u bodies, %u joints",
+                    world.entity_count(), world.archetype_count(), world.chunk_count(), physics->body_count(),
+                    physics->joint_count());
     }
 
     Shading shading;
@@ -907,13 +1123,35 @@ int main(int argc, char** argv) {
         if (input.key_pressed(platform::Key::R)) {
             reset_pile(world, *physics, pile);
         }
+        if (input.key_pressed(platform::Key::F)) {
+            fly.follow = !fly.follow;
+            TY_LOG_INFO("camera", "%s", fly.follow ? "following the character" : "flying free");
+        }
         report_edges(input);
 
         const double now = platform::now_seconds();
         const float dt = static_cast<float>(std::min(now - last_time, 0.1)); // clamp hitches
         last_time = now;
-        fly.update(input, *window, dt);
+        const Vec3 character_position = character.position();
+        fly.update(input, *window, dt, fly.follow ? &character_position : nullptr);
         shading.update(input, dt);
+
+        // The character walks where the camera's WASD point, when the camera
+        // is following it; headless, it takes a stroll along the edge so the
+        // controller is exercised there too.
+        {
+            Vec3 walk = Vec3::zero();
+            bool jump = false;
+            if (fly.follow) {
+                const bool run =
+                    input.key_down(platform::Key::LeftShift) || input.key_down(platform::Key::RightShift);
+                walk = fly.walk_direction(input) * (kWalkSpeed * (run ? 2.0f : 1.0f));
+                jump = input.key_pressed(platform::Key::Space);
+            } else if (options.headless && frame_count < 120) {
+                walk = Vec3{kWalkSpeed, 0.0f, 0.0f};
+            }
+            character.move(walk, jump, dt);
+        }
 
         engine_context.time_seconds = now;
         const bool reloaded = game.poll(engine_context); // a reload allocates; that frame is exempt below
@@ -952,7 +1190,7 @@ int main(int argc, char** argv) {
                             std::uint32_t bound_model = 0xFFFFFFFFu;
                             world.each<scene::LocalToWorld, scene::MeshRenderer>(
                                 [&](scene::Entity, scene::LocalToWorld& local_to_world, scene::MeshRenderer& mr) {
-                                    if (!mr.visible || mr.model > kModelFloor ||
+                                    if (!mr.visible || mr.model >= kModelCount ||
                                         renderer.models[mr.model].mesh.index_count == 0) {
                                         return;
                                     }
@@ -1033,6 +1271,7 @@ int main(int argc, char** argv) {
     TY_LOG_INFO("sandbox", "ran %ld frames, %u bodies awake", frame_count, physics->active_body_count());
     if (has_model) {
         report_pile(world, pile);
+        report_rest(world, *physics, character, rest);
     }
     game.unload(engine_context);
     renderer.destroy(); // GPU objects go before the window they present to

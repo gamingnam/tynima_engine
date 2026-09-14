@@ -2,10 +2,10 @@
 // at run time through sdk::GameModule, and reloaded whenever this file is
 // rebuilt — while the sandbox keeps running.
 //
-// Try it: with the sandbox open, press Space to launch the pile. Then change
+// Try it: with the sandbox open, press L to launch the pile. Then change
 // kLaunchSpeed below (or the spread), save, and run
 //     cmake --build --preset macos-debug --target tynima_sandbox_game
-// Press Space again: the new numbers are live within a second, and nothing
+// Press L again: the new numbers are live within a second, and nothing
 // else restarted — same world, same pile, same camera.
 //
 // Rules of the road: this module links nothing from the engine. It includes
@@ -66,7 +66,7 @@ void launch_chunk(void* user, const tynima_entity* /*entities*/, uint32_t count,
 }
 
 void on_update(const tynima_api* api, tynima_engine* engine, float /*dt*/) {
-    if (!api->key_pressed(engine, TYNIMA_KEY_Space)) {
+    if (!api->key_pressed(engine, TYNIMA_KEY_L)) {
         return;
     }
     Launch launch{api, engine};
