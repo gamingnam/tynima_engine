@@ -3,13 +3,13 @@
 // the clock it points at.
 #include <tynima.h>
 
+#include <tynima/core/log.h>
 #include <tynima/scene/world.h>
 #include <tynima/sdk/game_module.h>
 
-#include <cstdio>
-
 namespace {
 
+using tynima::core::LogLevel;
 using tynima::scene::ChunkView;
 using tynima::scene::Entity;
 
@@ -18,6 +18,9 @@ static_assert(static_cast<int>(TYNIMA_KEY_COUNT) == static_cast<int>(tynima::pla
               "tynima_key mirrors platform::Key");
 static_assert(static_cast<int>(TYNIMA_KEY_Escape) == static_cast<int>(tynima::platform::Key::Escape));
 static_assert(static_cast<int>(TYNIMA_KEY_RightSuper) == static_cast<int>(tynima::platform::Key::RightSuper));
+static_assert(static_cast<int>(TYNIMA_LOG_TRACE) == static_cast<int>(LogLevel::Trace) &&
+                  static_cast<int>(TYNIMA_LOG_FATAL) == static_cast<int>(LogLevel::Fatal),
+              "tynima_log_level mirrors core::LogLevel");
 
 Entity to_entity(tynima_entity e) noexcept {
     return Entity{e.index, e.generation};
@@ -98,12 +101,15 @@ double api_time_seconds(tynima_engine* engine) {
     return engine->time_seconds;
 }
 
-void api_log(tynima_engine* engine, const char* message) {
-    if (engine->log != nullptr) {
-        engine->log(message);
-    } else {
-        std::fprintf(stderr, "game    %s\n", message);
+void api_log(tynima_engine*, tynima_log_level level, const char* message) {
+    // No source location: the call site is in the module, on the far side of
+    // the ABI, and the module's own file names mean nothing to the engine.
+    int severity = static_cast<int>(level);
+    if (severity < static_cast<int>(TYNIMA_LOG_TRACE) || severity > static_cast<int>(TYNIMA_LOG_FATAL)) {
+        severity = static_cast<int>(TYNIMA_LOG_INFO);
     }
+    tynima::core::log_message(static_cast<LogLevel>(severity), "game", nullptr, 0, "%s",
+                              message != nullptr ? message : "");
 }
 
 const tynima_api kApi{

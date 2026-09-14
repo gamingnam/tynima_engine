@@ -9,6 +9,10 @@
  *
  * Phase 2: the world, keys, time and logging — enough for a game module to
  * own its systems. Grows with the SDK in Phase 6.
+ *
+ * Version history:
+ *   1  components, entities, chunk iteration, keys, time, log
+ *   2  log takes a level
  */
 #ifndef TYNIMA_H
 #define TYNIMA_H
@@ -20,7 +24,7 @@
 extern "C" {
 #endif
 
-#define TYNIMA_API_VERSION 1u
+#define TYNIMA_API_VERSION 2u
 
 /* ---- engine version ---- */
 
@@ -57,6 +61,20 @@ typedef enum tynima_key {
 #undef TYNIMA_KEY
     TYNIMA_KEY_COUNT
 } tynima_key;
+
+/* ---- logging ---- */
+
+/* Severity, matching the engine's core::LogLevel. Events below the engine's
+ * minimum level (Debug in Debug builds, Info otherwise, or the TYNIMA_LOG
+ * environment variable) are dropped. */
+typedef enum tynima_log_level {
+    TYNIMA_LOG_TRACE,
+    TYNIMA_LOG_DEBUG,
+    TYNIMA_LOG_INFO,
+    TYNIMA_LOG_WARN,
+    TYNIMA_LOG_ERROR,
+    TYNIMA_LOG_FATAL
+} tynima_log_level;
 
 /* ---- the API a game module receives ---- */
 
@@ -98,8 +116,8 @@ typedef struct tynima_api {
     /* Seconds since the engine started. */
     double (*time_seconds)(tynima_engine* engine);
 
-    /* One line to the engine's log. */
-    void (*log)(tynima_engine* engine, const char* message);
+    /* One line to the engine's log, in the "game" category. */
+    void (*log)(tynima_engine* engine, tynima_log_level level, const char* message);
 } tynima_api;
 
 /* ---- what a game module exports ---- */

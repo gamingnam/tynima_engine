@@ -1,6 +1,7 @@
 #include <tynima/assets/gltf.h>
 
 #include <tynima/assets/image.h>
+#include <tynima/core/log.h>
 #include <tynima/core/profile.h>
 
 #define CGLTF_IMPLEMENTATION
@@ -284,7 +285,7 @@ struct Importer {
             std::string image_error;
             if (!read_image_bytes(data.images[i], gltf_path, bytes, image_error) ||
                 !decode_image(bytes.data(), bytes.size(), model.images[i], image_error)) {
-                std::fprintf(stderr, "gltf: image %zu: %s\n", i, image_error.c_str());
+                TY_LOG_WARN("gltf", "image %zu: %s", i, image_error.c_str());
                 model.images[i].pixels.clear();
             }
         };

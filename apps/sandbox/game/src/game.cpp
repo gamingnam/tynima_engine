@@ -36,11 +36,11 @@ tynima_component_id g_spin = 0;
 void on_load(const tynima_api* api, tynima_engine* engine, bool reloaded) {
     g_transform = api->register_component(engine, Transform::kName, sizeof(Transform), alignof(Transform));
     g_spin = api->register_component(engine, Spin::kName, sizeof(Spin), alignof(Spin));
-    api->log(engine, reloaded ? "hot reloaded: same world, new code" : "game module loaded");
+    api->log(engine, TYNIMA_LOG_INFO, reloaded ? "hot reloaded: same world, new code" : "game module loaded");
 }
 
 void on_unload(const tynima_api* api, tynima_engine* engine, bool reloading) {
-    api->log(engine, reloading ? "unloading for a reload" : "game module unloaded");
+    api->log(engine, TYNIMA_LOG_INFO, reloading ? "unloading for a reload" : "game module unloaded");
 }
 
 struct Frame {

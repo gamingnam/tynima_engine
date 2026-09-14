@@ -11,6 +11,7 @@
 #include <tynima/core/arena.h>
 #include <tynima/core/assert.h>
 #include <tynima/core/jobs.h>
+#include <tynima/core/log.h>
 #include <tynima/core/memory.h>
 #include <tynima/core/profile.h>
 #include <tynima/core/version.h>
@@ -73,10 +74,6 @@ void populate_grid(scene::World& world, const render::MeshData& mesh, int side, 
 #ifndef TYNIMA_SANDBOX_GAME_MODULE
 #define TYNIMA_SANDBOX_GAME_MODULE ""
 #endif
-
-void game_log(const char* message) {
-    std::printf("game    %s\n", message);
-}
 
 #ifndef NDEBUG
 constexpr bool kGpuDebug = true; // Metal validation: catches API misuse loudly
@@ -354,8 +351,8 @@ struct Shading {
                                                  "occlusion", "vertex normals", "tangents"};
         float azimuth = std::fmod(degrees(light_azimuth), 360.0f);
         if (azimuth < 0.0f) azimuth += 360.0f;
-        std::printf("shading %s | view %s | tonemap %s | light az %.0f el %.0f\n", kModels[model], kViews[debug_view],
-                    tonemap ? "aces" : "off", static_cast<double>(azimuth),
+        TY_LOG_INFO("shading", "%s | view %s | tonemap %s | light az %.0f el %.0f", kModels[model],
+                    kViews[debug_view], tonemap ? "aces" : "off", static_cast<double>(azimuth),
                     static_cast<double>(degrees(light_elevation)));
     }
 
@@ -468,7 +465,7 @@ struct Renderer {
         }
         depth = device->create_texture({.format = device->preferred_depth_format(), .width = width, .height = height});
         if (!depth) {
-            std::fprintf(stderr, "gpu     depth texture failed: %s\n", platform::last_error());
+            TY_LOG_ERROR("gpu", "depth texture failed: %s", platform::last_error());
         }
         return depth;
     }
@@ -514,7 +511,7 @@ rhi::PipelineHandle make_pipeline(rhi::Device& device, const char* msl, const rh
         pipeline = device.create_graphics_pipeline(desc);
     }
     if (!pipeline) {
-        std::fprintf(stderr, "gpu     pipeline failed: %s\n", platform::last_error());
+        TY_LOG_ERROR("gpu", "pipeline failed: %s", platform::last_error());
     }
     device.destroy_shader(vs); // the pipeline holds what it needs
     device.destroy_shader(fs);
@@ -527,21 +524,21 @@ Renderer create_renderer(platform::Window& window, const render::ModelData* mode
     Renderer r;
     r.device = rhi::Device::create({.debug = kGpuDebug});
     if (r.device == nullptr) {
-        std::fprintf(stderr, "gpu     unavailable: %s\n", platform::last_error());
+        TY_LOG_ERROR("gpu", "unavailable: %s", platform::last_error());
         return r;
     }
-    std::printf("gpu     %s, wants %s shaders, depth %s\n", r.device->backend_name(),
+    TY_LOG_INFO("gpu", "%s, wants %s shaders, depth %s", r.device->backend_name(),
                 rhi::shader_format_name(r.device->shader_format()),
                 rhi::texture_format_name(r.device->preferred_depth_format()));
     if (!r.device->attach_window(window)) {
-        std::fprintf(stderr, "gpu     cannot present to this window: %s\n", platform::last_error());
+        TY_LOG_ERROR("gpu", "cannot present to this window: %s", platform::last_error());
         r.device.reset();
         return r;
     }
-    std::printf("swap    %s\n", r.device->swapchain_is_linear() ? "sRGB-encoded by the display hardware"
-                                                                : "plain SDR; the shader encodes sRGB itself");
+    TY_LOG_INFO("swap", "%s", r.device->swapchain_is_linear() ? "sRGB-encoded by the display hardware"
+                                                             : "plain SDR; the shader encodes sRGB itself");
     if (r.device->shader_format() != rhi::ShaderFormat::Msl) {
-        std::fprintf(stderr, "gpu     the sandbox only carries MSL until SDL_shadercross lands; drawing nothing\n");
+        TY_LOG_WARN("gpu", "the sandbox only carries MSL until SDL_shadercross lands; drawing nothing");
         return r;
     }
 
@@ -558,19 +555,19 @@ Renderer create_renderer(platform::Window& window, const render::ModelData* mode
 
     r.sampler = r.device->create_sampler({.max_anisotropy = 8.0f});
     if (!render::create_fallback_textures(*r.device, r.fallbacks) || !r.sampler) {
-        std::fprintf(stderr, "gpu     fallback textures or sampler failed: %s\n", platform::last_error());
+        TY_LOG_ERROR("gpu", "fallback textures or sampler failed: %s", platform::last_error());
         return r;
     }
     if (model_data != nullptr) {
         const double t0 = platform::now_seconds();
         if (!render::upload_model(*r.device, *model_data, r.fallbacks, r.model)) {
-            std::fprintf(stderr, "gpu     model upload failed: %s\n", platform::last_error());
+            TY_LOG_ERROR("gpu", "model upload failed: %s", platform::last_error());
         } else {
             std::size_t uploaded = 0;
             for (const rhi::TextureHandle t : r.model.textures) {
                 uploaded += t ? 1 : 0;
             }
-            std::printf("gpu     %zu of %zu textures uploaded with mipmaps in %.2f s\n", uploaded,
+            TY_LOG_INFO("gpu", "%zu of %zu textures uploaded with mipmaps in %.2f s", uploaded,
                         r.model.textures.size(), platform::now_seconds() - t0);
         }
     }
@@ -581,7 +578,7 @@ void report_edges(const platform::Input& input) {
     for (std::size_t i = 0; i < platform::kKeyCount; ++i) {
         const auto key = static_cast<platform::Key>(i);
         if (input.key_pressed(key)) {
-            std::printf("key     %s\n", platform::key_name(key));
+            TY_LOG_DEBUG("input", "%s", platform::key_name(key));
         }
     }
 }
@@ -592,28 +589,29 @@ int main(int argc, char** argv) {
     TY_PROFILE_THREAD("main");
     const Options options = parse_options(argc, argv);
 
+    TY_LOG_INFO("sandbox", "engine %s, log level %s", tynima::core::version_string(),
+                tynima::core::log_level_name(tynima::core::log_level()));
     if (!platform::init({.headless = options.headless})) {
-        std::fprintf(stderr, "platform init failed: %s\n", platform::last_error());
+        TY_LOG_ERROR("platform", "init failed: %s", platform::last_error());
         return 1;
     }
 
     auto window = platform::Window::create({.title = "tynima sandbox", .width = 1280, .height = 720});
     if (window == nullptr) {
-        std::fprintf(stderr, "window creation failed: %s\n", platform::last_error());
+        TY_LOG_ERROR("window", "creation failed: %s", platform::last_error());
         platform::shutdown();
         return 1;
     }
 
-    std::printf("tynima sandbox - engine %s\n", tynima::core::version_string());
-    std::printf("window  %dx%d points, %dx%d pixels, density %.2f%s\n", window->width(), window->height(),
+    TY_LOG_INFO("window", "%dx%d points, %dx%d pixels, density %.2f%s", window->width(), window->height(),
                 window->pixel_width(), window->pixel_height(), static_cast<double>(window->pixel_density()),
                 options.headless ? " (headless)" : "");
-    std::printf("profile %s\n", tynima::core::profiling_compiled()
+    TY_LOG_INFO("profile", "%s", tynima::core::profiling_compiled()
                                      ? "tracy instrumentation compiled in; connect the Tracy GUI to 127.0.0.1"
                                      : "off (TYNIMA_PROFILE=OFF)");
 
     tynima::core::JobSystem jobs;
-    std::printf("jobs    %u worker thread(s) + main, for %u performance cores\n", jobs.worker_count(),
+    TY_LOG_INFO("jobs", "%u worker thread(s) + main, for %u performance cores", jobs.worker_count(),
                 tynima::core::JobSystem::performance_core_count());
 
     // The model loads on the CPU in every mode, so the headless run covers the importer too.
@@ -625,21 +623,21 @@ int main(int argc, char** argv) {
     const render::MeshData& mesh_data = model_data.mesh;
     if (has_model) {
         const Vec3 size = mesh_data.bounds_max - mesh_data.bounds_min;
-        std::printf("model   %s: %zu vertices, %zu triangles, %zu submeshes, %.3f x %.3f x %.3f m\n",
+        TY_LOG_INFO("model", "%s: %zu vertices, %zu triangles, %zu submeshes, %.3f x %.3f x %.3f m",
                     options.model.c_str(), mesh_data.vertices.size(), mesh_data.indices.size() / 3,
                     mesh_data.submeshes.size(), static_cast<double>(size.x), static_cast<double>(size.y),
                     static_cast<double>(size.z));
-        std::printf("model   %zu materials, %zu images decoded in %.2f s", model_data.materials.size(),
+        TY_LOG_INFO("model", "%zu materials, %zu images decoded in %.2f s", model_data.materials.size(),
                     model_data.images.size(), platform::now_seconds() - import_start);
         for (const render::ImageData& image : model_data.images) {
-            std::printf(" [%ux%u%s]", image.width, image.height, image.srgb ? " sRGB" : "");
+            TY_LOG_DEBUG("model", "image %ux%u%s", image.width, image.height, image.srgb ? " sRGB" : "");
         }
-        std::printf("\n");
     } else {
-        std::fprintf(stderr, "model   %s — showing the triangle instead\n", import_error.c_str());
+        TY_LOG_WARN("model", "%s - showing the triangle instead", import_error.c_str());
     }
-    std::printf("controls right-drag looks, WASD/QE move, Shift runs, Escape quits\n"
-                "        1/2/3 unlit / Blinn-Phong / Cook-Torrance, N/M/O/V/B debug views, T tonemap, arrows move the light\n");
+    TY_LOG_INFO("controls", "right-drag looks, WASD/QE move, Shift runs, Escape quits");
+    TY_LOG_INFO("controls", "1/2/3 unlit / Blinn-Phong / Cook-Torrance, N/M/O/V/B debug views, T tonemap, "
+                            "arrows move the light");
 
     Renderer renderer = options.headless ? Renderer{} : create_renderer(*window, has_model ? &model_data : nullptr);
     bool reported_swapchain = false;
@@ -651,7 +649,7 @@ int main(int argc, char** argv) {
     Vec3 scene_max{0.0f};
     if (has_model) {
         populate_grid(world, mesh_data, 5, scene_min, scene_max);
-        std::printf("scene   %u entities in %u archetype(s), %u chunk(s)\n", world.entity_count(),
+        TY_LOG_INFO("scene", "%u entities in %u archetype(s), %u chunk(s)", world.entity_count(),
                     world.archetype_count(), world.chunk_count());
     }
 
@@ -675,14 +673,13 @@ int main(int argc, char** argv) {
     tynima_engine engine_context;
     engine_context.world = &world;
     engine_context.input = &input;
-    engine_context.log = game_log;
     tynima::sdk::GameModule game(TYNIMA_SANDBOX_GAME_MODULE);
+    TY_LOG_INFO("game", "loading %s", game.path().c_str());
     if (game.load(engine_context)) {
-        std::printf("game    %s\n        edit apps/sandbox/game/src/game.cpp, then: cmake --build --preset "
-                    "macos-debug --target tynima_sandbox_game\n",
-                    game.path().c_str());
+        TY_LOG_INFO("game", "edit apps/sandbox/game/src/game.cpp, then: cmake --build --preset macos-debug "
+                            "--target tynima_sandbox_game");
     } else {
-        std::fprintf(stderr, "game    %s - the scene will not move\n", game.last_error());
+        TY_LOG_ERROR("game", "%s - the scene will not move", game.last_error());
     }
     long frame_count = 0;
     double last_time = platform::now_seconds();
@@ -704,8 +701,8 @@ int main(int argc, char** argv) {
                 running = false;
                 break;
             case platform::EventType::WindowResized:
-                std::printf("resize  %dx%d points, %dx%d pixels\n", event.width, event.height, event.pixel_width,
-                            event.pixel_height);
+                TY_LOG_INFO("window", "resized to %dx%d points, %dx%d pixels", event.width, event.height,
+                            event.pixel_width, event.pixel_height);
                 break;
             case platform::EventType::WindowFocusGained:
             case platform::EventType::WindowFocusLost:
@@ -737,7 +734,7 @@ int main(int argc, char** argv) {
             if (auto frame = renderer.device->begin_frame()) {
                 if (frame->has_swapchain_image()) {
                     if (!reported_swapchain) {
-                        std::printf("swap    %ux%u pixels\n", frame->width(), frame->height());
+                        TY_LOG_INFO("swap", "%ux%u pixels", frame->width(), frame->height());
                         reported_swapchain = true;
                     }
                     const rhi::TextureHandle depth = renderer.depth_for(frame->width(), frame->height());
@@ -789,7 +786,7 @@ int main(int argc, char** argv) {
                 }
                 frame->submit();
             } else {
-                std::fprintf(stderr, "gpu     frame failed: %s\n", platform::last_error());
+                TY_LOG_ERROR("gpu", "frame failed: %s", platform::last_error());
                 running = false;
             }
         } else {
@@ -806,12 +803,12 @@ int main(int argc, char** argv) {
         TY_PROFILE_PLOT("external heap allocations / frame", static_cast<std::int64_t>(external_allocations));
         TY_PROFILE_PLOT("frame arena bytes", static_cast<std::int64_t>(frame_arena.used()));
         if (frame_count == 60) {
-            std::printf("heap    per frame: engine %llu, external (driver/OS) %llu\n",
+            TY_LOG_INFO("heap", "per frame: engine %llu, external (driver/OS) %llu",
                         static_cast<unsigned long long>(engine_allocations),
                         static_cast<unsigned long long>(external_allocations));
         }
         if (frame_count >= 10 && engine_allocations > 0 && !reloaded) {
-            std::fprintf(stderr, "frame %ld: engine code made %llu heap allocation(s)\n", frame_count,
+            TY_LOG_ERROR("heap", "frame %ld: engine code made %llu heap allocation(s)", frame_count,
                          static_cast<unsigned long long>(engine_allocations));
             TY_ASSERT(engine_allocations == 0, "a frame allocated on the heap from engine code");
         }
@@ -820,7 +817,8 @@ int main(int argc, char** argv) {
         ++frame_count;
         ++frames_since_report;
         if (now - last_report >= 5.0) {
-            std::printf("%.0f frames/s\n", static_cast<double>(frames_since_report) / (now - last_report));
+            TY_LOG_INFO("sandbox", "%.0f frames/s",
+                        static_cast<double>(frames_since_report) / (now - last_report));
             last_report = now;
             frames_since_report = 0;
         }
@@ -829,7 +827,7 @@ int main(int argc, char** argv) {
         }
     }
 
-    std::printf("ran %ld frames\n", frame_count);
+    TY_LOG_INFO("sandbox", "ran %ld frames", frame_count);
     game.unload(engine_context);
     renderer.destroy(); // GPU objects go before the window they present to
     window.reset();

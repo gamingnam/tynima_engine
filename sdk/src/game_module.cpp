@@ -1,10 +1,10 @@
 #include <tynima/sdk/game_module.h>
 
+#include <tynima/core/log.h>
 #include <tynima/core/profile.h>
 #include <tynima/platform/file.h>
 #include <tynima/platform/time.h>
 
-#include <cstdio>
 #include <utility>
 
 #if defined(_WIN32)
@@ -154,10 +154,10 @@ bool GameModule::poll(tynima_engine& engine) {
     const double start = platform::now_seconds();
     unload(engine, true);
     if (!load(engine)) {
-        std::fprintf(stderr, "game    reload failed: %s\n", error_.c_str());
+        TY_LOG_ERROR("game", "reload failed: %s", error_.c_str());
         return false;
     }
-    std::printf("game    reloaded %s (load #%u) in %.0f ms\n", path_.c_str(), load_count_,
+    TY_LOG_INFO("game", "reloaded %s (load #%u) in %.0f ms", path_.c_str(), load_count_,
                 (platform::now_seconds() - start) * 1000.0);
     return true;
 }

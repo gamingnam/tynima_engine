@@ -8,6 +8,9 @@ if(TYNIMA_PROFILE)
 endif()
 tynima_add_module(NAME core
   LINK ${core_libs})
+# The console log sink strips this prefix from source paths, so an error reads
+# "apps/sandbox/src/main.cpp:817" rather than the whole absolute path.
+target_compile_definitions(tynima_core PRIVATE TYNIMA_SOURCE_DIR="${PROJECT_SOURCE_DIR}/")
 if(TYNIMA_PROFILE)
   target_compile_definitions(tynima_core PUBLIC TYNIMA_PROFILE=1)
 endif()

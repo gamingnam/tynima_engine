@@ -95,6 +95,35 @@ The sandbox notices the new file, unloads the old code, loads the new, and
 the bottles change behaviour — same world, same camera, no restart. Holding
 Space while it runs spins them faster, an example of input through the API.
 
+## Logging and asserts
+
+Every message is an event — level, category, source location, thread, time —
+handed to the installed sinks. The console sink prints one line per event to
+stderr, coloured on a terminal; the profiler sink puts it on Tracy's timeline:
+
+```
+    0.140 INFO  model    1 materials, 4 images decoded in 0.14 s
+    0.140 WARN  gltf     image 2: unsupported format [thread 3]
+    1.204 FATAL assert   engine_allocations == 0: a frame allocated ... (apps/sandbox/src/main.cpp:817)
+```
+
+```cpp
+#include <tynima/core/log.h>
+TY_LOG_INFO("gpu", "%s, depth %s", backend, format);   // printf formats, checked at compile time
+```
+
+Levels are trace, debug, info, warn, error and fatal; the minimum is debug
+in Debug builds and info otherwise. `TYNIMA_LOG=trace ./tynima-sandbox`
+changes it for a run, `core::set_log_level` from code. A message is formatted
+on the stack, so logging inside a frame is fine; `core::add_log_sink` adds a
+destination (a file, a test's capture). Game modules log through the C API's
+`log(engine, level, message)`, under the "game" category.
+
+`TY_ASSERT(condition, "message")` is checked in Debug builds and compiled
+away in Release. A failure is logged at fatal and then traps in the debugger
+on the failing line when one is attached — step past it to carry on — or
+aborts when none is. `core::set_assert_handler` takes over for tests.
+
 ## Profiling
 
 Every configuration compiles in Tracy instrumentation (`TYNIMA_PROFILE`, on

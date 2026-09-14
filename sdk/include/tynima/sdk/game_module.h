@@ -10,12 +10,11 @@
 
 // What the engine hands a game module: filled in by the host each frame,
 // read by the C API functions in api.cpp. The module only ever sees the
-// opaque pointer.
+// opaque pointer. Log lines go to the engine's logger under "game".
 struct tynima_engine {
     tynima::scene::World* world = nullptr;
     const tynima::platform::Input* input = nullptr;
     double time_seconds = 0.0;
-    void (*log)(const char* message) = nullptr; // nullptr: stderr
 };
 
 namespace tynima::sdk {

@@ -1,13 +1,13 @@
 #include <tynima/rhi/device.h>
 
 #include <tynima/core/assert.h>
+#include <tynima/core/log.h>
 #include <tynima/core/memory.h>
 #include <tynima/core/profile.h>
 #include <tynima/platform/window.h>
 
 #include <SDL3/SDL.h>
 
-#include <cstdio>
 #include <cstring>
 #include <initializer_list>
 #include <utility>
@@ -404,13 +404,12 @@ Device::~Device() {
     SDL_WaitForGPUIdle(dev(device_));
 
     // Whatever is still alive is a leak by the caller; release it anyway so
-    // the driver does not keep it, and say so in Debug builds.
+    // the driver does not keep it, and say so.
     const ResourceCounts leaked = resource_counts();
     if (leaked.shaders + leaked.pipelines + leaked.buffers + leaked.textures + leaked.samplers > 0) {
-        std::fprintf(stderr,
-                     "rhi: %u shader(s), %u pipeline(s), %u buffer(s), %u texture(s), %u sampler(s) were never "
-                     "destroyed\n",
-                     leaked.shaders, leaked.pipelines, leaked.buffers, leaked.textures, leaked.samplers);
+        TY_LOG_WARN("rhi", "%u shader(s), %u pipeline(s), %u buffer(s), %u texture(s), %u sampler(s) were never "
+                           "destroyed",
+                    leaked.shaders, leaked.pipelines, leaked.buffers, leaked.textures, leaked.samplers);
     }
     pools_->pipelines.for_each([&](PipelineHandle, GraphicsPipeline& p) {
         SDL_ReleaseGPUGraphicsPipeline(dev(device_), p.handle);
