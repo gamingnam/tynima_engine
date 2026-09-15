@@ -114,10 +114,17 @@ never leave `engine/physics/`; the layering check enforces that.
 
 Entities follow bodies through the `RigidBody` component and
 `scene::update_bodies()`, run after the step and before `update_transforms()`.
-The sandbox drops a pile of a hundred bottles on a floor — through the
-engine's own solver by default, through Jolt with `--physics jolt` — and R
-drops it again; beside it hang a gate on a limited hinge and a chain of
-bottles on distance joints, and a character stands ready to walk into them.
+The simulation runs at a fixed 60 Hz whatever the frame rate:
+`physics::FixedStepper` ([`fixed_step.h`](engine/physics/include/tynima/physics/fixed_step.h))
+turns frame time into whole steps (at most four a frame, so a hitch drops
+time rather than spiralling) and says how far the frame is between the last
+two states; `scene::record_previous_poses()` before each step and
+`update_bodies(world, physics, alpha)` after them draw everything blended
+between those states. The sandbox drops a pile of a hundred bottles on a
+floor — through the engine's own solver by default, through Jolt with
+`--physics jolt` — and R drops it again; beside it hang a gate on a limited
+hinge and a chain of bottles on distance joints, and a character stands
+ready to walk into them.
 
 The pieces of our own solver arrive behind their own interfaces, each tested
 against a brute-force reference and timed on the pile's real trajectories
@@ -146,12 +153,19 @@ sampled from Jolt (`ctest` prints the numbers). So far:
   manifolds, and a sequential-impulse solver in Box2D's shape: warm-started
   velocity iterations with friction and restitution, then non-linear
   Gauss-Seidel position iterations against fresh anchors, so penetration is
-  fixed without pumping energy in. Bodies sleep after half a second of
-  stillness and are woken by anything moving into them — or by losing what
-  they rested on or hung from. Every scene in the world tests runs through
-  both worlds with the same expectations, and the sandbox's pile is dropped
-  through both (`--physics jolt` for the reference); nothing in a step
-  allocates.
+  fixed without pumping energy in. Every scene in the world tests runs
+  through both worlds with the same expectations, and the sandbox's pile is
+  dropped through both (`--physics jolt` for the reference); nothing in a
+  step allocates.
+- **Islands and sleep**: each step, union-find over the touching pairs and
+  the joints groups the bodies into islands — what touches or is joined,
+  directly or through others. An island is solved on its own (on its own
+  job when the world has a job system; the narrowphase runs over the pairs
+  in parallel too), sleeps as one once every body in it has been still for
+  half a second, and wakes as one when an awake body touches it, when
+  something kinematic pushes on it however slowly, or when it loses what it
+  rested on or hung from. The same scene with and without the job system
+  comes out bit for bit the same, on both backends.
 - **Joints** (`JointDesc` in [`physics.h`](engine/physics/include/tynima/physics/physics.h)):
   a distance joint keeps two anchors a set length apart (a rod, a chain
   link), a hinge keeps them together and lets the bodies turn about one

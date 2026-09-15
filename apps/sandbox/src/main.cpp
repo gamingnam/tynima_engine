@@ -26,6 +26,7 @@
 #include <tynima/platform/time.h>
 #include <tynima/platform/window.h>
 #include <tynima/physics/character.h>
+#include <tynima/physics/fixed_step.h>
 #include <tynima/render/camera.h>
 #include <tynima/render/mesh.h>
 #include <tynima/render/model.h>
@@ -1089,6 +1090,12 @@ int main(int argc, char** argv) {
     } else {
         TY_LOG_ERROR("game", "%s - the scene will not move", game.last_error());
     }
+    // Physics runs at a fixed 60 Hz whatever the frame rate: the frame's
+    // time accumulates into whole steps, and what is drawn is blended
+    // between the last two states. Input edges that must reach a step
+    // (a jump) are latched until one runs.
+    physics::FixedStepper stepper;
+    bool jump_latched = false;
     long frame_count = 0;
     double last_time = platform::now_seconds();
     double last_report = last_time;
@@ -1139,18 +1146,14 @@ int main(int argc, char** argv) {
         // The character walks where the camera's WASD point, when the camera
         // is following it; headless, it takes a stroll along the edge so the
         // controller is exercised there too.
-        {
-            Vec3 walk = Vec3::zero();
-            bool jump = false;
-            if (fly.follow) {
-                const bool run =
-                    input.key_down(platform::Key::LeftShift) || input.key_down(platform::Key::RightShift);
-                walk = fly.walk_direction(input) * (kWalkSpeed * (run ? 2.0f : 1.0f));
-                jump = input.key_pressed(platform::Key::Space);
-            } else if (options.headless && frame_count < 120) {
-                walk = Vec3{kWalkSpeed, 0.0f, 0.0f};
-            }
-            character.move(walk, jump, dt);
+        Vec3 walk = Vec3::zero();
+        if (fly.follow) {
+            const bool run =
+                input.key_down(platform::Key::LeftShift) || input.key_down(platform::Key::RightShift);
+            walk = fly.walk_direction(input) * (kWalkSpeed * (run ? 2.0f : 1.0f));
+            jump_latched = jump_latched || input.key_pressed(platform::Key::Space);
+        } else if (options.headless && stepper.total_steps < 90) {
+            walk = Vec3{kWalkSpeed, 0.0f, 0.0f};
         }
 
         engine_context.time_seconds = now;
@@ -1158,8 +1161,12 @@ int main(int argc, char** argv) {
         {
             TY_PROFILE_SCOPE_NAMED("systems");
             game.update(engine_context, dt);
-            physics->step(dt); // variable steps until task 6 brings the fixed timestep
-            scene::update_bodies(world, *physics);
+            stepper.advance(*physics, dt, [&](float step) {
+                scene::record_previous_poses(world, *physics);
+                character.move(walk, jump_latched, step);
+                jump_latched = false;
+            });
+            scene::update_bodies(world, *physics, stepper.alpha());
             scene::update_transforms(world);
         }
 
@@ -1268,7 +1275,8 @@ int main(int argc, char** argv) {
         }
     }
 
-    TY_LOG_INFO("sandbox", "ran %ld frames, %u bodies awake", frame_count, physics->active_body_count());
+    TY_LOG_INFO("sandbox", "ran %ld frames, %llu physics steps, %u bodies awake", frame_count,
+                static_cast<unsigned long long>(stepper.total_steps), physics->active_body_count());
     if (has_model) {
         report_pile(world, pile);
         report_rest(world, *physics, character, rest);

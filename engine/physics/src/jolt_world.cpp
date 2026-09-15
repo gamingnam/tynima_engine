@@ -427,6 +427,13 @@ public:
         settings.mLinearVelocity = to_jolt(desc.linear_velocity);
         settings.mAngularVelocity = to_jolt(desc.angular_velocity);
         settings.mUserData = handle.packed(); // Jolt hands it back from queries
+        // A kinematic body goes where it is told, however slowly: left to
+        // Jolt it would fall asleep below the sleep speed and stop. Only
+        // while it moves, though — at rest it may sleep, and let what rests
+        // on it sleep too (see set_velocity).
+        const bool under_way = motion == JPH::EMotionType::Kinematic &&
+                               (desc.linear_velocity != Vec3{0.0f} || desc.angular_velocity != Vec3{0.0f});
+        settings.mAllowSleeping = !under_way;
         if (desc.lock_rotation) {
             settings.mAllowedDOFs =
                 JPH::EAllowedDOFs::TranslationX | JPH::EAllowedDOFs::TranslationY |
@@ -552,6 +559,14 @@ public:
             JPH::BodyInterface& bi = system_.GetBodyInterface();
             bi.SetLinearAndAngularVelocity(record->id, to_jolt(linear), to_jolt(angular));
             bi.ActivateBody(record->id); // Jolt would let a zero velocity leave it asleep
+            {
+                // A moving kinematic body must not doze off below the sleep
+                // speed; a still one may, and its island with it.
+                const JPH::BodyLockWrite lock(system_.GetBodyLockInterface(), record->id);
+                if (lock.Succeeded() && lock.GetBody().IsKinematic()) {
+                    lock.GetBody().SetAllowSleeping(linear == Vec3{0.0f} && angular == Vec3{0.0f});
+                }
+            }
         }
     }
 

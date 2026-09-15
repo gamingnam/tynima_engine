@@ -5,6 +5,7 @@
 #include <tynima/scene/systems.h>
 #include <tynima/scene/world.h>
 
+#include <cmath>
 #include <cstdint>
 #include <vector>
 
@@ -238,6 +239,38 @@ TEST_CASE("update_transforms composes through Parent chains") {
     world.destroy(root);
     scene::update_transforms(world);
     CHECK(approx_equal(world.get<LocalToWorld>(child)->matrix.translation(), Vec3{0, 1, 0}));
+}
+
+TEST_CASE("update_bodies interpolates between the recorded and the current pose") {
+    using scene::RigidBody;
+    using scene::Transform;
+    auto physics = physics::create_tynima_world({.gravity = Vec3{0.0f}});
+    physics::BodyDesc box;
+    box.shape = physics::Shape::box(Vec3{0.5f});
+    box.linear_velocity = Vec3{6.0f, 0.0f, 0.0f};          // 0.1 m per 1/60 s step
+    box.angular_velocity = Vec3{0.0f, 6.0f * kPi, 0.0f};   // 18 degrees per step
+    const physics::BodyHandle body = physics->create_body(box);
+    REQUIRE(body);
+    World world(64);
+    const Entity entity = world.create(Transform{}, RigidBody{body});
+
+    // No pose recorded yet: drawn where the body is, whatever alpha says.
+    scene::update_bodies(world, *physics, 0.5f);
+    CHECK(approx_equal(world.get<Transform>(entity)->position, Vec3{0, 0, 0}));
+
+    scene::record_previous_poses(world, *physics);
+    physics->step(1.0f / 60.0f);
+    scene::update_bodies(world, *physics, 0.5f);
+    const Transform& halfway = *world.get<Transform>(entity);
+    CHECK(halfway.position.x == doctest::Approx(0.05f).epsilon(0.02));
+    // Half of that: the x axis has swung 9 degrees towards -z.
+    const Vec3 x_axis = halfway.rotation.rotate(Vec3{1, 0, 0});
+    CHECK(std::atan2(-x_axis.z, x_axis.x) == doctest::Approx(kPi / 20.0f).epsilon(0.02));
+
+    scene::update_bodies(world, *physics, 1.0f);
+    CHECK(world.get<Transform>(entity)->position.x == doctest::Approx(0.1f).epsilon(0.02));
+    scene::update_bodies(world, *physics, 0.0f);
+    CHECK(world.get<Transform>(entity)->position.x == doctest::Approx(0.0f).epsilon(0.02));
 }
 
 TEST_CASE("update_bodies moves entities with their physics bodies") {

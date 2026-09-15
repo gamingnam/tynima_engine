@@ -45,9 +45,17 @@ struct MeshRenderer {
 // Ties the entity to a body in the application's PhysicsWorld. The body
 // drives the Transform: update_bodies() copies its pose in after every step.
 // The handle is only meaningful in the world that made it.
+//
+// With a fixed timestep the frame is rarely on a step boundary, so the pose
+// drawn is a blend: record_previous_poses() keeps where the body was before
+// the last step, and update_bodies(world, physics, alpha) draws alpha of the
+// way from there to where it is now.
 struct RigidBody {
     static constexpr const char* kName = "RigidBody";
     physics::BodyHandle body;
+    math::Vec3 previous_position{0.0f};
+    math::Quat previous_rotation = math::Quat::identity();
+    bool has_previous = false; // until the first record_previous_poses()
 };
 
 } // namespace tynima::scene

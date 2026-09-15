@@ -3,6 +3,7 @@
 #include <atomic>
 #include <cstdint>
 #include <memory>
+#include <type_traits>
 #include <utility>
 
 namespace tynima::core {
@@ -64,8 +65,9 @@ public:
         if (count == 0) {
             return;
         }
+        using Callable = std::remove_reference_t<Fn>; // fn may arrive as an lvalue
         struct Task {
-            const Fn* fn;
+            const Callable* fn;
             std::uint32_t begin;
             std::uint32_t end;
         };
