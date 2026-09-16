@@ -36,6 +36,8 @@
 #include <tynima/physics/broadphase.h>
 #include <tynima/physics/collision.h>
 
+#include "state_hash.h"
+
 #include <algorithm>
 #include <cmath>
 #include <initializer_list>
@@ -592,6 +594,14 @@ public:
         return found;
     }
 
+    std::uint64_t state_hash() const override {
+        StateHasher hasher;
+        bodies_.for_each([&](BodyHandle handle, const Body&) {
+            hasher.add_body(handle, body_state(handle));
+        });
+        return hasher.value();
+    }
+
     std::uint32_t contact_count() const noexcept override { return manifolds_count_; }
 
     void each_contact(void (*fn)(void* user, const Contact& contact), void* user) const override {
@@ -940,7 +950,7 @@ private:
         const Vec3 h = a.rotation.rotate(joint.axis_a);
         const Vec3 ua = a.rotation.rotate(joint.reference_a);
         const Vec3 ub = b.rotation.rotate(joint.reference_b);
-        return std::atan2(dot(cross(ub, ua), h), dot(ua, ub));
+        return math::arctan2(dot(cross(ub, ua), h), dot(ua, ub));
     }
 
     // Every joint with at least one body awake becomes a constraint; the

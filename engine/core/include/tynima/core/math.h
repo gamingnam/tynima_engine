@@ -7,4 +7,5 @@
 #include <tynima/core/math/quat.h>
 #include <tynima/core/math/scalar.h>
 #include <tynima/core/math/transform.h>
+#include <tynima/core/math/trig.h>
 #include <tynima/core/math/vec.h>

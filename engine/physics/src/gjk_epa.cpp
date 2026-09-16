@@ -31,6 +31,12 @@ constexpr int kEpaMaxIterations = 64;
 constexpr std::uint32_t kEpaMaxVertices = 4 + kEpaMaxIterations;
 constexpr std::uint32_t kEpaMaxFaces = 512;
 constexpr float kEpsilon = 1e-6f;
+// GJK's tolerances scale with its simplex. A float carries about seven
+// digits, so with support points ten metres out (a box resting on a 20 m
+// floor) the closest point comes with a micron or so of noise, and a
+// distance of a tenth of a micron means nothing there; between two small
+// boxes the same rule is still well under a hundredth of a millimetre.
+constexpr float kGjkRelativeTolerance = 1e-5f;
 
 Simplex::Vertex minkowski_support(const Convex& a, const Convex& b, const Vec3& direction) noexcept {
     Simplex::Vertex v;
@@ -229,6 +235,7 @@ GjkResult gjk(const Convex& a, const Convex& b) noexcept {
     s.v[0] = minkowski_support(a, b, direction);
     s.v[0].weight = 1.0f;
     s.count = 1;
+    float scale_sq = dot(s.v[0].w, s.v[0].w); // how far out the simplex reaches
 
     Vec3 p = s.v[0].w;
     for (int iteration = 0; iteration < kGjkMaxIterations; ++iteration) {
@@ -251,7 +258,8 @@ GjkResult gjk(const Convex& a, const Convex& b) noexcept {
         }
         p = closest_point(s);
         const float dist_sq = dot(p, p);
-        if (dist_sq < kEpsilon * kEpsilon) {
+        float tolerance = kGjkRelativeTolerance * std::sqrt(scale_sq);
+        if (dist_sq <= tolerance * tolerance) {
             result.intersecting = true; // the origin is on the simplex
             return result;
         }
@@ -259,15 +267,17 @@ GjkResult gjk(const Convex& a, const Convex& b) noexcept {
         // the current closest point in that direction, that point is it.
         const Vec3 d = p * -1.0f;
         const Simplex::Vertex w = minkowski_support(a, b, d);
+        scale_sq = std::max(scale_sq, dot(w.w, w.w));
+        tolerance = kGjkRelativeTolerance * std::sqrt(scale_sq);
         const float dist = std::sqrt(dist_sq);
         const float progress = dist + dot(w.w, d) / dist; // how much closer w gets, along d
-        if (progress <= 1e-5f * dist + 1e-7f) {
+        if (progress <= tolerance) {
             break;
         }
         bool duplicate = false;
         for (std::uint32_t i = 0; i < s.count; ++i) {
             const Vec3 diff = w.w - s.v[i].w;
-            duplicate = duplicate || dot(diff, diff) < kEpsilon * kEpsilon;
+            duplicate = duplicate || dot(diff, diff) <= tolerance * tolerance;
         }
         if (duplicate) {
             break;

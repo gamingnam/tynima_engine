@@ -4,13 +4,22 @@
 // camera. Falls back to Phase 0's triangle when there is no model.
 //
 //   tynima-sandbox [--headless] [--frames N] [--model path.glb] [--physics tynima|jolt]
+//                  [--record log.tyrec | --replay log.tyrec]
 //
 // The pile runs on the engine's own physics by default; --physics jolt
 // drops the same pile through Jolt, and the report line at exit compares.
+// --headless runs without a window or a GPU, at a fixed sixtieth of a
+// second a frame, with a scripted player at the keyboard.
+//
+// --record writes every frame's input and frame time, and the physics
+// world's hash at the end, to a text log; --replay feeds that log back in
+// place of the clock and the keyboard and checks the run ends on the same
+// hash — the simulation is deterministic, so it must, and CI replays a
+// recorded pile to prove it (exit code 3 when it does not).
 //
 // Controls: hold the right mouse button to look; W/A/S/D move, Q/E descend
-// and climb, Shift runs; R drops the pile again; Space (the game module)
-// launches it; Escape quits.
+// and climb, Shift runs; R drops the pile again; L (the game module)
+// launches it; F follows the character; Escape quits.
 #include <tynima/assets/gltf.h>
 #include <tynima/core/arena.h>
 #include <tynima/core/assert.h>
@@ -22,6 +31,7 @@
 #include <tynima/physics/physics.h>
 #include <tynima/platform/events.h>
 #include <tynima/platform/input.h>
+#include <tynima/platform/input_log.h>
 #include <tynima/platform/platform.h>
 #include <tynima/platform/time.h>
 #include <tynima/platform/window.h>
@@ -116,7 +126,7 @@ Pile populate_pile(scene::World& world, physics::PhysicsWorld& physics, const re
                                     (static_cast<float>(z) - half) * spacing + shove_z};
                 // A tilt of up to ~30 degrees about a random horizontal axis, then a random yaw.
                 const float tilt_direction = noise(n, 4) * kTwoPi;
-                const Vec3 tilt_axis{std::cos(tilt_direction), 0.0f, std::sin(tilt_direction)};
+                const Vec3 tilt_axis{cosine(tilt_direction), 0.0f, sine(tilt_direction)};
                 const Quat rotation = Quat::from_axis_angle(Vec3::unit_y(), noise(n, 5) * kTwoPi) *
                                       Quat::from_axis_angle(tilt_axis, (noise(n, 6) - 0.5f) * 1.0f);
                 physics::BodyDesc body;
@@ -414,8 +424,15 @@ struct Options {
     bool headless = false;
     long max_frames = -1; // -1: run until closed
     std::string model = TYNIMA_SANDBOX_ASSETS_DIR "/WaterBottle.glb";
-    bool jolt = false; // the reference physics instead of the engine's own
+    bool jolt = false;   // the reference physics instead of the engine's own
+    std::string record; // write the input log here at exit
+    std::string replay; // play this input log instead of live input and time
 };
+
+// Exit codes past the usual 0 and 1.
+constexpr int kExitUsage = 2;
+constexpr int kExitReplayMismatch = 3;
+constexpr int kExitSkipped = 77; // what CTest's SKIP_RETURN_CODE reads as "not run"
 
 Options parse_options(int argc, char** argv) {
     Options options;
@@ -431,13 +448,21 @@ Options parse_options(int argc, char** argv) {
             options.jolt = std::strcmp(which, "jolt") == 0;
             if (!options.jolt && std::strcmp(which, "tynima") != 0) {
                 std::fprintf(stderr, "--physics: expected 'tynima' or 'jolt', got '%s'\n", which);
-                std::exit(2);
+                std::exit(kExitUsage);
             }
+        } else if (std::strcmp(argv[i], "--record") == 0 && i + 1 < argc) {
+            options.record = argv[++i];
+        } else if (std::strcmp(argv[i], "--replay") == 0 && i + 1 < argc) {
+            options.replay = argv[++i];
         } else {
             std::fprintf(stderr, "usage: tynima-sandbox [--headless] [--frames N] [--model path.glb] "
-                                 "[--physics tynima|jolt]\n");
-            std::exit(2);
+                                 "[--physics tynima|jolt] [--record log.tyrec | --replay log.tyrec]\n");
+            std::exit(kExitUsage);
         }
+    }
+    if (!options.record.empty() && !options.replay.empty()) {
+        std::fprintf(stderr, "--record and --replay are one or the other\n");
+        std::exit(kExitUsage);
     }
     return options;
 }
@@ -734,8 +759,8 @@ struct FlyCamera {
         camera.look_at(center);
         // Recover yaw/pitch from the resulting forward so mouse-look continues from here.
         const Vec3 f = camera.forward();
-        yaw = std::atan2(-f.x, -f.z);
-        pitch = std::asin(clamp(f.y, -1.0f, 1.0f));
+        yaw = arctan2(-f.x, -f.z); // deterministic: in follow mode the camera steers the character
+        pitch = arcsin(f.y);
         camera.near = std::max(radius * 0.02f, 0.005f);
         speed = std::max(radius * 1.5f, 0.2f);
     }
@@ -962,11 +987,66 @@ void report_edges(const platform::Input& input) {
     }
 }
 
+// Headless there is nobody at the keyboard, so the sandbox plays one: F on
+// the first frame to follow the character, D held for a second and a half
+// to walk it along the edge of the pile, a jump on the way, and L once the
+// pile has settled to launch it through the game module. It goes in through
+// the same door as a replay, so a log recorded headless carries all of it.
+platform::InputFrame scripted_frame(long index, float dt) {
+    platform::InputFrame frame;
+    frame.dt = dt;
+    const auto bit = [](platform::Key key) { return static_cast<std::size_t>(key); };
+    const auto press = [&](platform::Key key) {
+        frame.keys_down.set(bit(key));
+        frame.keys_pressed.set(bit(key));
+    };
+    if (index == 0) {
+        press(platform::Key::F);
+        press(platform::Key::D);
+    } else if (index < 90) {
+        frame.keys_down.set(bit(platform::Key::D));
+    } else if (index == 90) {
+        frame.keys_released.set(bit(platform::Key::D));
+    }
+    if (index == 40) {
+        press(platform::Key::Space);
+    } else if (index == 41) {
+        frame.keys_released.set(bit(platform::Key::Space));
+    }
+    if (index == 180) {
+        press(platform::Key::L);
+    } else if (index == 181) {
+        frame.keys_released.set(bit(platform::Key::L));
+    }
+    return frame;
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
     TY_PROFILE_THREAD("main");
-    const Options options = parse_options(argc, argv);
+    Options options = parse_options(argc, argv);
+
+    // A replay decides the physics backend and the frame count: the log
+    // was recorded on one, for that many frames.
+    platform::InputLog log;
+    if (!options.replay.empty()) {
+        std::string error;
+        if (!log.load(options.replay.c_str(), error)) {
+            std::fprintf(stderr, "--replay: %s\n", error.c_str());
+            return kExitUsage;
+        }
+        options.jolt = log.backend.rfind("Jolt", 0) == 0;
+        options.max_frames = static_cast<long>(log.frames.size());
+    } else if (!options.record.empty()) {
+        // Room for the whole recording up front, so that taking a frame down
+        // is not a heap allocation in that frame: --frames says how many, or
+        // ten minutes at 60 Hz (a longer recording grows past it and trips
+        // the per-frame check).
+        constexpr long kTenMinutesOfFrames = 10 * 60 * 60;
+        log.frames.reserve(static_cast<std::size_t>(options.max_frames >= 0 ? options.max_frames
+                                                                               : kTenMinutesOfFrames));
+    }
 
     TY_LOG_INFO("sandbox", "engine %s, log level %s", tynima::core::version_string(),
                 tynima::core::log_level_name(tynima::core::log_level()));
@@ -1097,6 +1177,7 @@ int main(int argc, char** argv) {
     physics::FixedStepper stepper;
     bool jump_latched = false;
     long frame_count = 0;
+    double game_time = 0.0; // the game module's clock: frame times summed, so a replay reads the same
     double last_time = platform::now_seconds();
     double last_report = last_time;
     long frames_since_report = 0;
@@ -1109,6 +1190,25 @@ int main(int argc, char** argv) {
             TY_PROFILE_SCOPE_NAMED("events");
             platform::pump_events(input, events);
         }
+        // Time and input: the clock and the keyboard, or the log's — and
+        // headless, a fixed frame of a sixtieth and the script above, so the
+        // run is the same twice. Settled here, before anything reads either.
+        const double now = platform::now_seconds();
+        float dt = static_cast<float>(std::min(now - last_time, 0.1)); // clamp hitches
+        last_time = now;
+        if (!options.replay.empty()) {
+            const platform::InputFrame& frame = log.frames[static_cast<std::size_t>(frame_count)];
+            platform::apply_frame(frame, input);
+            dt = frame.dt;
+        } else if (options.headless) {
+            dt = 1.0f / 60.0f;
+            platform::apply_frame(scripted_frame(frame_count, dt), input);
+        }
+        if (!options.record.empty()) {
+            log.frames.push_back(platform::capture_frame(input, dt));
+        }
+        game_time += static_cast<double>(dt);
+        report_edges(input);
         for (const auto& event : events) {
             switch (event.type) {
             case platform::EventType::Quit:
@@ -1134,29 +1234,21 @@ int main(int argc, char** argv) {
             fly.follow = !fly.follow;
             TY_LOG_INFO("camera", "%s", fly.follow ? "following the character" : "flying free");
         }
-        report_edges(input);
-
-        const double now = platform::now_seconds();
-        const float dt = static_cast<float>(std::min(now - last_time, 0.1)); // clamp hitches
-        last_time = now;
         const Vec3 character_position = character.position();
         fly.update(input, *window, dt, fly.follow ? &character_position : nullptr);
         shading.update(input, dt);
 
         // The character walks where the camera's WASD point, when the camera
-        // is following it; headless, it takes a stroll along the edge so the
-        // controller is exercised there too.
+        // is following it.
         Vec3 walk = Vec3::zero();
         if (fly.follow) {
             const bool run =
                 input.key_down(platform::Key::LeftShift) || input.key_down(platform::Key::RightShift);
             walk = fly.walk_direction(input) * (kWalkSpeed * (run ? 2.0f : 1.0f));
             jump_latched = jump_latched || input.key_pressed(platform::Key::Space);
-        } else if (options.headless && stepper.total_steps < 90) {
-            walk = Vec3{kWalkSpeed, 0.0f, 0.0f};
         }
 
-        engine_context.time_seconds = now;
+        engine_context.time_seconds = game_time;
         const bool reloaded = game.poll(engine_context); // a reload allocates; that frame is exempt below
         {
             TY_PROFILE_SCOPE_NAMED("systems");
@@ -1275,15 +1367,48 @@ int main(int argc, char** argv) {
         }
     }
 
-    TY_LOG_INFO("sandbox", "ran %ld frames, %llu physics steps, %u bodies awake", frame_count,
-                static_cast<unsigned long long>(stepper.total_steps), physics->active_body_count());
+    const auto state_hash = static_cast<unsigned long long>(physics->state_hash());
+    const auto steps_taken = static_cast<unsigned long long>(stepper.total_steps);
+    TY_LOG_INFO("sandbox", "ran %ld frames, %llu physics steps, %u bodies awake, state hash %016llx",
+                frame_count, steps_taken, physics->active_body_count(), state_hash);
     if (has_model) {
         report_pile(world, pile);
         report_rest(world, *physics, character, rest);
+    }
+    int exit_code = 0;
+    if (!options.record.empty()) {
+        log.backend = physics->backend_name();
+        log.steps = stepper.total_steps;
+        log.state_hash = state_hash;
+        log.has_end = true;
+        std::string error;
+        if (log.save(options.record.c_str(), error)) {
+            TY_LOG_INFO("replay", "recorded %zu frames to %s", log.frames.size(), options.record.c_str());
+        } else {
+            TY_LOG_ERROR("replay", "%s", error.c_str());
+            exit_code = 1;
+        }
+    } else if (!options.replay.empty()) {
+        if (!has_model) {
+            // Without the pile there is nothing the log was about: not a failure, not a pass.
+            TY_LOG_WARN("replay", "no model, so no pile to replay: skipped");
+            exit_code = kExitSkipped;
+        } else if (!log.has_end) {
+            TY_LOG_WARN("replay", "the log has no end hash to compare with (an unfinished recording)");
+        } else if (log.state_hash == state_hash && log.steps == stepper.total_steps) {
+            TY_LOG_INFO("replay", "%zu frames replayed: %llu steps and state hash %016llx, as recorded",
+                        log.frames.size(), steps_taken, state_hash);
+        } else {
+            TY_LOG_ERROR("replay", "the replay diverged: %llu steps and state hash %016llx; recorded %llu "
+                                   "steps and %016llx (on %s)",
+                         steps_taken, state_hash, static_cast<unsigned long long>(log.steps),
+                         static_cast<unsigned long long>(log.state_hash), log.backend.c_str());
+            exit_code = kExitReplayMismatch;
+        }
     }
     game.unload(engine_context);
     renderer.destroy(); // GPU objects go before the window they present to
     window.reset();
     platform::shutdown();
-    return 0;
+    return exit_code;
 }

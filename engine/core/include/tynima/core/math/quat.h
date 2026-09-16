@@ -1,6 +1,7 @@
 #pragma once
 
 #include <tynima/core/math/mat.h>
+#include <tynima/core/math/trig.h>
 #include <tynima/core/math/vec.h>
 
 #include <cmath>
@@ -25,9 +26,9 @@ struct Quat {
 
     // `axis` must be unit length; `angle` in radians, right-hand rule.
     [[nodiscard]] static Quat from_axis_angle(const Vec3& axis, float angle) noexcept {
-        const float half = 0.5f * angle;
-        const float s = std::sin(half);
-        return {axis.x * s, axis.y * s, axis.z * s, std::cos(half)};
+        float s, c;
+        sin_cos(0.5f * angle, s, c); // the deterministic pair: the same quaternion on every platform
+        return {axis.x * s, axis.y * s, axis.z * s, c};
     }
 
     // The rotation taking unit vector `from` to unit vector `to`, by the shortest arc.

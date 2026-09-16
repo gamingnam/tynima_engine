@@ -45,7 +45,7 @@ Vec3 CharacterController::velocity() const {
 void CharacterController::probe_ground() {
     on_ground_ = false;
     ground_normal_ = Vec3{0.0f, 1.0f, 0.0f};
-    const float min_up = std::cos(desc_.max_slope_degrees * math::kPi / 180.0f);
+    const float min_up = math::cosine(desc_.max_slope_degrees * math::kPi / 180.0f);
     float best = min_up;
     world_.each_contact([&](const Contact& c) {
         Vec3 up;

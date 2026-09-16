@@ -187,6 +187,12 @@ public:
     // since the joint was made, right-handed, in radians (0 for anything else).
     [[nodiscard]] virtual float hinge_angle(JointHandle joint) const = 0;
 
+    // A 64-bit hash of every body's pose, velocities and sleep state, in
+    // handle order: two runs that did the same thing to the same world hash
+    // the same, and one different bit anywhere shows. The determinism
+    // tests and the sandbox's input-log replay compare these.
+    [[nodiscard]] virtual std::uint64_t state_hash() const = 0;
+
     // The contacts the last step() worked with, one per touching pair.
     [[nodiscard]] virtual std::uint32_t contact_count() const noexcept = 0;
     virtual void each_contact(void (*fn)(void* user, const Contact& contact), void* user) const = 0;

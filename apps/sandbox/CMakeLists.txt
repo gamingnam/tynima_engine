@@ -34,6 +34,24 @@ target_compile_definitions(tynima_sandbox PRIVATE TYNIMA_SANDBOX_ASSETS_DIR="${s
 
 # Smoke test: the full init -> window -> model load -> event loop -> shutdown
 # path, without a display. Runs on CI runners and anywhere else with no window server.
+#
+# Determinism tests: each log under replays/ is a headless run recorded on
+# one machine — five seconds of the pile dropping, the character walking and
+# jumping, the game module launching the pile — ending with the physics
+# world's hash, one on the engine's own physics and one on Jolt. Replaying
+# a log must reach its hash, here and on every other platform (exit code 3
+# when it does not). Without the sample model there is no pile, and the
+# sandbox reports the test as skipped (77).
+#
+# When the simulation changes on purpose, record them again:
+#   tynima-sandbox --headless --frames 300 --record apps/sandbox/replays/pile.tyrec
+#   tynima-sandbox --headless --frames 300 --physics jolt \
+#                  --record apps/sandbox/replays/pile_jolt.tyrec
 if(TYNIMA_BUILD_TESTS)
   add_test(NAME sandbox_headless COMMAND tynima_sandbox --headless --frames 30)
+  foreach(log IN ITEMS pile pile_jolt)
+    add_test(NAME sandbox_replay_${log}
+      COMMAND tynima_sandbox --headless --replay "${CMAKE_CURRENT_SOURCE_DIR}/replays/${log}.tyrec")
+    set_tests_properties(sandbox_replay_${log} PROPERTIES SKIP_RETURN_CODE 77)
+  endforeach()
 endif()

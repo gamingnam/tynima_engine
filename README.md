@@ -59,8 +59,12 @@ unlit, Blinn-Phong and Cook-Torrance shading; `N`/`M`/`O`/`V`/`B` show the
 mapped normals, metallic/roughness, occlusion, vertex normals and tangents;
 `T` toggles tonemapping; the arrow keys move the light. `--model path.glb` loads
 something else. `--headless --frames N` runs the same loop with no window and
-no GPU (the model still loads), which is what the `sandbox_headless` CTest
-does on CI.
+no GPU (the model still loads) with a scripted player at the keyboard, which
+is what the `sandbox_headless` CTest does on CI. `--record run.tyrec` writes
+every frame's input and frame time, and the physics world's hash at the end,
+to a text log; `--replay run.tyrec` plays it back in place of the clock and
+the keyboard and exits 3 if the run does not end on the same hash — see
+[Determinism](#determinism) below.
 
 GPU notes:
 
@@ -186,6 +190,44 @@ sampled from Jolt (`ctest` prints the numbers). So far:
   while it stands, so nothing creeps), jumps at its jump speed, keeps air
   control, is stopped by walls and shoves light bodies aside. Walking,
   climbing, jumping and pushing measure the same on both worlds.
+
+### Determinism
+
+The simulation is meant to come out bit for bit the same on every run,
+every thread count and every platform the engine builds for, which is what
+makes replays exact and a recorded run a regression test. Three things make
+it so:
+
+- **The arithmetic.** IEEE adds, multiplies, divides and square roots round
+  the same everywhere as long as the compiler neither reorders them nor
+  fuses a multiply and an add into one instruction, so every target we own
+  builds with contraction off (`-ffp-contract=off`, `/fp:precise`) and never
+  with fast-math ([`cmake/Warnings.cmake`](cmake/Warnings.cmake)).
+- **The transcendentals.** `sin`, `cos`, `atan2` and friends come from the
+  platform's libm, which rounds differently on macOS and Windows, so
+  simulation code uses the engine's own `math::sine`, `cosine`, `tangent`,
+  `arctan2`, `arcsin`, `arccos` ([`math/trig.h`](engine/core/include/tynima/core/math/trig.h)):
+  Cephes-style polynomials after a Cody-Waite range reduction, within a few
+  ulps of libm and the same bits on every platform. `Quat::from_axis_angle`
+  and the transform helpers use them; libm is left to rendering.
+- **The order of work.** Islands are solved in parallel but each island is
+  solved serially, and the narrowphase writes each pair's manifold to its
+  own slot, so the result does not depend on which thread got there first.
+
+`PhysicsWorld::state_hash()` folds every body's pose, velocities and sleep
+state into 64 bits, and the tests check it: the same history hashes the
+same, one nudge of a tenth of a millinewton-second shows, and the threaded
+and the serial run of one scene hash the same on every step. On top of that
+sits the input log ([`platform/input_log.h`](engine/platform/include/tynima/platform/input_log.h)):
+`tynima-sandbox --record` takes down every frame's input and frame time and
+the hash at the end, `--replay` plays the log back and compares, and
+[`apps/sandbox/replays/`](apps/sandbox/replays/) holds one such run on each
+backend — five seconds of the pile dropping, the character walking and
+jumping, the game module launching the pile — that the `sandbox_replay_*`
+CTests replay on every platform CI builds. Any change to the simulation, a
+new shape in the scene or one rounding in the solver, fails them; when the
+change is meant, look at the new run, then record the logs again with the
+commands in [`apps/sandbox/CMakeLists.txt`](apps/sandbox/CMakeLists.txt).
 
 ## Logging and asserts
 

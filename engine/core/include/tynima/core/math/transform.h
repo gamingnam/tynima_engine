@@ -2,6 +2,7 @@
 
 #include <tynima/core/math/mat.h>
 #include <tynima/core/math/quat.h>
+#include <tynima/core/math/trig.h>
 #include <tynima/core/math/vec.h>
 
 #include <cmath>
@@ -25,15 +26,18 @@ namespace tynima::math {
 
 // Right-hand rule about each axis: rotation_y(+90°) takes +x to -z.
 [[nodiscard]] inline Mat4 rotation_x(float angle) noexcept {
-    const float c = std::cos(angle), s = std::sin(angle);
+    float s, c;
+    sin_cos(angle, s, c);
     return Mat4::from_rows({1.0f, 0.0f, 0.0f, 0.0f}, {0.0f, c, -s, 0.0f}, {0.0f, s, c, 0.0f}, {0.0f, 0.0f, 0.0f, 1.0f});
 }
 [[nodiscard]] inline Mat4 rotation_y(float angle) noexcept {
-    const float c = std::cos(angle), s = std::sin(angle);
+    float s, c;
+    sin_cos(angle, s, c);
     return Mat4::from_rows({c, 0.0f, s, 0.0f}, {0.0f, 1.0f, 0.0f, 0.0f}, {-s, 0.0f, c, 0.0f}, {0.0f, 0.0f, 0.0f, 1.0f});
 }
 [[nodiscard]] inline Mat4 rotation_z(float angle) noexcept {
-    const float c = std::cos(angle), s = std::sin(angle);
+    float s, c;
+    sin_cos(angle, s, c);
     return Mat4::from_rows({c, -s, 0.0f, 0.0f}, {s, c, 0.0f, 0.0f}, {0.0f, 0.0f, 1.0f, 0.0f}, {0.0f, 0.0f, 0.0f, 1.0f});
 }
 [[nodiscard]] constexpr Mat4 rotation(const Quat& q) noexcept {

@@ -11,6 +11,8 @@
 #include <tynima/core/profile.h>
 #include <tynima/physics/collision.h> // Pose
 
+#include "state_hash.h"
+
 #include <Jolt/Jolt.h> // first, before any other Jolt header
 
 // The rest of this file mixes with Jolt's over-aligned types and its style
@@ -709,6 +711,14 @@ public:
             return 0.0f;
         }
         return static_cast<const JPH::HingeConstraint*>(record->constraint.GetPtr())->GetCurrentAngle();
+    }
+
+    std::uint64_t state_hash() const override {
+        StateHasher hasher;
+        bodies_.for_each([&](BodyHandle handle, const BodyRecord&) {
+            hasher.add_body(handle, body_state(handle));
+        });
+        return hasher.value();
     }
 
     std::uint32_t contact_count() const noexcept override {

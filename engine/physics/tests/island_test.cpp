@@ -222,6 +222,7 @@ TEST_CASE("the same scene with and without the job system comes out bit for bit 
                                               << " bodies differ between the threaded and the serial run");
             CHECK(different == 0);
             CHECK(threaded->active_body_count() == serial->active_body_count());
+            CHECK(threaded->state_hash() == serial->state_hash());
         }
     }
 }

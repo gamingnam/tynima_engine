@@ -127,7 +127,8 @@ typedef struct tynima_api {
     bool (*key_pressed)(tynima_engine* engine, tynima_key key);
     bool (*key_released)(tynima_engine* engine, tynima_key key);
 
-    /* Seconds since the engine started. */
+    /* Seconds since the engine started, as the host's frame times add up: in
+     * a replay it reads exactly as it did in the run that was recorded. */
     double (*time_seconds)(tynima_engine* engine);
 
     /* Physics. A stale body, or a host without a physics world, is a no-op.
