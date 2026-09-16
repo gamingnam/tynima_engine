@@ -61,16 +61,41 @@ struct BufferDesc {
 
 // Rgba8Srgb is the same bytes as Rgba8Unorm, but the GPU decodes sRGB to
 // linear when sampling — the right format for color textures authored for
-// the eye (base color, emissive); data textures (normals, roughness) stay Unorm.
-enum class TextureFormat : std::uint8_t { Rgba8Unorm, Rgba8Srgb, Depth32Float, Depth24Stencil8, Depth16 };
+// the eye (base color, emissive); data textures (normals, roughness) stay
+// Unorm. The Bgra8 pair is what swapchains come in; Rgba16Float is the
+// working format for light before tonemapping.
+enum class TextureFormat : std::uint8_t {
+    Rgba8Unorm,
+    Rgba8Srgb,
+    Bgra8Unorm,
+    Bgra8Srgb,
+    Rgba16Float,
+    Depth32Float,
+    Depth24Stencil8,
+    Depth16
+};
 const char* texture_format_name(TextureFormat format) noexcept;
 [[nodiscard]] constexpr bool is_depth_format(TextureFormat format) noexcept {
     return format == TextureFormat::Depth32Float || format == TextureFormat::Depth24Stencil8 ||
            format == TextureFormat::Depth16;
 }
-// Bytes per pixel for the color formats (0 for depth: never uploaded from the CPU).
+// Bytes per pixel as stored, for every format (depth included: a depth
+// texture is never uploaded from the CPU, but it does take memory).
 [[nodiscard]] constexpr std::uint32_t bytes_per_pixel(TextureFormat format) noexcept {
-    return format == TextureFormat::Rgba8Unorm || format == TextureFormat::Rgba8Srgb ? 4 : 0;
+    switch (format) {
+    case TextureFormat::Rgba8Unorm:
+    case TextureFormat::Rgba8Srgb:
+    case TextureFormat::Bgra8Unorm:
+    case TextureFormat::Bgra8Srgb:
+    case TextureFormat::Depth32Float:
+    case TextureFormat::Depth24Stencil8:
+        return 4;
+    case TextureFormat::Rgba16Float:
+        return 8;
+    case TextureFormat::Depth16:
+        return 2;
+    }
+    return 0;
 }
 // Levels in a full mip chain down to 1x1.
 [[nodiscard]] std::uint32_t mip_level_count(std::uint32_t width, std::uint32_t height) noexcept;
@@ -141,8 +166,12 @@ struct DepthState {
     CompareOp compare = CompareOp::Greater;
 };
 
-// The only render target is the swapchain (its format comes from the window)
-// plus, optionally, a depth texture in the device's preferred depth format.
+inline constexpr std::uint32_t kMaxColorTargets = 4;
+
+// A pipeline is built for the formats of the targets it will draw into —
+// every GPU API bakes them into the pipeline state — and a pass binding
+// other formats is refused. No color targets means a depth-only pipeline
+// (a shadow map); `Device::swapchain_format()` is what the swapchain wants.
 struct GraphicsPipelineDesc {
     ShaderHandle vertex_shader;
     ShaderHandle fragment_shader;
@@ -150,7 +179,9 @@ struct GraphicsPipelineDesc {
     VertexLayout vertex_layout{};
     CullMode cull = CullMode::None; // front faces are counter-clockwise, as in glTF
     DepthState depth{};
-    bool has_depth_target = false;
+    TextureFormat color_formats[kMaxColorTargets]{};
+    std::uint32_t color_target_count = 0;
+    std::optional<TextureFormat> depth_format; // nullopt: no depth target
 };
 
 struct ClearColor {
@@ -160,12 +191,43 @@ struct ClearColor {
     float a = 1.0f;
 };
 
+// What a pass does with an attachment's contents on the way in and out.
+// Load keeps what is there; Clear fills it; DontCare promises the pass
+// writes every pixel it will ever read, and Store/DontCare say whether the
+// result must reach memory at all. A tile-based GPU keeps an attachment that
+// is cleared or don't-cared in and don't-cared out entirely on-chip.
+enum class LoadOp : std::uint8_t { Load, Clear, DontCare };
+enum class StoreOp : std::uint8_t { Store, DontCare };
+
+struct ColorAttachment {
+    TextureHandle texture; // needs ColorTarget usage; the swapchain handle is one
+    LoadOp load = LoadOp::Clear;
+    StoreOp store = StoreOp::Store;
+    ClearColor clear{};
+};
+
+struct DepthAttachment {
+    TextureHandle texture; // needs DepthStencilTarget usage
+    LoadOp load = LoadOp::Clear;
+    StoreOp store = StoreOp::DontCare; // depth is rarely read back
+    float clear = 0.0f;                // reverse-Z: far
+};
+
+// Every attachment must have the same size. `name` labels the pass for GPU
+// debuggers and profilers.
+struct RenderPassDesc {
+    const char* name = nullptr;
+    ColorAttachment colors[kMaxColorTargets]{};
+    std::uint32_t color_count = 0;
+    std::optional<DepthAttachment> depth;
+};
+
 // ---------------------------------------------------------------- recording
 
 class Device;
 
-// A render pass that targets the swapchain image. end() closes it; the
-// destructor closes it if you forget.
+// A render pass on its attachments. end() closes it; the destructor closes
+// it if you forget.
 class RenderPass {
 public:
     RenderPass(RenderPass&& other) noexcept;
@@ -193,11 +255,12 @@ public:
 
 private:
     friend class Frame;
-    RenderPass(Device* device, void* command_buffer, void* pass) noexcept
-        : device_(device), command_buffer_(command_buffer), pass_(pass) {}
+    RenderPass(Device* device, void* command_buffer, void* pass, bool labelled) noexcept
+        : device_(device), command_buffer_(command_buffer), pass_(pass), labelled_(labelled) {}
     Device* device_;       // resolves handles; not owned
     void* command_buffer_; // SDL_GPUCommandBuffer*, not owned
     void* pass_;           // SDL_GPURenderPass*
+    bool labelled_;        // a debug group was pushed for the pass's name; end() pops it
 };
 
 // One frame's command buffer and, when the window is visible, its swapchain
@@ -212,25 +275,32 @@ public:
 
     // False while the window is minimized: nothing to draw to this frame, but
     // submit() is still required.
-    [[nodiscard]] bool has_swapchain_image() const noexcept { return swapchain_texture_ != nullptr; }
+    [[nodiscard]] bool has_swapchain_image() const noexcept { return static_cast<bool>(swapchain_); }
     [[nodiscard]] std::uint32_t width() const noexcept { return width_; }   // pixels
     [[nodiscard]] std::uint32_t height() const noexcept { return height_; } // pixels
+    // This frame's swapchain image as a texture handle: a color attachment
+    // for passes in this frame only — never sampled, never kept. Null when
+    // there is no image.
+    [[nodiscard]] TextureHandle swapchain_texture() const noexcept { return swapchain_; }
 
-    // Begins a pass that clears the swapchain image and, if given, the depth
-    // texture (which must match the swapchain size). nullopt when there is no
-    // image. Depth contents are discarded after the pass: they are never read
-    // back, which is what lets a tile-based GPU keep them on-chip.
+    // Begins a pass on the given attachments. nullopt (with the reason in
+    // platform::last_error()) for no attachments, a destroyed or misused
+    // handle, or sizes that differ.
+    [[nodiscard]] std::optional<RenderPass> begin_pass(const RenderPassDesc& desc) noexcept;
+    // The common case: clear the swapchain image and, if given, the depth
+    // texture (which must match the swapchain size), and discard depth after
+    // the pass. nullopt when there is no image.
     [[nodiscard]] std::optional<RenderPass> begin_swapchain_pass(const ClearColor& clear, TextureHandle depth = {},
                                                                  float depth_clear = 0.0f) noexcept;
     void submit() noexcept;
 
 private:
     friend class Device;
-    Frame(Device* device, void* command_buffer, void* swapchain_texture, std::uint32_t width,
+    Frame(Device* device, void* command_buffer, TextureHandle swapchain, std::uint32_t width,
           std::uint32_t height) noexcept;
-    Device* device_;          // resolves handles; not owned
-    void* command_buffer_;    // SDL_GPUCommandBuffer*
-    void* swapchain_texture_; // SDL_GPUTexture*, not owned
+    Device* device_;         // resolves handles; not owned
+    void* command_buffer_;   // SDL_GPUCommandBuffer*
+    TextureHandle swapchain_; // a borrowed entry in the texture pool, gone after submit()
     std::uint32_t width_;
     std::uint32_t height_;
 };
@@ -276,6 +346,9 @@ public:
     [[nodiscard]] TextureFormat preferred_depth_format() const noexcept;
     // True once a window is attached with an sRGB-encoded swapchain.
     [[nodiscard]] bool swapchain_is_linear() const noexcept { return swapchain_linear_; }
+    // The swapchain's format once a window is attached: what a pipeline that
+    // draws to it must be built for.
+    [[nodiscard]] TextureFormat swapchain_format() const noexcept { return swapchain_format_; }
 
     // Handle validity: false for null handles and for anything destroyed.
     [[nodiscard]] bool valid(ShaderHandle handle) const noexcept;
@@ -342,6 +415,7 @@ private:
     bool vsync_;
     bool want_linear_swapchain_;
     bool swapchain_linear_ = false;
+    TextureFormat swapchain_format_ = TextureFormat::Bgra8Unorm;
 };
 
 } // namespace tynima::rhi

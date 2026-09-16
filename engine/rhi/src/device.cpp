@@ -35,6 +35,7 @@ struct Texture {
     TextureFormat format;
     std::uint32_t mip_levels;
     TextureUsage usage;
+    bool borrowed; // SDL's (the swapchain image): never released, uploaded to, or mipmapped by us
 };
 
 struct Sampler {
@@ -108,11 +109,40 @@ SDL_GPUTextureFormat to_sdl(TextureFormat format) noexcept {
     switch (format) {
     case TextureFormat::Rgba8Unorm: return SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM;
     case TextureFormat::Rgba8Srgb: return SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM_SRGB;
+    case TextureFormat::Bgra8Unorm: return SDL_GPU_TEXTUREFORMAT_B8G8R8A8_UNORM;
+    case TextureFormat::Bgra8Srgb: return SDL_GPU_TEXTUREFORMAT_B8G8R8A8_UNORM_SRGB;
+    case TextureFormat::Rgba16Float: return SDL_GPU_TEXTUREFORMAT_R16G16B16A16_FLOAT;
     case TextureFormat::Depth32Float: return SDL_GPU_TEXTUREFORMAT_D32_FLOAT;
     case TextureFormat::Depth24Stencil8: return SDL_GPU_TEXTUREFORMAT_D24_UNORM_S8_UINT;
     case TextureFormat::Depth16: return SDL_GPU_TEXTUREFORMAT_D16_UNORM;
     }
     return SDL_GPU_TEXTUREFORMAT_D32_FLOAT;
+}
+
+// The swapchain's format, as one of ours; false for one we have no name for.
+bool from_sdl(SDL_GPUTextureFormat format, TextureFormat& out) noexcept {
+    for (const TextureFormat candidate : {TextureFormat::Rgba8Unorm, TextureFormat::Rgba8Srgb,
+                                          TextureFormat::Bgra8Unorm, TextureFormat::Bgra8Srgb,
+                                          TextureFormat::Rgba16Float}) {
+        if (to_sdl(candidate) == format) {
+            out = candidate;
+            return true;
+        }
+    }
+    return false;
+}
+
+SDL_GPULoadOp to_sdl(LoadOp op) noexcept {
+    switch (op) {
+    case LoadOp::Load: return SDL_GPU_LOADOP_LOAD;
+    case LoadOp::Clear: return SDL_GPU_LOADOP_CLEAR;
+    case LoadOp::DontCare: return SDL_GPU_LOADOP_DONT_CARE;
+    }
+    return SDL_GPU_LOADOP_DONT_CARE;
+}
+
+SDL_GPUStoreOp to_sdl(StoreOp op) noexcept {
+    return op == StoreOp::Store ? SDL_GPU_STOREOP_STORE : SDL_GPU_STOREOP_DONT_CARE;
 }
 
 SDL_GPUFilter to_sdl(Filter filter) noexcept {
@@ -206,6 +236,9 @@ const char* texture_format_name(TextureFormat format) noexcept {
     switch (format) {
     case TextureFormat::Rgba8Unorm: return "RGBA8_UNORM";
     case TextureFormat::Rgba8Srgb: return "RGBA8_SRGB";
+    case TextureFormat::Bgra8Unorm: return "BGRA8_UNORM";
+    case TextureFormat::Bgra8Srgb: return "BGRA8_SRGB";
+    case TextureFormat::Rgba16Float: return "RGBA16_FLOAT";
     case TextureFormat::Depth32Float: return "D32_FLOAT";
     case TextureFormat::Depth24Stencil8: return "D24_UNORM_S8";
     case TextureFormat::Depth16: return "D16_UNORM";
@@ -216,7 +249,8 @@ const char* texture_format_name(TextureFormat format) noexcept {
 // ---------------------------------------------------------------- RenderPass
 
 RenderPass::RenderPass(RenderPass&& other) noexcept
-    : device_(other.device_), command_buffer_(other.command_buffer_), pass_(std::exchange(other.pass_, nullptr)) {}
+    : device_(other.device_), command_buffer_(other.command_buffer_),
+      pass_(std::exchange(other.pass_, nullptr)), labelled_(other.labelled_) {}
 
 RenderPass& RenderPass::operator=(RenderPass&& other) noexcept {
     if (this != &other) {
@@ -224,6 +258,7 @@ RenderPass& RenderPass::operator=(RenderPass&& other) noexcept {
         device_ = other.device_;
         command_buffer_ = other.command_buffer_;
         pass_ = std::exchange(other.pass_, nullptr);
+        labelled_ = other.labelled_;
     }
     return *this;
 }
@@ -301,19 +336,22 @@ void RenderPass::end() noexcept {
     if (pass_ != nullptr) {
         SDL_EndGPURenderPass(rp(pass_));
         pass_ = nullptr;
+        if (labelled_) {
+            SDL_PopGPUDebugGroup(cmd(command_buffer_));
+        }
     }
 }
 
 // --------------------------------------------------------------------- Frame
 
-Frame::Frame(Device* device, void* command_buffer, void* swapchain_texture, std::uint32_t width,
+Frame::Frame(Device* device, void* command_buffer, TextureHandle swapchain, std::uint32_t width,
              std::uint32_t height) noexcept
-    : device_(device), command_buffer_(command_buffer), swapchain_texture_(swapchain_texture), width_(width),
+    : device_(device), command_buffer_(command_buffer), swapchain_(swapchain), width_(width),
       height_(height) {}
 
 Frame::Frame(Frame&& other) noexcept
     : device_(other.device_), command_buffer_(std::exchange(other.command_buffer_, nullptr)),
-      swapchain_texture_(std::exchange(other.swapchain_texture_, nullptr)), width_(other.width_),
+      swapchain_(std::exchange(other.swapchain_, TextureHandle{})), width_(other.width_),
       height_(other.height_) {}
 
 Frame& Frame::operator=(Frame&& other) noexcept {
@@ -321,7 +359,7 @@ Frame& Frame::operator=(Frame&& other) noexcept {
         submit();
         device_ = other.device_;
         command_buffer_ = std::exchange(other.command_buffer_, nullptr);
-        swapchain_texture_ = std::exchange(other.swapchain_texture_, nullptr);
+        swapchain_ = std::exchange(other.swapchain_, TextureHandle{});
         width_ = other.width_;
         height_ = other.height_;
     }
@@ -332,45 +370,108 @@ Frame::~Frame() {
     submit();
 }
 
-std::optional<RenderPass> Frame::begin_swapchain_pass(const ClearColor& clear, TextureHandle depth,
-                                                      float depth_clear) noexcept {
+std::optional<RenderPass> Frame::begin_pass(const RenderPassDesc& desc) noexcept {
     TY_EXTERNAL_ALLOCATIONS();
-    if (command_buffer_ == nullptr || swapchain_texture_ == nullptr) {
+    if (command_buffer_ == nullptr) {
+        SDL_SetError("rhi::Frame::begin_pass: the frame was submitted");
         return std::nullopt;
     }
-    const Texture* depth_object = nullptr;
-    if (depth) {
-        depth_object = device_->pools_->textures.get(depth);
-        TY_ASSERT(depth_object != nullptr, "begin_swapchain_pass: destroyed depth texture handle");
-        if (depth_object == nullptr) {
-            SDL_SetError("begin_swapchain_pass: destroyed depth texture handle");
+    if (desc.color_count > kMaxColorTargets) {
+        SDL_SetError("rhi::Frame::begin_pass: %u color attachments (at most %u)", desc.color_count,
+                     kMaxColorTargets);
+        return std::nullopt;
+    }
+    if (desc.color_count == 0 && !desc.depth.has_value()) {
+        SDL_SetError("rhi::Frame::begin_pass: a pass needs at least one attachment");
+        return std::nullopt;
+    }
+
+    // Every attachment resolves to a live texture of the right usage, and
+    // they all agree on a size.
+    Extent2D extent{};
+    const auto resolve = [&](TextureHandle handle, TextureUsage needed, const char* what) -> const Texture* {
+        const Texture* object = device_->pools_->textures.get(handle);
+        TY_ASSERT(object != nullptr, "rhi::Frame::begin_pass: null or destroyed attachment handle");
+        if (object == nullptr) {
+            SDL_SetError("rhi::Frame::begin_pass: %s attachment is null or destroyed", what);
+            return nullptr;
+        }
+        if (!has_usage(object->usage, needed)) {
+            SDL_SetError("rhi::Frame::begin_pass: %s attachment lacks the usage for it", what);
+            return nullptr;
+        }
+        if (extent.width == 0) {
+            extent = object->extent;
+        } else if (extent.width != object->extent.width || extent.height != object->extent.height) {
+            SDL_SetError("rhi::Frame::begin_pass: attachments differ in size (%ux%u vs %ux%u)", extent.width,
+                         extent.height, object->extent.width, object->extent.height);
+            return nullptr;
+        }
+        return object;
+    };
+
+    SDL_GPUColorTargetInfo colors[kMaxColorTargets]{};
+    for (std::uint32_t i = 0; i < desc.color_count; ++i) {
+        const ColorAttachment& a = desc.colors[i];
+        const Texture* object = resolve(a.texture, TextureUsage::ColorTarget, "color");
+        if (object == nullptr) {
             return std::nullopt;
         }
+        colors[i].texture = object->handle;
+        colors[i].clear_color = SDL_FColor{a.clear.r, a.clear.g, a.clear.b, a.clear.a};
+        colors[i].load_op = to_sdl(a.load);
+        colors[i].store_op = to_sdl(a.store);
+        // Not loading last time's contents means SDL may hand the pass a
+        // fresh copy if the old one is still in flight — no stall. The
+        // swapchain image is SDL's own and is never cycled.
+        colors[i].cycle = !object->borrowed && a.load != LoadOp::Load;
     }
-
-    SDL_GPUColorTargetInfo color{};
-    color.texture = static_cast<SDL_GPUTexture*>(swapchain_texture_);
-    color.clear_color = SDL_FColor{clear.r, clear.g, clear.b, clear.a};
-    color.load_op = SDL_GPU_LOADOP_CLEAR;
-    color.store_op = SDL_GPU_STOREOP_STORE;
-
     SDL_GPUDepthStencilTargetInfo depth_info{};
-    if (depth_object != nullptr) {
-        depth_info.texture = depth_object->handle;
-        depth_info.clear_depth = depth_clear;
-        depth_info.load_op = SDL_GPU_LOADOP_CLEAR;
-        depth_info.store_op = SDL_GPU_STOREOP_DONT_CARE; // never read back: stays on-chip on a tiler
+    if (desc.depth.has_value()) {
+        const DepthAttachment& a = *desc.depth;
+        const Texture* object = resolve(a.texture, TextureUsage::DepthStencilTarget, "depth");
+        if (object == nullptr) {
+            return std::nullopt;
+        }
+        depth_info.texture = object->handle;
+        depth_info.clear_depth = a.clear;
+        depth_info.load_op = to_sdl(a.load);
+        depth_info.store_op = to_sdl(a.store);
         depth_info.stencil_load_op = SDL_GPU_LOADOP_DONT_CARE;
         depth_info.stencil_store_op = SDL_GPU_STOREOP_DONT_CARE;
-        depth_info.cycle = true; // let SDL swap in a fresh texture if last frame's is still in flight
+        depth_info.cycle = a.load != LoadOp::Load;
     }
 
-    SDL_GPURenderPass* pass = SDL_BeginGPURenderPass(cmd(command_buffer_), &color, 1,
-                                                     depth_object != nullptr ? &depth_info : nullptr);
+    const bool labelled = desc.name != nullptr;
+    if (labelled) {
+        SDL_PushGPUDebugGroup(cmd(command_buffer_), desc.name);
+    }
+    SDL_GPURenderPass* pass = SDL_BeginGPURenderPass(cmd(command_buffer_), colors, desc.color_count,
+                                                     desc.depth.has_value() ? &depth_info : nullptr);
     if (pass == nullptr) {
+        if (labelled) {
+            SDL_PopGPUDebugGroup(cmd(command_buffer_));
+        }
         return std::nullopt;
     }
-    return RenderPass(device_, command_buffer_, pass);
+    return RenderPass(device_, command_buffer_, pass, labelled);
+}
+
+std::optional<RenderPass> Frame::begin_swapchain_pass(const ClearColor& clear, TextureHandle depth,
+                                                      float depth_clear) noexcept {
+    if (!swapchain_) {
+        SDL_SetError("rhi::Frame::begin_swapchain_pass: no swapchain image this frame");
+        return std::nullopt;
+    }
+    RenderPassDesc desc;
+    desc.colors[0] = ColorAttachment{.texture = swapchain_, .load = LoadOp::Clear, .store = StoreOp::Store,
+                                     .clear = clear};
+    desc.color_count = 1;
+    if (depth) {
+        desc.depth = DepthAttachment{.texture = depth, .load = LoadOp::Clear, .store = StoreOp::DontCare,
+                                     .clear = depth_clear};
+    }
+    return begin_pass(desc);
 }
 
 void Frame::submit() noexcept {
@@ -379,7 +480,10 @@ void Frame::submit() noexcept {
         TY_PROFILE_SCOPE_NAMED("rhi::Frame::submit");
         SDL_SubmitGPUCommandBuffer(cmd(command_buffer_));
         command_buffer_ = nullptr;
-        swapchain_texture_ = nullptr;
+        if (swapchain_) {
+            device_->pools_->textures.destroy(swapchain_); // the entry, not SDL's texture
+            swapchain_ = {};
+        }
     }
 }
 
@@ -447,6 +551,12 @@ bool Device::attach_window(platform::Window& window) noexcept {
     swapchain_linear_ = composition == SDL_GPU_SWAPCHAINCOMPOSITION_SDR_LINEAR;
     if (!SDL_SetGPUSwapchainParameters(dev(device_), handle, composition, present)) {
         swapchain_linear_ = false; // keep whatever SDL gave us by default
+    }
+    if (!from_sdl(SDL_GetGPUSwapchainTextureFormat(dev(device_), handle), swapchain_format_)) {
+        SDL_SetError("rhi::Device::attach_window: the swapchain format is not one the engine knows");
+        SDL_ReleaseWindowFromGPUDevice(dev(device_), handle);
+        window_ = nullptr;
+        return false;
     }
     return true;
 }
@@ -529,9 +639,23 @@ void Device::destroy_shader(ShaderHandle shader) noexcept {
 
 PipelineHandle Device::create_graphics_pipeline(const GraphicsPipelineDesc& desc) noexcept {
     TY_EXTERNAL_ALLOCATIONS();
-    if (window_ == nullptr) {
-        SDL_SetError("rhi::Device::create_graphics_pipeline: attach_window() first — the pipeline targets the "
-                     "swapchain format");
+    if (desc.color_target_count > kMaxColorTargets) {
+        SDL_SetError("rhi::Device::create_graphics_pipeline: %u color targets (at most %u)",
+                     desc.color_target_count, kMaxColorTargets);
+        return {};
+    }
+    if (desc.color_target_count == 0 && !desc.depth_format.has_value()) {
+        SDL_SetError("rhi::Device::create_graphics_pipeline: a pipeline needs a color or depth target");
+        return {};
+    }
+    for (std::uint32_t i = 0; i < desc.color_target_count; ++i) {
+        if (is_depth_format(desc.color_formats[i])) {
+            SDL_SetError("rhi::Device::create_graphics_pipeline: color target %u has a depth format", i);
+            return {};
+        }
+    }
+    if (desc.depth_format.has_value() && !is_depth_format(*desc.depth_format)) {
+        SDL_SetError("rhi::Device::create_graphics_pipeline: the depth target has a color format");
         return {};
     }
     const Shader* vertex = pools_->shaders.get(desc.vertex_shader);
@@ -549,8 +673,10 @@ PipelineHandle Device::create_graphics_pipeline(const GraphicsPipelineDesc& desc
         return {};
     }
 
-    SDL_GPUColorTargetDescription color{};
-    color.format = SDL_GetGPUSwapchainTextureFormat(dev(device_), win(window_));
+    SDL_GPUColorTargetDescription colors[kMaxColorTargets]{};
+    for (std::uint32_t i = 0; i < desc.color_target_count; ++i) {
+        colors[i].format = to_sdl(desc.color_formats[i]);
+    }
 
     SDL_GPUVertexBufferDescription vertex_buffer{};
     vertex_buffer.slot = 0;
@@ -582,10 +708,10 @@ PipelineHandle Device::create_graphics_pipeline(const GraphicsPipelineDesc& desc
     info.depth_stencil_state.compare_op = to_sdl(desc.depth.compare);
     info.depth_stencil_state.enable_depth_test = desc.depth.test;
     info.depth_stencil_state.enable_depth_write = desc.depth.write;
-    info.target_info.color_target_descriptions = &color;
-    info.target_info.num_color_targets = 1;
-    if (desc.has_depth_target) {
-        info.target_info.depth_stencil_format = to_sdl(preferred_depth_format());
+    info.target_info.color_target_descriptions = colors;
+    info.target_info.num_color_targets = desc.color_target_count;
+    if (desc.depth_format.has_value()) {
+        info.target_info.depth_stencil_format = to_sdl(*desc.depth_format);
         info.target_info.has_depth_stencil_target = true;
     }
 
@@ -728,7 +854,8 @@ TextureHandle Device::create_texture(const TextureDesc& desc) noexcept {
     if (handle == nullptr) {
         return {};
     }
-    return pools_->textures.create(Texture{handle, {desc.width, desc.height}, desc.format, levels, usage});
+    return pools_->textures.create(
+        Texture{handle, {desc.width, desc.height}, desc.format, levels, usage, false});
 }
 
 Extent2D Device::texture_extent(TextureHandle texture) const noexcept {
@@ -741,12 +868,16 @@ bool Device::upload_texture(TextureHandle texture, const void* pixels, std::uint
     TY_PROFILE_SCOPE_NAMED("rhi::upload_texture");
     TY_EXTERNAL_ALLOCATIONS();
     const Texture* object = pools_->textures.get(texture);
-    if (object == nullptr) {
-        SDL_SetError("rhi::Device::upload_texture: null or destroyed texture handle");
+    if (object == nullptr || object->borrowed) {
+        SDL_SetError("rhi::Device::upload_texture: null, destroyed or borrowed texture handle");
         return false;
     }
     if (mip_level >= object->mip_levels) {
         SDL_SetError("rhi::Device::upload_texture: mip level %u of %u", mip_level, object->mip_levels);
+        return false;
+    }
+    if (is_depth_format(object->format)) {
+        SDL_SetError("rhi::Device::upload_texture: depth textures are rendered to, not uploaded");
         return false;
     }
     const Extent2D level{object->extent.width >> mip_level > 0 ? object->extent.width >> mip_level : 1,
@@ -769,8 +900,8 @@ bool Device::generate_mipmaps(TextureHandle texture) noexcept {
     TY_PROFILE_SCOPE_NAMED("rhi::generate_mipmaps");
     TY_EXTERNAL_ALLOCATIONS();
     const Texture* object = pools_->textures.get(texture);
-    if (object == nullptr) {
-        SDL_SetError("rhi::Device::generate_mipmaps: null or destroyed texture handle");
+    if (object == nullptr || object->borrowed) {
+        SDL_SetError("rhi::Device::generate_mipmaps: null, destroyed or borrowed texture handle");
         return false;
     }
     if (object->mip_levels <= 1) {
@@ -820,7 +951,9 @@ TextureHandle Device::create_texture_with_data(TextureFormat format, std::uint32
 void Device::destroy_texture(TextureHandle texture) noexcept {
     TY_EXTERNAL_ALLOCATIONS();
     if (const Texture* object = pools_->textures.get(texture)) {
-        SDL_ReleaseGPUTexture(dev(device_), object->handle);
+        if (!object->borrowed) {
+            SDL_ReleaseGPUTexture(dev(device_), object->handle);
+        }
         pools_->textures.destroy(texture);
     }
 }
@@ -876,7 +1009,20 @@ std::optional<Frame> Device::begin_frame() noexcept {
         SDL_CancelGPUCommandBuffer(command_buffer);
         return std::nullopt;
     }
-    return Frame(this, command_buffer, texture, width, height);
+    // The swapchain image joins the texture pool for the frame, so passes can
+    // name it like any other target; submit() takes the entry back.
+    TextureHandle swapchain;
+    if (texture != nullptr) {
+        swapchain = pools_->textures.create(Texture{texture, Extent2D{width, height}, swapchain_format_, 1,
+                                                    TextureUsage::ColorTarget, true});
+        if (!swapchain) {
+            SDL_CancelGPUCommandBuffer(command_buffer);
+            SDL_SetError("rhi: texture budget of %u exhausted, no room for the swapchain image",
+                         pools_->textures.capacity());
+            return std::nullopt;
+        }
+    }
+    return Frame(this, command_buffer, swapchain, width, height);
 }
 
 } // namespace tynima::rhi

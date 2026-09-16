@@ -85,7 +85,9 @@ TEST_CASE("mip level counts") {
     CHECK(rhi::is_depth_format(rhi::TextureFormat::Depth32Float));
     CHECK_FALSE(rhi::is_depth_format(rhi::TextureFormat::Rgba8Srgb));
     CHECK(rhi::bytes_per_pixel(rhi::TextureFormat::Rgba8Srgb) == 4);
-    CHECK(rhi::bytes_per_pixel(rhi::TextureFormat::Depth16) == 0);
+    CHECK(rhi::bytes_per_pixel(rhi::TextureFormat::Rgba16Float) == 8);
+    CHECK(rhi::bytes_per_pixel(rhi::TextureFormat::Depth16) == 2);
+    CHECK(rhi::bytes_per_pixel(rhi::TextureFormat::Depth32Float) == 4);
 }
 
 TEST_CASE("shader format names") {
@@ -124,15 +126,27 @@ TEST_CASE("runtime MSL compilation, a pipeline, and three frames") {
     // A broken shader fails cleanly, not loudly.
     CHECK(!device->create_shader(msl_shader(rhi::ShaderStage::Vertex, "vs_main", "this is not metal")));
 
-    // Pipelines target the swapchain, so they need a window first.
+    // A pipeline is built for its target formats: none at all is refused.
     CHECK(!device->create_graphics_pipeline({.vertex_shader = vs, .fragment_shader = fs}));
     CHECK(platform::last_error()[0] != '\0');
+    // An offscreen target needs no window.
+    rhi::GraphicsPipelineDesc offscreen{.vertex_shader = vs, .fragment_shader = fs};
+    offscreen.color_formats[0] = rhi::TextureFormat::Rgba16Float;
+    offscreen.color_target_count = 1;
+    const rhi::PipelineHandle offscreen_pipeline = device->create_graphics_pipeline(offscreen);
+    CHECK_MESSAGE(static_cast<bool>(offscreen_pipeline), platform::last_error());
+    device->destroy_graphics_pipeline(offscreen_pipeline);
 
     auto window = platform::Window::create({.title = "tynima rhi test", .width = 320, .height = 240});
     REQUIRE(window != nullptr);
     REQUIRE_MESSAGE(device->attach_window(*window), platform::last_error());
+    MESSAGE("swapchain format: ", std::string(rhi::texture_format_name(device->swapchain_format())));
+    CHECK(!rhi::is_depth_format(device->swapchain_format()));
 
-    const rhi::PipelineHandle pipeline = device->create_graphics_pipeline({.vertex_shader = vs, .fragment_shader = fs});
+    rhi::GraphicsPipelineDesc desc{.vertex_shader = vs, .fragment_shader = fs};
+    desc.color_formats[0] = device->swapchain_format();
+    desc.color_target_count = 1;
+    const rhi::PipelineHandle pipeline = device->create_graphics_pipeline(desc);
     REQUIRE_MESSAGE(static_cast<bool>(pipeline), platform::last_error());
     device->destroy_shader(vs); // the pipeline keeps what it needs
     device->destroy_shader(fs);
@@ -201,7 +215,9 @@ TEST_CASE("buffers, a depth texture, and an indexed draw with a vertex layout") 
     desc.vertex_layout = {sizeof(TestVertex), attributes, 2};
     desc.cull = rhi::CullMode::Back;
     desc.depth = {.test = true, .write = true, .compare = rhi::CompareOp::Greater};
-    desc.has_depth_target = true;
+    desc.color_formats[0] = device->swapchain_format();
+    desc.color_target_count = 1;
+    desc.depth_format = device->preferred_depth_format();
     const rhi::PipelineHandle pipeline = device->create_graphics_pipeline(desc);
     REQUIRE_MESSAGE(static_cast<bool>(pipeline), platform::last_error());
     device->destroy_shader(vs);
@@ -303,6 +319,8 @@ TEST_CASE("sampled textures: upload, GPU mipmaps, samplers, and a textured draw"
     desc.vertex_shader = vs;
     desc.fragment_shader = fs;
     desc.vertex_layout = {sizeof(TestVertex), attributes, 2};
+    desc.color_formats[0] = device->swapchain_format();
+    desc.color_target_count = 1;
     const rhi::PipelineHandle pipeline = device->create_graphics_pipeline(desc);
     REQUIRE_MESSAGE(static_cast<bool>(pipeline), platform::last_error());
     device->destroy_shader(vs);
@@ -329,6 +347,132 @@ TEST_CASE("sampled textures: upload, GPU mipmaps, samplers, and a textured draw"
     device->destroy_buffer(vb);
     device->destroy_sampler(sampler);
     device->destroy_texture(texture);
+    device.reset();
+    window.reset();
+}
+
+TEST_CASE("offscreen passes: draw into a texture, then sample it into the swapchain") {
+    Session session;
+    auto device = rhi::Device::create({.debug = false});
+    if (device == nullptr) {
+        MESSAGE("skipped: no GPU device (", std::string(platform::last_error()), ")");
+        return;
+    }
+    auto window = platform::Window::create({.title = "tynima rhi test", .width = 320, .height = 240});
+    REQUIRE(window != nullptr);
+    REQUIRE_MESSAGE(device->attach_window(*window), platform::last_error());
+
+    // The first pass draws a flat triangle into an HDR texture; the second
+    // samples that texture onto the swapchain.
+    const rhi::ShaderHandle vs = device->create_shader(msl_shader(rhi::ShaderStage::Vertex, "vs_main"));
+    const rhi::ShaderHandle fs = device->create_shader(msl_shader(rhi::ShaderStage::Fragment, "fs_main"));
+    REQUIRE_MESSAGE(static_cast<bool>(vs), platform::last_error());
+    REQUIRE_MESSAGE(static_cast<bool>(fs), platform::last_error());
+    rhi::GraphicsPipelineDesc offscreen{.vertex_shader = vs, .fragment_shader = fs};
+    offscreen.color_formats[0] = rhi::TextureFormat::Rgba16Float;
+    offscreen.color_target_count = 1;
+    offscreen.depth_format = device->preferred_depth_format();
+    const rhi::PipelineHandle draw_pipeline = device->create_graphics_pipeline(offscreen);
+    REQUIRE_MESSAGE(static_cast<bool>(draw_pipeline), platform::last_error());
+    device->destroy_shader(vs);
+    device->destroy_shader(fs);
+
+    const rhi::VertexAttribute attributes[2] = {{0, rhi::VertexFormat::Float3, 0},
+                                               {1, rhi::VertexFormat::Float3, 12}};
+    rhi::ShaderDesc vs_desc = msl_shader(rhi::ShaderStage::Vertex, "vs_main", kMeshMsl);
+    vs_desc.num_uniform_buffers = 1;
+    rhi::ShaderDesc fs_desc = msl_shader(rhi::ShaderStage::Fragment, "fs_textured", kMeshMsl);
+    fs_desc.num_samplers = 1;
+    const rhi::ShaderHandle blit_vs = device->create_shader(vs_desc);
+    const rhi::ShaderHandle blit_fs = device->create_shader(fs_desc);
+    REQUIRE_MESSAGE(static_cast<bool>(blit_vs), platform::last_error());
+    REQUIRE_MESSAGE(static_cast<bool>(blit_fs), platform::last_error());
+    rhi::GraphicsPipelineDesc blit{.vertex_shader = blit_vs, .fragment_shader = blit_fs};
+    blit.vertex_layout = {sizeof(TestVertex), attributes, 2};
+    blit.color_formats[0] = device->swapchain_format();
+    blit.color_target_count = 1;
+    const rhi::PipelineHandle blit_pipeline = device->create_graphics_pipeline(blit);
+    REQUIRE_MESSAGE(static_cast<bool>(blit_pipeline), platform::last_error());
+    device->destroy_shader(blit_vs);
+    device->destroy_shader(blit_fs);
+
+    const TestVertex vertices[3] = {{{-1.0f, -1.0f, 0.0f}, {1, 1, 1}}, {{3.0f, -1.0f, 0.0f}, {1, 1, 1}},
+                                    {{-1.0f, 3.0f, 0.0f}, {1, 1, 1}}};
+    const rhi::BufferHandle vb =
+        device->create_buffer_with_data(rhi::BufferUsage::Vertex, vertices, sizeof vertices);
+    REQUIRE(static_cast<bool>(vb));
+    const rhi::SamplerHandle sampler = device->create_sampler({});
+    REQUIRE(static_cast<bool>(sampler));
+    const float identity[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+
+    rhi::TextureHandle hdr, depth;
+    for (int i = 0; i < 2; ++i) {
+        auto frame = device->begin_frame();
+        REQUIRE_MESSAGE(frame.has_value(), platform::last_error());
+        if (!frame->has_swapchain_image()) {
+            frame->submit();
+            continue;
+        }
+        CHECK(static_cast<bool>(frame->swapchain_texture()));
+        CHECK(device->texture_extent(frame->swapchain_texture()).width == frame->width());
+        if (!hdr) {
+            const rhi::TextureUsage target = rhi::TextureUsage::ColorTarget | rhi::TextureUsage::Sampled;
+            hdr = device->create_texture({.format = rhi::TextureFormat::Rgba16Float,
+                                          .width = frame->width(),
+                                          .height = frame->height(),
+                                          .usage = target});
+            depth = device->create_texture({.format = device->preferred_depth_format(),
+                                            .width = frame->width(),
+                                            .height = frame->height()});
+            REQUIRE_MESSAGE(static_cast<bool>(hdr), platform::last_error());
+            REQUIRE_MESSAGE(static_cast<bool>(depth), platform::last_error());
+        }
+
+        // Misuse is refused with a reason, not a crash: no attachments, a
+        // depth texture as a color target, sizes that differ.
+        CHECK(!frame->begin_pass({}));
+        rhi::RenderPassDesc wrong{.name = "wrong"};
+        wrong.colors[0] = {.texture = depth};
+        wrong.color_count = 1;
+        CHECK(!frame->begin_pass(wrong));
+        CHECK(platform::last_error()[0] != '\0');
+
+        rhi::RenderPassDesc scene{.name = "scene"};
+        scene.colors[0] = {.texture = hdr, .load = rhi::LoadOp::Clear, .store = rhi::StoreOp::Store};
+        scene.color_count = 1;
+        scene.depth = rhi::DepthAttachment{.texture = depth};
+        {
+            auto pass = frame->begin_pass(scene);
+            REQUIRE_MESSAGE(pass.has_value(), platform::last_error());
+            pass->bind_pipeline(draw_pipeline);
+            pass->draw(3);
+            pass->end();
+        }
+        rhi::RenderPassDesc present{.name = "present"};
+        present.colors[0] = {.texture = frame->swapchain_texture(), .load = rhi::LoadOp::DontCare};
+        present.color_count = 1;
+        {
+            auto pass = frame->begin_pass(present);
+            REQUIRE_MESSAGE(pass.has_value(), platform::last_error());
+            pass->bind_pipeline(blit_pipeline);
+            pass->push_vertex_uniforms(0, identity, sizeof(identity));
+            pass->bind_fragment_texture(0, hdr, sampler);
+            pass->bind_vertex_buffer(vb);
+            pass->draw(3);
+            pass->end();
+        }
+        const rhi::TextureHandle swapchain = frame->swapchain_texture();
+        frame->submit();
+        CHECK(!device->valid(swapchain)); // gone with the frame
+    }
+
+    device->destroy_graphics_pipeline(draw_pipeline);
+    device->destroy_graphics_pipeline(blit_pipeline);
+    device->destroy_buffer(vb);
+    device->destroy_sampler(sampler);
+    device->destroy_texture(hdr);
+    device->destroy_texture(depth);
+    CHECK(device->resource_counts().textures == 0);
     device.reset();
     window.reset();
 }

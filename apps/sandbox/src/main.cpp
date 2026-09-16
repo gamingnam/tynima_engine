@@ -28,6 +28,8 @@
 #include <tynima/core/memory.h>
 #include <tynima/core/profile.h>
 #include <tynima/core/version.h>
+#include <tynima/physics/character.h>
+#include <tynima/physics/fixed_step.h>
 #include <tynima/physics/physics.h>
 #include <tynima/platform/events.h>
 #include <tynima/platform/input.h>
@@ -35,9 +37,8 @@
 #include <tynima/platform/platform.h>
 #include <tynima/platform/time.h>
 #include <tynima/platform/window.h>
-#include <tynima/physics/character.h>
-#include <tynima/physics/fixed_step.h>
 #include <tynima/render/camera.h>
+#include <tynima/render/frame_graph.h>
 #include <tynima/render/mesh.h>
 #include <tynima/render/model.h>
 #include <tynima/rhi/device.h>
@@ -515,7 +516,7 @@ struct FrameUniforms {
     float4 camera_position; // xyz
     float4 light_direction; // xyz: towards the light; w: intensity
     float4 light_color;     // rgb; w: ambient intensity
-    float4 params;          // x: encode sRGB here, y: shading model, z: debug view, w: tonemap
+    float4 params;          // x: shading model, y: debug view
 };
 
 struct MaterialUniforms {
@@ -547,12 +548,7 @@ float3 f_schlick(float v_dot_h, float3 f0) {
     return f0 + (float3(1.0) - f0) * f;
 }
 
-// Narkowicz's ACES fit: the post stack's job eventually, in the shader for now.
-float3 tonemap_aces(float3 x) {
-    const float a = 2.51, b = 0.03, c = 2.43, d = 0.59, e = 0.14;
-    return saturate((x * (a * x + b)) / (x * (c * x + d) + e));
-}
-
+// Linear light out, into an HDR target: the tonemap pass makes it a picture.
 fragment float4 fs_main(VSOut in [[stage_in]],
                         texture2d<float> base_color_map [[texture(0)]],
                         texture2d<float> metallic_roughness_map [[texture(1)]],
@@ -589,8 +585,8 @@ fragment float4 fs_main(VSOut in [[stage_in]],
     float3 radiance = frame.light_color.rgb * frame.light_direction.w;
     float ambient = frame.light_color.w;
 
-    int mode = int(frame.params.y);
-    int debug_view = int(frame.params.z);
+    int mode = int(frame.params.x);
+    int debug_view = int(frame.params.y);
     float3 color;
     if (debug_view == 1) {
         color = n * 0.5 + 0.5;
@@ -631,13 +627,52 @@ fragment float4 fs_main(VSOut in [[stage_in]],
         float3 indirect = (diffuse_color + f0 * 0.5) * ambient * occlusion;
         color = direct + indirect + emissive;
     }
-    if (frame.params.w > 0.5 && debug_view == 0) {
+    return float4(color, base.a);
+}
+)";
+
+// The post pass: one triangle over the screen, the HDR image sampled once
+// per pixel, ACES to bring it into range, and the sRGB encode when the
+// swapchain does not do it in hardware.
+constexpr const char* kTonemapMsl = R"(
+#include <metal_stdlib>
+using namespace metal;
+
+struct VSOut {
+    float4 position [[position]];
+    float2 uv;
+};
+
+// Three vertices that cover the screen: (-1,-1), (3,-1), (-1,3) in clip
+// space; the parts past the edges are clipped away.
+vertex VSOut vs_main(uint vid [[vertex_id]]) {
+    float2 corner = float2((vid << 1) & 2, vid & 2);
+    VSOut out;
+    out.position = float4(corner * 2.0 - 1.0, 0.0, 1.0);
+    out.uv = float2(corner.x, 1.0 - corner.y); // texture rows run top to bottom
+    return out;
+}
+
+struct PostUniforms {
+    float4 params; // x: tonemap, y: encode sRGB
+};
+
+// Narkowicz's ACES fit.
+float3 tonemap_aces(float3 x) {
+    const float a = 2.51, b = 0.03, c = 2.43, d = 0.59, e = 0.14;
+    return saturate((x * (a * x + b)) / (x * (c * x + d) + e));
+}
+
+fragment float4 fs_main(VSOut in [[stage_in]], texture2d<float> hdr [[texture(0)]], sampler s [[sampler(0)]],
+                        constant PostUniforms& post [[buffer(0)]]) {
+    float3 color = hdr.sample(s, in.uv).rgb;
+    if (post.params.x > 0.5) {
         color = tonemap_aces(color);
     }
-    if (frame.params.x > 0.5) {
-        color = pow(color, float3(1.0 / 2.2));
+    if (post.params.y > 0.5) {
+        color = pow(max(color, 0.0), float3(1.0 / 2.2));
     }
-    return float4(color, base.a);
+    return float4(color, 1.0);
 }
 )";
 
@@ -688,6 +723,11 @@ struct MaterialUniforms {
     Vec4 emissive_factor;
 };
 static_assert(sizeof(MaterialUniforms) == 48, "matches the MSL MaterialUniforms struct");
+
+struct PostUniforms {
+    Vec4 params;
+};
+static_assert(sizeof(PostUniforms) == 16, "matches the MSL PostUniforms struct");
 
 // What the keys toggle. Printed whenever it changes.
 struct Shading {
@@ -819,21 +859,30 @@ struct FlyCamera {
 
 // ----------------------------------------------------------------- renderer
 
+// The frame's passes draw the scene into this format; the tonemap pass
+// brings it down to the swapchain's.
+constexpr rhi::TextureFormat kHdrFormat = rhi::TextureFormat::Rgba16Float;
+constexpr rhi::ClearColor kSkyColor{.r = 0.09f, .g = 0.10f, .b = 0.12f};
+
 struct Renderer {
     std::unique_ptr<rhi::Device> device;
+    std::unique_ptr<render::FrameGraph> graph; // owns the frame's transient textures
     rhi::PipelineHandle mesh_pipeline;
     rhi::PipelineHandle triangle_pipeline;
-    rhi::TextureHandle depth;
+    rhi::PipelineHandle tonemap_pipeline;
     render::FallbackTextures fallbacks;
-    rhi::SamplerHandle sampler;
+    rhi::SamplerHandle sampler;      // materials: anisotropic, repeating
+    rhi::SamplerHandle post_sampler; // the HDR image: one texel per pixel, clamped
     render::Model models[kModelCount]; // by kModel* slot
 
     Renderer() = default;
     Renderer(Renderer&& other) noexcept
-        : device(std::move(other.device)), mesh_pipeline(std::exchange(other.mesh_pipeline, {})),
-          triangle_pipeline(std::exchange(other.triangle_pipeline, {})), depth(std::exchange(other.depth, {})),
+        : device(std::move(other.device)), graph(std::move(other.graph)),
+          mesh_pipeline(std::exchange(other.mesh_pipeline, {})),
+          triangle_pipeline(std::exchange(other.triangle_pipeline, {})),
+          tonemap_pipeline(std::exchange(other.tonemap_pipeline, {})),
           fallbacks(std::exchange(other.fallbacks, render::FallbackTextures{})),
-          sampler(std::exchange(other.sampler, {})) {
+          sampler(std::exchange(other.sampler, {})), post_sampler(std::exchange(other.post_sampler, {})) {
         for (std::uint32_t i = 0; i < kModelCount; ++i) {
             models[i] = std::exchange(other.models[i], render::Model{});
         }
@@ -841,37 +890,21 @@ struct Renderer {
     Renderer& operator=(Renderer&&) = delete;
     ~Renderer() { destroy(); }
 
-    // The depth texture tracks the swapchain size: recreate it when that changes.
-    rhi::TextureHandle depth_for(std::uint32_t width, std::uint32_t height) {
-        if (depth) {
-            const rhi::Extent2D extent = device->texture_extent(depth);
-            if (extent.width == width && extent.height == height) {
-                return depth;
-            }
-            device->destroy_texture(depth);
-            depth = {};
-        }
-        depth = device->create_texture({.format = device->preferred_depth_format(), .width = width, .height = height});
-        if (!depth) {
-            TY_LOG_ERROR("gpu", "depth texture failed: %s", platform::last_error());
-        }
-        return depth;
-    }
-
     // GPU objects go before their device, and the device before the window.
     void destroy() noexcept {
         if (device != nullptr) {
+            graph.reset(); // returns its textures first
             for (render::Model& model : models) {
                 render::destroy_model(*device, model);
             }
             device->destroy_sampler(sampler);
+            device->destroy_sampler(post_sampler);
             render::destroy_fallback_textures(*device, fallbacks);
             device->destroy_graphics_pipeline(mesh_pipeline);
             device->destroy_graphics_pipeline(triangle_pipeline);
-            device->destroy_texture(depth);
-            mesh_pipeline = triangle_pipeline = {};
-            depth = {};
-            sampler = {};
+            device->destroy_graphics_pipeline(tonemap_pipeline);
+            mesh_pipeline = triangle_pipeline = tonemap_pipeline = {};
+            sampler = post_sampler = {};
             device.reset();
         }
     }
@@ -927,24 +960,40 @@ Renderer create_renderer(platform::Window& window, const render::ModelData* mode
     }
     TY_LOG_INFO("swap", "%s", r.device->swapchain_is_linear() ? "sRGB-encoded by the display hardware"
                                                              : "plain SDR; the shader encodes sRGB itself");
+    r.graph = std::make_unique<render::FrameGraph>(r.device.get());
     if (r.device->shader_format() != rhi::ShaderFormat::Msl) {
         TY_LOG_WARN("gpu", "the sandbox only carries MSL until SDL_shadercross lands; drawing nothing");
         return r;
     }
 
+    // The scene pass draws into HDR with depth; the tonemap pass draws into
+    // the swapchain with neither.
     rhi::GraphicsPipelineDesc mesh_desc;
     mesh_desc.vertex_layout = render::vertex_layout();
     mesh_desc.cull = rhi::CullMode::Back;
     mesh_desc.depth = {.test = true, .write = true, .compare = rhi::CompareOp::Greater}; // reverse-Z
-    mesh_desc.has_depth_target = true;
+    mesh_desc.color_formats[0] = kHdrFormat;
+    mesh_desc.color_target_count = 1;
+    mesh_desc.depth_format = r.device->preferred_depth_format();
     r.mesh_pipeline = make_pipeline(*r.device, kMeshMsl, mesh_desc, 1, 2, 5);
 
     rhi::GraphicsPipelineDesc triangle_desc;
-    triangle_desc.has_depth_target = true; // same pass, so the same targets, even with the test off
+    triangle_desc.color_formats[0] = kHdrFormat; // same pass, so the same targets, even with the test off
+    triangle_desc.color_target_count = 1;
+    triangle_desc.depth_format = r.device->preferred_depth_format();
     r.triangle_pipeline = make_pipeline(*r.device, kTriangleMsl, triangle_desc, 0, 0, 0);
 
+    rhi::GraphicsPipelineDesc tonemap_desc;
+    tonemap_desc.color_formats[0] = r.device->swapchain_format();
+    tonemap_desc.color_target_count = 1;
+    r.tonemap_pipeline = make_pipeline(*r.device, kTonemapMsl, tonemap_desc, 0, 1, 1);
+
     r.sampler = r.device->create_sampler({.max_anisotropy = 8.0f});
-    if (!render::create_fallback_textures(*r.device, r.fallbacks) || !r.sampler) {
+    r.post_sampler = r.device->create_sampler({.min_filter = rhi::Filter::Nearest,
+                                               .mag_filter = rhi::Filter::Nearest,
+                                               .address_u = rhi::AddressMode::ClampToEdge,
+                                               .address_v = rhi::AddressMode::ClampToEdge});
+    if (!render::create_fallback_textures(*r.device, r.fallbacks) || !r.sampler || !r.post_sampler) {
         TY_LOG_ERROR("gpu", "fallback textures or sampler failed: %s", platform::last_error());
         return r;
     }
@@ -1019,6 +1068,138 @@ platform::InputFrame scripted_frame(long index, float dt) {
         frame.keys_released.set(bit(platform::Key::L));
     }
     return frame;
+}
+
+// The frame as a graph: the scene into an HDR transient with a depth
+// transient beside it, then the tonemap pass reading that onto the swapchain.
+// Declared, compiled and run every frame — the graph decides that depth is
+// never stored and that HDR is, and would drop either pass if nothing
+// consumed it.
+void draw_frame(Renderer& renderer, rhi::Frame& frame, scene::World& world, const FlyCamera& fly,
+                const Shading& shading) {
+    render::FrameGraph& graph = *renderer.graph;
+    const render::TextureInfo screen{.format = kHdrFormat, .width = frame.width(), .height = frame.height()};
+    graph.begin();
+    render::GraphTexture swapchain = graph.import(
+        "swapchain", frame.swapchain_texture(),
+        {.format = renderer.device->swapchain_format(), .width = frame.width(), .height = frame.height()});
+    render::GraphTexture hdr = graph.create("hdr", screen);
+    render::GraphTexture depth = graph.create("depth", {.format = renderer.device->preferred_depth_format(),
+                                                        .width = screen.width,
+                                                        .height = screen.height});
+
+    const float aspect = static_cast<float>(frame.width()) / static_cast<float>(frame.height());
+    const Mat4 view_projection = fly.camera.view_projection(aspect);
+    const bool have_scene = renderer.models[kModelBottle].mesh.index_count > 0 && renderer.mesh_pipeline;
+    graph.add_pass(
+        "scene",
+        [&](render::PassBuilder& b) {
+            hdr = b.write_color(hdr, rhi::LoadOp::Clear, kSkyColor);
+            depth = b.write_depth(depth, rhi::LoadOp::Clear, 0.0f);
+        },
+        [&](rhi::RenderPass& pass, const render::PassResources&) {
+            if (!have_scene) {
+                if (renderer.triangle_pipeline) {
+                    pass.bind_pipeline(renderer.triangle_pipeline);
+                    pass.draw(3);
+                }
+                return;
+            }
+            pass.bind_pipeline(renderer.mesh_pipeline);
+            const Vec3 light = shading.light_direction();
+            const FrameUniforms frame_uniforms{{fly.camera.position, 1.0f},
+                                               {light, shading.light_intensity},
+                                               {1.0f, 0.97f, 0.92f, shading.ambient},
+                                               {static_cast<float>(shading.model),
+                                                static_cast<float>(shading.debug_view), 0.0f, 0.0f}};
+            pass.push_fragment_uniforms(0, &frame_uniforms, sizeof(frame_uniforms));
+            // One draw per submesh per entity that has something to draw.
+            std::uint32_t bound_model = 0xFFFFFFFFu;
+            world.each<scene::LocalToWorld, scene::MeshRenderer>(
+                [&](scene::Entity, scene::LocalToWorld& local_to_world, scene::MeshRenderer& mr) {
+                    if (!mr.visible || mr.model >= kModelCount) {
+                        return;
+                    }
+                    const render::Model& model = renderer.models[mr.model];
+                    if (model.mesh.index_count == 0) {
+                        return;
+                    }
+                    if (bound_model != mr.model) {
+                        render::bind_mesh(pass, model.mesh);
+                        bound_model = mr.model;
+                    }
+                    const MeshUniforms uniforms{view_projection * local_to_world.matrix,
+                                                local_to_world.matrix};
+                    pass.push_vertex_uniforms(0, &uniforms, sizeof(uniforms));
+                    for (const render::Submesh& sub : model.mesh.submeshes) {
+                        const render::Material& material = model.materials[sub.material];
+                        const MaterialUniforms material_uniforms{
+                            material.base_color_factor,
+                            {material.metallic_factor, material.roughness_factor, material.occlusion_strength,
+                             material.normal_scale},
+                            {material.emissive_factor, 0.0f}};
+                        pass.bind_fragment_texture(0, material.base_color, renderer.sampler);
+                        pass.bind_fragment_texture(1, material.metallic_roughness, renderer.sampler);
+                        pass.bind_fragment_texture(2, material.occlusion, renderer.sampler);
+                        pass.bind_fragment_texture(3, material.emissive, renderer.sampler);
+                        pass.bind_fragment_texture(4, material.normal, renderer.sampler);
+                        pass.push_fragment_uniforms(1, &material_uniforms, sizeof(material_uniforms));
+                        pass.draw_indexed(sub.index_count, sub.first_index);
+                    }
+                });
+        });
+    // Debug views are data, not light: they go to the screen as they are.
+    const PostUniforms post{{shading.tonemap && shading.debug_view == 0 ? 1.0f : 0.0f,
+                             renderer.device->swapchain_is_linear() ? 0.0f : 1.0f, 0.0f, 0.0f}};
+    graph.add_pass(
+        "tonemap",
+        [&](render::PassBuilder& b) {
+            b.read(hdr);
+            // The triangle covers every pixel, so nothing needs loading — unless
+            // there is no pipeline to draw it (no shaders for this backend yet),
+            // when a clear is all the frame has.
+            if (renderer.tonemap_pipeline) {
+                swapchain = b.write_color(swapchain, rhi::LoadOp::DontCare);
+            } else {
+                swapchain = b.write_color(swapchain, rhi::LoadOp::Clear, kSkyColor);
+            }
+        },
+        [&](rhi::RenderPass& pass, const render::PassResources& resources) {
+            if (!renderer.tonemap_pipeline) {
+                return;
+            }
+            pass.bind_pipeline(renderer.tonemap_pipeline);
+            pass.bind_fragment_texture(0, resources.texture(hdr), renderer.post_sampler);
+            pass.push_fragment_uniforms(0, &post, sizeof post);
+            pass.draw(3);
+        });
+    if (graph.compile()) {
+        graph.execute(frame);
+    } else {
+        TY_LOG_ERROR("graph", "%s", graph.error());
+    }
+}
+
+// What the graph made of the frame, once it has settled.
+void report_graph(const render::FrameGraph& graph) {
+    const render::FrameGraph::Stats& stats = graph.stats();
+    TY_LOG_INFO("graph", "%u passes (%u culled); %u transients in %u textures, %.1f MB of %.1f MB asked; "
+                         "%u attachments stored, %u discarded; %u could live in tile memory",
+                stats.passes, stats.culled, stats.transients_used, stats.physical_textures,
+                static_cast<double>(stats.bytes_allocated) / 1048576.0,
+                static_cast<double>(stats.bytes_requested) / 1048576.0, stats.attachments_stored,
+                stats.attachments_discarded, stats.memoryless);
+    char text[1024];
+    graph.describe(text, sizeof text);
+    for (char* line = text; *line != '\0';) {
+        char* end = std::strchr(line, '\n');
+        if (end == nullptr) {
+            break;
+        }
+        *end = '\0';
+        TY_LOG_INFO("graph", "  %s", line);
+        line = end + 1;
+    }
 }
 
 } // namespace
@@ -1182,6 +1363,7 @@ int main(int argc, char** argv) {
     double last_report = last_time;
     long frames_since_report = 0;
     bool running = true;
+    std::uint32_t last_culled = 0;
 
     while (running) {
         frame_arena.reset();
@@ -1271,57 +1453,11 @@ int main(int argc, char** argv) {
                         TY_LOG_INFO("swap", "%ux%u pixels", frame->width(), frame->height());
                         reported_swapchain = true;
                     }
-                    const rhi::TextureHandle depth = renderer.depth_for(frame->width(), frame->height());
-                    if (auto pass = frame->begin_swapchain_pass({.r = 0.09f, .g = 0.10f, .b = 0.12f}, depth, 0.0f)) {
-                        if (renderer.models[kModelBottle].mesh.index_count > 0 && renderer.mesh_pipeline) {
-                            const float aspect = static_cast<float>(frame->width()) / static_cast<float>(frame->height());
-                            const Mat4 view_projection = fly.camera.view_projection(aspect);
-                            pass->bind_pipeline(renderer.mesh_pipeline);
-                            const Vec3 light = shading.light_direction();
-                            const FrameUniforms frame_uniforms{
-                                {fly.camera.position, 1.0f},
-                                {light, shading.light_intensity},
-                                {1.0f, 0.97f, 0.92f, shading.ambient},
-                                {renderer.device->swapchain_is_linear() ? 0.0f : 1.0f, static_cast<float>(shading.model),
-                                 static_cast<float>(shading.debug_view), shading.tonemap ? 1.0f : 0.0f}};
-                            pass->push_fragment_uniforms(0, &frame_uniforms, sizeof(frame_uniforms));
-                            // One draw per submesh per entity that has something to draw.
-                            std::uint32_t bound_model = 0xFFFFFFFFu;
-                            world.each<scene::LocalToWorld, scene::MeshRenderer>(
-                                [&](scene::Entity, scene::LocalToWorld& local_to_world, scene::MeshRenderer& mr) {
-                                    if (!mr.visible || mr.model >= kModelCount ||
-                                        renderer.models[mr.model].mesh.index_count == 0) {
-                                        return;
-                                    }
-                                    const render::Model& model = renderer.models[mr.model];
-                                    if (bound_model != mr.model) {
-                                        render::bind_mesh(*pass, model.mesh);
-                                        bound_model = mr.model;
-                                    }
-                                    const MeshUniforms uniforms{view_projection * local_to_world.matrix,
-                                                                local_to_world.matrix};
-                                    pass->push_vertex_uniforms(0, &uniforms, sizeof(uniforms));
-                                    for (const render::Submesh& sub : model.mesh.submeshes) {
-                                        const render::Material& material = model.materials[sub.material];
-                                        const MaterialUniforms material_uniforms{
-                                            material.base_color_factor,
-                                            {material.metallic_factor, material.roughness_factor,
-                                             material.occlusion_strength, material.normal_scale},
-                                            {material.emissive_factor, 0.0f}};
-                                        pass->bind_fragment_texture(0, material.base_color, renderer.sampler);
-                                        pass->bind_fragment_texture(1, material.metallic_roughness, renderer.sampler);
-                                        pass->bind_fragment_texture(2, material.occlusion, renderer.sampler);
-                                        pass->bind_fragment_texture(3, material.emissive, renderer.sampler);
-                                        pass->bind_fragment_texture(4, material.normal, renderer.sampler);
-                                        pass->push_fragment_uniforms(1, &material_uniforms, sizeof(material_uniforms));
-                                        pass->draw_indexed(sub.index_count, sub.first_index);
-                                    }
-                                });
-                        } else if (renderer.triangle_pipeline) {
-                            pass->bind_pipeline(renderer.triangle_pipeline);
-                            pass->draw(3);
-                        }
-                        pass->end();
+                    draw_frame(renderer, *frame, world, fly, shading);
+                    const std::uint32_t culled = renderer.graph->stats().culled;
+                    if (frame_count == 60 || (frame_count > 60 && culled != last_culled)) {
+                        report_graph(*renderer.graph);
+                        last_culled = culled;
                     }
                 }
                 frame->submit();

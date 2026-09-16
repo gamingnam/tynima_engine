@@ -21,7 +21,7 @@ past that declaration.
 | `engine/assets/`  | `core platform render scene`         | Runtime loading of cooked blobs, GPU upload, hot reload     |
 | `engine/scene/`   | `core render physics`                | Archetype ECS, transforms, the systems that drive the rest  |
 | `engine/physics/` | `core`                               | Rigid bodies behind `PhysicsWorld`: Jolt now, ours next     |
-| `engine/render/`  | `core rhi`                           | Frame graph, passes, materials, culling                     |
+| `engine/render/`  | `core platform rhi`                  | Frame graph, passes, materials, culling                     |
 | `engine/rhi/`     | `core platform`                      | Render hardware interface — SDL3 GPU, then native Metal     |
 | `engine/platform/`| `core`                               | Window, input, filesystem, time, threads (wraps SDL3)       |
 | `engine/core/`    | —                                    | Allocators, containers, math, jobs, logging, reflection     |
@@ -50,7 +50,8 @@ The sandbox loads a glTF model (a CC0 Khronos sample, downloaded into
 `build/<preset>/assets/` at configure time) with its base color texture,
 draws it with a reverse-Z depth buffer through SDL3 GPU with its Metal shaders
 compiled at runtime — sRGB textures sampled through sRGB formats, lighting in
-linear, an sRGB-encoded swapchain on the way out — and lets you fly around it: hold the right mouse button to look, W/A/S/D to move, Q/E
+linear into a 16-bit float target, tonemapped onto an sRGB-encoded swapchain
+in a second pass — and lets you fly around it: hold the right mouse button to look, W/A/S/D to move, Q/E
 to descend and climb, Shift to run, Escape to quit. `F` puts the camera
 behind the character instead: then W/A/S/D walk it, Space jumps, Shift
 runs, and it can shove bottles about, push the gate open and swing the
@@ -228,6 +229,57 @@ CTests replay on every platform CI builds. Any change to the simulation, a
 new shape in the scene or one rounding in the solver, fails them; when the
 change is meant, look at the new run, then record the logs again with the
 commands in [`apps/sandbox/CMakeLists.txt`](apps/sandbox/CMakeLists.txt).
+
+## Frame graph
+
+`render::FrameGraph` ([`frame_graph.h`](engine/render/include/tynima/render/frame_graph.h))
+is how a frame is drawn: passes declare what they read and write, and the
+graph decides the rest — the shape Frostbite described at GDC 2017, built
+every frame from scratch (declaring is a few dozen stores; nothing in it
+allocates after construction). A pass's setup callback names its
+attachments and the textures it samples through versioned handles (every
+write makes a new version, so the graph knows exactly which pass produced
+what another consumes); its execute callback draws. `compile()` then:
+
+- **orders** the passes: after whatever wrote what they read, after whatever
+  read what they overwrite, otherwise as added — and refuses a cycle;
+- **culls** what nobody consumes: a pass whose writes are never read, never
+  loaded by a later write and not an imported texture (the swapchain, a
+  shadow atlas kept across frames) does not run, nor does whatever only
+  fed it;
+- **allocates transients**: a texture the graph creates lives from its first
+  use to its last, so two whose lives do not overlap share one physical
+  texture, and the physical textures persist across frames and are dropped
+  when unused for a couple of seconds;
+- **decides every load and store**: a write nothing reads afterwards is
+  stored `DontCare`, and a transient that is never sampled and never stored
+  is flagged as one that could live entirely in tile memory — which is the
+  point of the project. SDL GPU has no memoryless attachments; the native
+  Metal backend later in Phase 4 will act on the flag.
+
+Barriers: on SDL GPU the pass order is the synchronisation (the backend
+tracks hazards within a command buffer), and the graph's edges are what a
+backend with explicit barriers would emit them from.
+
+The sandbox draws through it: a `scene` pass into an `Rgba16Float` transient
+with a depth transient beside it, and a `tonemap` pass that samples the
+result onto the swapchain (ACES, and the sRGB encode where the swapchain
+does not do it). The graph works out that depth is never stored and HDR is,
+and the sandbox logs the plan once it has settled (here at 2560×1440):
+
+```
+graph: 2 passes (0 culled); 2 transients in 2 textures, 44.2 MB of 44.2 MB asked; 2 attachments stored, 1 discarded; 1 could live in tile memory
+graph:   scene: writes hdr (clear, store), depth (clear, discard)
+graph:   tonemap: reads hdr; writes swapchain (dontcare, store)
+```
+
+The RHI grew what the graph needs: passes on any texture with load and
+store actions (`Frame::begin_pass`), pipelines built for explicit target
+formats, and the swapchain image as an ordinary texture handle for the
+frame (`Frame::swapchain_texture()`). The render tests compile graphs with
+no device at all — culling, ordering, aliasing, stores, and every way a
+graph can be malformed — and the RHI tests draw offscreen and sample it
+back where a GPU exists.
 
 ## Logging and asserts
 
