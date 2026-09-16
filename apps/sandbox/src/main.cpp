@@ -19,7 +19,8 @@
 //
 // Controls: hold the right mouse button to look; W/A/S/D move, Q/E descend
 // and climb, Shift runs; R drops the pile again; L (the game module)
-// launches it; F follows the character; Escape quits.
+// launches it; F follows the character; C shows the shadow cascades, X
+// toggles shadows; Escape quits.
 #include <tynima/assets/gltf.h>
 #include <tynima/core/arena.h>
 #include <tynima/core/assert.h>
@@ -41,6 +42,7 @@
 #include <tynima/render/frame_graph.h>
 #include <tynima/render/mesh.h>
 #include <tynima/render/model.h>
+#include <tynima/render/shadows.h>
 #include <tynima/rhi/device.h>
 #include <tynima/scene/components.h>
 #include <tynima/scene/systems.h>
@@ -525,7 +527,24 @@ struct MaterialUniforms {
     float4 emissive_factor; // rgb
 };
 
+struct ShadowUniforms {
+    float4x4 cascade_matrix[4]; // world -> light clip, reverse-Z
+    float4 cascade_param[4];    // x: texel size (m), y: depth per metre, z: texel size in uv
+    float4 settings;            // x: cascades, y: strength (0: off), z: normal offset, w: bias (in texels)
+};
+
 constant float kPi = 3.14159265358979;
+
+// 3x3 taps of the hardware's own 2x2 compare: a soft edge four texels wide.
+float shadow_pcf(depth2d<float> map, sampler s, float2 uv, float depth, float texel_uv) {
+    float sum = 0.0;
+    for (int y = -1; y <= 1; ++y) {
+        for (int x = -1; x <= 1; ++x) {
+            sum += map.sample_compare(s, uv + float2(x, y) * texel_uv, depth);
+        }
+    }
+    return sum / 9.0;
+}
 
 // GGX / Trowbridge-Reitz normal distribution: how many microfacets face h.
 float d_ggx(float n_dot_h, float alpha) {
@@ -555,9 +574,15 @@ fragment float4 fs_main(VSOut in [[stage_in]],
                         texture2d<float> occlusion_map [[texture(2)]],
                         texture2d<float> emissive_map [[texture(3)]],
                         texture2d<float> normal_map [[texture(4)]],
+                        depth2d<float> shadow_map0 [[texture(5)]],
+                        depth2d<float> shadow_map1 [[texture(6)]],
+                        depth2d<float> shadow_map2 [[texture(7)]],
+                        depth2d<float> shadow_map3 [[texture(8)]],
                         sampler map_sampler [[sampler(0)]],
+                        sampler shadow_sampler [[sampler(5)]],
                         constant FrameUniforms& frame [[buffer(0)]],
-                        constant MaterialUniforms& m [[buffer(1)]]) {
+                        constant MaterialUniforms& m [[buffer(1)]],
+                        constant ShadowUniforms& shadows [[buffer(2)]]) {
     float4 base = base_color_map.sample(map_sampler, in.uv) * m.base_color_factor;
     float4 mr = metallic_roughness_map.sample(map_sampler, in.uv);
     float metallic = mr.b * m.factors.x;                        // glTF: metallic in B
@@ -585,6 +610,39 @@ fragment float4 fs_main(VSOut in [[stage_in]],
     float3 radiance = frame.light_color.rgb * frame.light_direction.w;
     float ambient = frame.light_color.w;
 
+    // Shadow: from the first cascade whose map holds this point. The lookup
+    // point is pushed off the surface along the normal, more where the light
+    // grazes it, and the depth nudged towards the light — the two biases
+    // that keep a lit surface from shadowing itself.
+    float shadow = 1.0;
+    int cascade = -1;
+    if (shadows.settings.y > 0.0) {
+        float grazing = 1.0 - saturate(dot(geometric_n, l));
+        for (int c = 0; c < int(shadows.settings.x); ++c) {
+            float4 param = shadows.cascade_param[c];
+            float3 lookup = in.world_position + geometric_n * (param.x * shadows.settings.z * grazing);
+            float4 lc = shadows.cascade_matrix[c] * float4(lookup, 1.0);
+            float2 uv = float2(lc.x * 0.5 + 0.5, 0.5 - lc.y * 0.5);
+            float border = param.z * 2.0; // the taps must stay inside the map
+            bool inside = uv.x > border && uv.x < 1.0 - border && uv.y > border && uv.y < 1.0 - border;
+            if (inside && lc.z > 0.0 && lc.z < 1.0) {
+                float depth = lc.z + param.x * shadows.settings.w * param.y;
+                if (c == 0) {
+                    shadow = shadow_pcf(shadow_map0, shadow_sampler, uv, depth, param.z);
+                } else if (c == 1) {
+                    shadow = shadow_pcf(shadow_map1, shadow_sampler, uv, depth, param.z);
+                } else if (c == 2) {
+                    shadow = shadow_pcf(shadow_map2, shadow_sampler, uv, depth, param.z);
+                } else {
+                    shadow = shadow_pcf(shadow_map3, shadow_sampler, uv, depth, param.z);
+                }
+                cascade = c;
+                break;
+            }
+        }
+        shadow = 1.0 - (1.0 - shadow) * shadows.settings.y;
+    }
+
     int mode = int(frame.params.x);
     int debug_view = int(frame.params.y);
     float3 color;
@@ -609,7 +667,8 @@ fragment float4 fs_main(VSOut in [[stage_in]],
         float3 spec_color = mix(float3(0.04), base.rgb, metallic);
         float3 diffuse = base.rgb * (1.0 - metallic) / kPi;
         float3 specular = spec_color * pow(n_dot_h, shininess) * (shininess + 8.0) / (8.0 * kPi);
-        color = (diffuse + specular) * radiance * n_dot_l + base.rgb * ambient * occlusion + emissive;
+        float3 direct = (diffuse + specular) * radiance * n_dot_l * shadow;
+        color = direct + base.rgb * ambient * occlusion + emissive;
     } else {
         // Cook-Torrance with the metallic workflow: dielectrics reflect 4% at
         // normal incidence and keep their albedo as diffuse; metals reflect
@@ -622,13 +681,41 @@ fragment float4 fs_main(VSOut in [[stage_in]],
         float vis = v_smith_ggx_correlated(n_dot_v, n_dot_l, alpha);
         float3 specular = d * vis * f;
         float3 diffuse = (float3(1.0) - f) * diffuse_color / kPi;
-        float3 direct = (diffuse + specular) * radiance * n_dot_l;
+        float3 direct = (diffuse + specular) * radiance * n_dot_l * shadow;
         // A uniform grey environment stands in for image-based lighting (Phase 4).
         float3 indirect = (diffuse_color + f0 * 0.5) * ambient * occlusion;
         color = direct + indirect + emissive;
     }
+    if (debug_view == 6) {
+        // Which cascade shadowed the pixel: red, green, blue, yellow; grey for none.
+        float3 tints[5] = {float3(1.0, 0.2, 0.2), float3(0.2, 1.0, 0.2), float3(0.2, 0.4, 1.0),
+                           float3(1.0, 1.0, 0.2), float3(0.5)};
+        color = mix(color, tints[cascade < 0 ? 4 : cascade], 0.4);
+    }
     return float4(color, base.a);
 }
+)";
+
+// The shadow map pass: the casters' depth from the light and nothing else.
+// The pipeline has no color target, so the fragment function returns none.
+constexpr const char* kShadowMsl = R"(
+#include <metal_stdlib>
+using namespace metal;
+
+struct VertexIn {
+    float3 position [[attribute(0)]];
+};
+
+struct Uniforms {
+    float4x4 mvp;
+    float4x4 model;
+};
+
+vertex float4 vs_main(VertexIn in [[stage_in]], constant Uniforms& u [[buffer(0)]]) {
+    return u.mvp * float4(in.position, 1.0);
+}
+
+fragment void fs_main() {}
 )";
 
 // The post pass: one triangle over the screen, the HDR image sampled once
@@ -729,11 +816,20 @@ struct PostUniforms {
 };
 static_assert(sizeof(PostUniforms) == 16, "matches the MSL PostUniforms struct");
 
+struct ShadowUniforms {
+    Mat4 cascade_matrix[render::kMaxCascades];
+    Vec4 cascade_param[render::kMaxCascades];
+    Vec4 settings;
+};
+static_assert(sizeof(ShadowUniforms) == 336, "matches the MSL ShadowUniforms struct");
+
 // What the keys toggle. Printed whenever it changes.
 struct Shading {
     int model = 2;      // 0 unlit, 1 Blinn-Phong, 2 Cook-Torrance
-    int debug_view = 0; // 0 lit, 1 shading normals, 2 metallic/roughness, 3 occlusion, 4 vertex normals, 5 tangents
+    int debug_view = 0; // 0 lit, 1 shading normals, 2 metallic/roughness, 3 occlusion, 4 vertex normals,
+                        // 5 tangents, 6 lit with the shadow cascades tinted
     bool tonemap = true;
+    bool shadows = true;
     float light_azimuth = radians(35.0f);   // around +y, from +z
     float light_elevation = radians(50.0f); // above the horizon
     float light_intensity = 3.0f;           // linear radiance; >1 is what tonemapping is for
@@ -744,22 +840,28 @@ struct Shading {
                 std::cos(light_elevation) * std::cos(light_azimuth)};
     }
 
+    // Debug views 0 and 6 are lit images and go through the tonemapper; the
+    // rest are data and go to the screen as they are.
+    [[nodiscard]] bool view_is_lit() const { return debug_view == 0 || debug_view == 6; }
+
     void print() const {
         static constexpr const char* kModels[] = {"unlit", "blinn-phong", "cook-torrance"};
-        static constexpr const char* kViews[] = {"lit", "shading normals (mapped)", "metallic (r) / roughness (g)",
-                                                 "occlusion", "vertex normals", "tangents"};
+        static constexpr const char* kViews[] = {"lit",       "shading normals (mapped)",
+                                                 "metallic (r) / roughness (g)",
+                                                 "occlusion", "vertex normals",
+                                                 "tangents",  "shadow cascades"};
         float azimuth = std::fmod(degrees(light_azimuth), 360.0f);
         if (azimuth < 0.0f) azimuth += 360.0f;
-        TY_LOG_INFO("shading", "%s | view %s | tonemap %s | light az %.0f el %.0f", kModels[model],
-                    kViews[debug_view], tonemap ? "aces" : "off", static_cast<double>(azimuth),
-                    static_cast<double>(degrees(light_elevation)));
+        TY_LOG_INFO("shading", "%s | view %s | tonemap %s | shadows %s | light az %.0f el %.0f",
+                    kModels[model], kViews[debug_view], tonemap ? "aces" : "off", shadows ? "on" : "off",
+                    static_cast<double>(azimuth), static_cast<double>(degrees(light_elevation)));
     }
 
     // Returns true when something changed.
     bool update(const platform::Input& input, float dt) {
         using platform::Key;
         const int old_model = model, old_view = debug_view;
-        const bool old_tonemap = tonemap;
+        const bool old_tonemap = tonemap, old_shadows = shadows;
         if (input.key_pressed(Key::Digit1)) model = 0;
         if (input.key_pressed(Key::Digit2)) model = 1;
         if (input.key_pressed(Key::Digit3)) model = 2;
@@ -768,15 +870,18 @@ struct Shading {
         if (input.key_pressed(Key::O)) debug_view = debug_view == 3 ? 0 : 3;
         if (input.key_pressed(Key::V)) debug_view = debug_view == 4 ? 0 : 4;
         if (input.key_pressed(Key::B)) debug_view = debug_view == 5 ? 0 : 5;
+        if (input.key_pressed(Key::C)) debug_view = debug_view == 6 ? 0 : 6;
         if (input.key_pressed(Key::Digit0)) debug_view = 0;
         if (input.key_pressed(Key::T)) tonemap = !tonemap;
+        if (input.key_pressed(Key::X)) shadows = !shadows;
         const float turn = radians(60.0f) * dt;
         bool moved = false;
         if (input.key_down(Key::Left)) { light_azimuth -= turn; moved = true; }
         if (input.key_down(Key::Right)) { light_azimuth += turn; moved = true; }
         if (input.key_down(Key::Up)) { light_elevation = std::min(light_elevation + turn, radians(89.0f)); moved = true; }
         if (input.key_down(Key::Down)) { light_elevation = std::max(light_elevation - turn, radians(-10.0f)); moved = true; }
-        const bool changed = model != old_model || debug_view != old_view || tonemap != old_tonemap;
+        const bool changed =
+            model != old_model || debug_view != old_view || tonemap != old_tonemap || shadows != old_shadows;
         if (changed) print();
         return changed || moved;
     }
@@ -864,16 +969,29 @@ struct FlyCamera {
 constexpr rhi::TextureFormat kHdrFormat = rhi::TextureFormat::Rgba16Float;
 constexpr rhi::ClearColor kSkyColor{.r = 0.09f, .g = 0.10f, .b = 0.12f};
 
+// The sun's shadow: four cascades out to 60 m, the lookup pushed two texels
+// off the surface and one texel towards the light against acne.
+constexpr render::CascadeSettings kCascades{.count = 4, .map_size = 2048, .max_distance = 60.0f};
+constexpr float kShadowNormalOffsetTexels = 2.0f;
+constexpr float kShadowBiasTexels = 1.0f;
+constexpr std::uint32_t kShadowTextureSlot = 5; // after the five material maps
+constexpr const char* kShadowPassNames[render::kMaxCascades] = {"shadow 0", "shadow 1", "shadow 2",
+                                                                 "shadow 3"};
+
 struct Renderer {
     std::unique_ptr<rhi::Device> device;
     std::unique_ptr<render::FrameGraph> graph; // owns the frame's transient textures
     rhi::PipelineHandle mesh_pipeline;
     rhi::PipelineHandle triangle_pipeline;
     rhi::PipelineHandle tonemap_pipeline;
+    rhi::PipelineHandle shadow_pipeline; // depth only
     render::FallbackTextures fallbacks;
-    rhi::SamplerHandle sampler;      // materials: anisotropic, repeating
-    rhi::SamplerHandle post_sampler; // the HDR image: one texel per pixel, clamped
+    rhi::SamplerHandle sampler;        // materials: anisotropic, repeating
+    rhi::SamplerHandle post_sampler;   // the HDR image: one texel per pixel, clamped
+    rhi::SamplerHandle shadow_sampler; // the shadow maps: compared, bilinear, clamped
+    rhi::TextureHandle shadow_fallback; // a 1x1 depth texture for the shadow slots when there are no maps
     render::Model models[kModelCount]; // by kModel* slot
+    bool shadows = false; // the device can sample its depth format and the shadow pipeline built
 
     Renderer() = default;
     Renderer(Renderer&& other) noexcept
@@ -881,8 +999,11 @@ struct Renderer {
           mesh_pipeline(std::exchange(other.mesh_pipeline, {})),
           triangle_pipeline(std::exchange(other.triangle_pipeline, {})),
           tonemap_pipeline(std::exchange(other.tonemap_pipeline, {})),
+          shadow_pipeline(std::exchange(other.shadow_pipeline, {})),
           fallbacks(std::exchange(other.fallbacks, render::FallbackTextures{})),
-          sampler(std::exchange(other.sampler, {})), post_sampler(std::exchange(other.post_sampler, {})) {
+          sampler(std::exchange(other.sampler, {})), post_sampler(std::exchange(other.post_sampler, {})),
+          shadow_sampler(std::exchange(other.shadow_sampler, {})),
+          shadow_fallback(std::exchange(other.shadow_fallback, {})), shadows(other.shadows) {
         for (std::uint32_t i = 0; i < kModelCount; ++i) {
             models[i] = std::exchange(other.models[i], render::Model{});
         }
@@ -899,12 +1020,16 @@ struct Renderer {
             }
             device->destroy_sampler(sampler);
             device->destroy_sampler(post_sampler);
+            device->destroy_sampler(shadow_sampler);
+            device->destroy_texture(shadow_fallback);
             render::destroy_fallback_textures(*device, fallbacks);
             device->destroy_graphics_pipeline(mesh_pipeline);
             device->destroy_graphics_pipeline(triangle_pipeline);
             device->destroy_graphics_pipeline(tonemap_pipeline);
-            mesh_pipeline = triangle_pipeline = tonemap_pipeline = {};
-            sampler = post_sampler = {};
+            device->destroy_graphics_pipeline(shadow_pipeline);
+            mesh_pipeline = triangle_pipeline = tonemap_pipeline = shadow_pipeline = {};
+            sampler = post_sampler = shadow_sampler = {};
+            shadow_fallback = {};
             device.reset();
         }
     }
@@ -975,7 +1100,8 @@ Renderer create_renderer(platform::Window& window, const render::ModelData* mode
     mesh_desc.color_formats[0] = kHdrFormat;
     mesh_desc.color_target_count = 1;
     mesh_desc.depth_format = r.device->preferred_depth_format();
-    r.mesh_pipeline = make_pipeline(*r.device, kMeshMsl, mesh_desc, 1, 2, 5);
+    r.mesh_pipeline =
+        make_pipeline(*r.device, kMeshMsl, mesh_desc, 1, 3, kShadowTextureSlot + render::kMaxCascades);
 
     rhi::GraphicsPipelineDesc triangle_desc;
     triangle_desc.color_formats[0] = kHdrFormat; // same pass, so the same targets, even with the test off
@@ -987,6 +1113,33 @@ Renderer create_renderer(platform::Window& window, const render::ModelData* mode
     tonemap_desc.color_formats[0] = r.device->swapchain_format();
     tonemap_desc.color_target_count = 1;
     r.tonemap_pipeline = make_pipeline(*r.device, kTonemapMsl, tonemap_desc, 0, 1, 1);
+
+    // Shadows need the depth format to be sampled as well as drawn into.
+    const rhi::TextureFormat depth_format = r.device->preferred_depth_format();
+    if (r.device->supports_texture(depth_format, rhi::TextureUsage::DepthStencilTarget |
+                                                     rhi::TextureUsage::Sampled)) {
+        rhi::GraphicsPipelineDesc shadow_desc;
+        shadow_desc.vertex_layout = render::vertex_layout();
+        shadow_desc.cull = rhi::CullMode::None; // thin things cast from both sides
+        shadow_desc.depth = {.test = true, .write = true, .compare = rhi::CompareOp::Greater};
+        shadow_desc.depth_format = depth_format;
+        r.shadow_pipeline = make_pipeline(*r.device, kShadowMsl, shadow_desc, 1, 0, 0);
+        r.shadow_sampler = r.device->create_sampler({.address_u = rhi::AddressMode::ClampToEdge,
+                                                     .address_v = rhi::AddressMode::ClampToEdge,
+                                                     .compare = rhi::CompareOp::GreaterEqual});
+        // The scene shader declares its shadow maps whether or not there are
+        // any this frame, so the slots always need a depth texture in them.
+        r.shadow_fallback = r.device->create_texture(
+            {.format = depth_format,
+             .width = 1,
+             .height = 1,
+             .usage = rhi::TextureUsage::DepthStencilTarget | rhi::TextureUsage::Sampled});
+        r.shadows = r.shadow_pipeline && r.shadow_sampler && r.shadow_fallback;
+    }
+    if (!r.shadows) {
+        TY_LOG_WARN("gpu", "no shadows: %s cannot be sampled here, or the shadow pipeline failed",
+                    rhi::texture_format_name(depth_format));
+    }
 
     r.sampler = r.device->create_sampler({.max_anisotropy = 8.0f});
     r.post_sampler = r.device->create_sampler({.min_filter = rhi::Filter::Nearest,
@@ -1070,34 +1223,96 @@ platform::InputFrame scripted_frame(long index, float dt) {
     return frame;
 }
 
-// The frame as a graph: the scene into an HDR transient with a depth
-// transient beside it, then the tonemap pass reading that onto the swapchain.
-// Declared, compiled and run every frame — the graph decides that depth is
-// never stored and that HDR is, and would drop either pass if nothing
-// consumed it.
+// Every entity with something to draw, its GPU model and its world matrix,
+// with the mesh bound once per run of the same model.
+template <typename PerEntity>
+void each_drawable(scene::World& world, Renderer& renderer, rhi::RenderPass& pass, PerEntity&& per_entity) {
+    std::uint32_t bound_model = 0xFFFFFFFFu;
+    world.each<scene::LocalToWorld, scene::MeshRenderer>(
+        [&](scene::Entity, scene::LocalToWorld& local_to_world, scene::MeshRenderer& mr) {
+            if (!mr.visible || mr.model >= kModelCount) {
+                return;
+            }
+            const render::Model& model = renderer.models[mr.model];
+            if (model.mesh.index_count == 0) {
+                return;
+            }
+            if (bound_model != mr.model) {
+                render::bind_mesh(pass, model.mesh);
+                bound_model = mr.model;
+            }
+            per_entity(model, local_to_world.matrix);
+        });
+}
+
+// The frame as a graph: the sun's shadow maps, one depth-only pass per
+// cascade; the scene into an HDR transient with a depth transient beside
+// it, reading the shadow maps; then the tonemap pass reading that onto the
+// swapchain. Declared, compiled and run every frame — the graph decides that
+// the scene's depth is never stored and that the shadow maps and HDR are,
+// and would drop any pass whose result nothing consumed.
 void draw_frame(Renderer& renderer, rhi::Frame& frame, scene::World& world, const FlyCamera& fly,
                 const Shading& shading) {
     render::FrameGraph& graph = *renderer.graph;
+    const rhi::TextureFormat depth_format = renderer.device->preferred_depth_format();
     const render::TextureInfo screen{.format = kHdrFormat, .width = frame.width(), .height = frame.height()};
     graph.begin();
     render::GraphTexture swapchain = graph.import(
         "swapchain", frame.swapchain_texture(),
         {.format = renderer.device->swapchain_format(), .width = frame.width(), .height = frame.height()});
     render::GraphTexture hdr = graph.create("hdr", screen);
-    render::GraphTexture depth = graph.create("depth", {.format = renderer.device->preferred_depth_format(),
-                                                        .width = screen.width,
-                                                        .height = screen.height});
+    render::GraphTexture depth =
+        graph.create("depth", {.format = depth_format, .width = screen.width, .height = screen.height});
 
     const float aspect = static_cast<float>(frame.width()) / static_cast<float>(frame.height());
     const Mat4 view_projection = fly.camera.view_projection(aspect);
+    const Vec3 light = shading.light_direction();
     const bool have_scene = renderer.models[kModelBottle].mesh.index_count > 0 && renderer.mesh_pipeline;
+    const bool shadows = have_scene && renderer.shadows && shading.shadows;
+
+    // The cascades: fitted to this frame's view, each drawn from the light.
+    render::CascadeSet cascades;
+    render::GraphTexture shadow_maps[render::kMaxCascades];
+    if (shadows) {
+        cascades = render::fit_cascades(fly.camera, aspect, light, kCascades);
+        for (std::uint32_t i = 0; i < cascades.count; ++i) {
+            shadow_maps[i] = graph.create(kShadowPassNames[i], {.format = depth_format,
+                                                                .width = kCascades.map_size,
+                                                                .height = kCascades.map_size});
+            graph.add_pass(
+                kShadowPassNames[i],
+                [&, i](render::PassBuilder& b) { shadow_maps[i] = b.write_depth(shadow_maps[i]); },
+                [&, i](rhi::RenderPass& pass, const render::PassResources&) {
+                    pass.bind_pipeline(renderer.shadow_pipeline);
+                    const Mat4& light_view_projection = cascades.cascades[i].view_projection;
+                    each_drawable(world, renderer, pass, [&](const render::Model& model, const Mat4& world) {
+                        const MeshUniforms uniforms{light_view_projection * world, world};
+                        pass.push_vertex_uniforms(0, &uniforms, sizeof(uniforms));
+                        pass.draw_indexed(model.mesh.index_count); // every submesh at once: no materials here
+                    });
+                });
+        }
+    }
+    ShadowUniforms shadow_uniforms{};
+    for (std::uint32_t i = 0; i < cascades.count; ++i) {
+        const render::Cascade& cascade = cascades.cascades[i];
+        shadow_uniforms.cascade_matrix[i] = cascade.view_projection;
+        shadow_uniforms.cascade_param[i] = {cascade.texel_size, 1.0f / cascade.depth_range,
+                                            1.0f / static_cast<float>(kCascades.map_size), 0.0f};
+    }
+    shadow_uniforms.settings = {static_cast<float>(cascades.count), shadows ? 1.0f : 0.0f,
+                                kShadowNormalOffsetTexels, kShadowBiasTexels};
+
     graph.add_pass(
         "scene",
         [&](render::PassBuilder& b) {
+            for (std::uint32_t i = 0; i < cascades.count; ++i) {
+                b.read(shadow_maps[i]);
+            }
             hdr = b.write_color(hdr, rhi::LoadOp::Clear, kSkyColor);
             depth = b.write_depth(depth, rhi::LoadOp::Clear, 0.0f);
         },
-        [&](rhi::RenderPass& pass, const render::PassResources&) {
+        [&](rhi::RenderPass& pass, const render::PassResources& resources) {
             if (!have_scene) {
                 if (renderer.triangle_pipeline) {
                     pass.bind_pipeline(renderer.triangle_pipeline);
@@ -1106,50 +1321,47 @@ void draw_frame(Renderer& renderer, rhi::Frame& frame, scene::World& world, cons
                 return;
             }
             pass.bind_pipeline(renderer.mesh_pipeline);
-            const Vec3 light = shading.light_direction();
             const FrameUniforms frame_uniforms{{fly.camera.position, 1.0f},
                                                {light, shading.light_intensity},
                                                {1.0f, 0.97f, 0.92f, shading.ambient},
                                                {static_cast<float>(shading.model),
                                                 static_cast<float>(shading.debug_view), 0.0f, 0.0f}};
             pass.push_fragment_uniforms(0, &frame_uniforms, sizeof(frame_uniforms));
-            // One draw per submesh per entity that has something to draw.
-            std::uint32_t bound_model = 0xFFFFFFFFu;
-            world.each<scene::LocalToWorld, scene::MeshRenderer>(
-                [&](scene::Entity, scene::LocalToWorld& local_to_world, scene::MeshRenderer& mr) {
-                    if (!mr.visible || mr.model >= kModelCount) {
-                        return;
+            pass.push_fragment_uniforms(2, &shadow_uniforms, sizeof(shadow_uniforms));
+            // Every shadow slot gets a depth texture, since the shader declares
+            // four: the cascades, then the last one again, or the 1x1 stand-in
+            // when shadows are off (the shader never reads it then).
+            if (renderer.shadow_sampler && renderer.shadow_fallback) {
+                for (std::uint32_t i = 0; i < render::kMaxCascades; ++i) {
+                    rhi::TextureHandle map = renderer.shadow_fallback;
+                    if (cascades.count > 0) {
+                        map = resources.texture(shadow_maps[std::min(i, cascades.count - 1)]);
                     }
-                    const render::Model& model = renderer.models[mr.model];
-                    if (model.mesh.index_count == 0) {
-                        return;
-                    }
-                    if (bound_model != mr.model) {
-                        render::bind_mesh(pass, model.mesh);
-                        bound_model = mr.model;
-                    }
-                    const MeshUniforms uniforms{view_projection * local_to_world.matrix,
-                                                local_to_world.matrix};
-                    pass.push_vertex_uniforms(0, &uniforms, sizeof(uniforms));
-                    for (const render::Submesh& sub : model.mesh.submeshes) {
-                        const render::Material& material = model.materials[sub.material];
-                        const MaterialUniforms material_uniforms{
-                            material.base_color_factor,
-                            {material.metallic_factor, material.roughness_factor, material.occlusion_strength,
-                             material.normal_scale},
-                            {material.emissive_factor, 0.0f}};
-                        pass.bind_fragment_texture(0, material.base_color, renderer.sampler);
-                        pass.bind_fragment_texture(1, material.metallic_roughness, renderer.sampler);
-                        pass.bind_fragment_texture(2, material.occlusion, renderer.sampler);
-                        pass.bind_fragment_texture(3, material.emissive, renderer.sampler);
-                        pass.bind_fragment_texture(4, material.normal, renderer.sampler);
-                        pass.push_fragment_uniforms(1, &material_uniforms, sizeof(material_uniforms));
-                        pass.draw_indexed(sub.index_count, sub.first_index);
-                    }
-                });
+                    pass.bind_fragment_texture(kShadowTextureSlot + i, map, renderer.shadow_sampler);
+                }
+            }
+            each_drawable(world, renderer, pass, [&](const render::Model& model, const Mat4& world_matrix) {
+                const MeshUniforms uniforms{view_projection * world_matrix, world_matrix};
+                pass.push_vertex_uniforms(0, &uniforms, sizeof(uniforms));
+                for (const render::Submesh& sub : model.mesh.submeshes) {
+                    const render::Material& material = model.materials[sub.material];
+                    const MaterialUniforms material_uniforms{
+                        material.base_color_factor,
+                        {material.metallic_factor, material.roughness_factor, material.occlusion_strength,
+                         material.normal_scale},
+                        {material.emissive_factor, 0.0f}};
+                    pass.bind_fragment_texture(0, material.base_color, renderer.sampler);
+                    pass.bind_fragment_texture(1, material.metallic_roughness, renderer.sampler);
+                    pass.bind_fragment_texture(2, material.occlusion, renderer.sampler);
+                    pass.bind_fragment_texture(3, material.emissive, renderer.sampler);
+                    pass.bind_fragment_texture(4, material.normal, renderer.sampler);
+                    pass.push_fragment_uniforms(1, &material_uniforms, sizeof(material_uniforms));
+                    pass.draw_indexed(sub.index_count, sub.first_index);
+                }
+            });
         });
     // Debug views are data, not light: they go to the screen as they are.
-    const PostUniforms post{{shading.tonemap && shading.debug_view == 0 ? 1.0f : 0.0f,
+    const PostUniforms post{{shading.tonemap && shading.view_is_lit() ? 1.0f : 0.0f,
                              renderer.device->swapchain_is_linear() ? 0.0f : 1.0f, 0.0f, 0.0f}};
     graph.add_pass(
         "tonemap",
@@ -1189,7 +1401,7 @@ void report_graph(const render::FrameGraph& graph) {
                 static_cast<double>(stats.bytes_allocated) / 1048576.0,
                 static_cast<double>(stats.bytes_requested) / 1048576.0, stats.attachments_stored,
                 stats.attachments_discarded, stats.memoryless);
-    char text[1024];
+    char text[2048];
     graph.describe(text, sizeof text);
     for (char* line = text; *line != '\0';) {
         char* end = std::strchr(line, '\n');
@@ -1294,8 +1506,8 @@ int main(int argc, char** argv) {
     TY_LOG_INFO("controls", "right-drag looks, WASD/QE fly, Shift runs, R re-drops the pile, "
                             "L launches it, Escape quits");
     TY_LOG_INFO("controls", "F follows the character: then WASD walk it, Space jumps, Shift runs");
-    TY_LOG_INFO("controls", "1/2/3 unlit / Blinn-Phong / Cook-Torrance, N/M/O/V/B debug views, T tonemap, "
-                            "arrows move the light");
+    TY_LOG_INFO("controls", "1/2/3 unlit / Blinn-Phong / Cook-Torrance, N/M/O/V/B debug views, C shows the "
+                            "shadow cascades, X toggles shadows, T tonemap, arrows move the light");
 
     Renderer renderer = options.headless ? Renderer{} : create_renderer(*window, has_model ? &model_data : nullptr);
     bool reported_swapchain = false;

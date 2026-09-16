@@ -58,7 +58,8 @@ runs, and it can shove bottles about, push the gate open and swing the
 hanging chain. `1`/`2`/`3` switch between
 unlit, Blinn-Phong and Cook-Torrance shading; `N`/`M`/`O`/`V`/`B` show the
 mapped normals, metallic/roughness, occlusion, vertex normals and tangents;
-`T` toggles tonemapping; the arrow keys move the light. `--model path.glb` loads
+`C` tints the picture by shadow cascade and `X` turns shadows off; `T`
+toggles tonemapping; the arrow keys move the light. `--model path.glb` loads
 something else. `--headless --frames N` runs the same loop with no window and
 no GPU (the model still loads) with a scripted player at the keyboard, which
 is what the `sandbox_headless` CTest does on CI. `--record run.tyrec` writes
@@ -280,6 +281,25 @@ frame (`Frame::swapchain_texture()`). The render tests compile graphs with
 no device at all — culling, ordering, aliasing, stores, and every way a
 graph can be malformed — and the RHI tests draw offscreen and sample it
 back where a GPU exists.
+
+### Shadows
+
+The sun casts cascaded shadow maps ([`shadows.h`](engine/render/include/tynima/render/shadows.h)):
+`fit_cascades()` cuts the view frustum into four slices out to 60 m —
+between uniform and logarithmic, the "practical split scheme" — and fits an
+orthographic light-space box around each slice's bounding sphere. The
+sphere, not the slice, so the box keeps its size as the camera turns; its
+position snapped to the shadow map's texel grid, so edges do not shimmer as
+the camera moves; reverse-Z like the camera, so one depth convention serves
+the whole frame. Every cascade is a 2048² depth-only pass in the frame
+graph, and the scene pass reads them: the first cascade whose map holds the
+pixel is sampled with 3×3 taps of the hardware's own 2×2 comparison (a
+comparison sampler, `SamplerDesc::compare`), with the lookup point pushed
+two texels off the surface along the normal and one texel towards the
+light against acne. The tests check that every corner of every slice lands
+inside its cascade at a depth the map can hold, that nearer the light means
+deeper into 1, and that a step smaller than a texel moves the map's contents
+by a whole texel or not at all.
 
 ## Logging and asserts
 

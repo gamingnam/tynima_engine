@@ -577,6 +577,11 @@ ShaderFormat Device::shader_format() const noexcept {
     return ShaderFormat::Dxil;
 }
 
+bool Device::supports_texture(TextureFormat format, TextureUsage usage) const noexcept {
+    TY_EXTERNAL_ALLOCATIONS();
+    return SDL_GPUTextureSupportsFormat(dev(device_), to_sdl(format), SDL_GPU_TEXTURETYPE_2D, to_sdl(usage));
+}
+
 TextureFormat Device::preferred_depth_format() const noexcept {
     for (const TextureFormat candidate : {TextureFormat::Depth32Float, TextureFormat::Depth24Stencil8}) {
         if (SDL_GPUTextureSupportsFormat(dev(device_), to_sdl(candidate), SDL_GPU_TEXTURETYPE_2D,
@@ -976,6 +981,10 @@ SamplerHandle Device::create_sampler(const SamplerDesc& desc) noexcept {
     info.enable_anisotropy = desc.max_anisotropy > 1.0f;
     info.min_lod = 0.0f;
     info.max_lod = 1000.0f;
+    if (desc.compare.has_value()) {
+        info.enable_compare = true;
+        info.compare_op = to_sdl(*desc.compare);
+    }
     SDL_GPUSampler* handle = SDL_CreateGPUSampler(dev(device_), &info);
     if (handle == nullptr) {
         return {};

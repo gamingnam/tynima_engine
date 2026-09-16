@@ -126,6 +126,17 @@ struct Extent2D {
 enum class Filter : std::uint8_t { Nearest, Linear };
 enum class AddressMode : std::uint8_t { Repeat, MirroredRepeat, ClampToEdge };
 
+enum class CompareOp : std::uint8_t {
+    Never,
+    Less,
+    Equal,
+    LessEqual,
+    Greater,
+    NotEqual,
+    GreaterEqual,
+    Always
+};
+
 struct SamplerDesc {
     Filter min_filter = Filter::Linear;
     Filter mag_filter = Filter::Linear;
@@ -133,6 +144,10 @@ struct SamplerDesc {
     AddressMode address_u = AddressMode::Repeat;
     AddressMode address_v = AddressMode::Repeat;
     float max_anisotropy = 1.0f; // 1 = off; 8-16 is what a material sampler wants
+    // A comparison sampler: sampling a depth texture through it compares a
+    // reference depth against the texels (with the filter blending the 0/1
+    // results, which is hardware PCF) — shadow maps' sampler.
+    std::optional<CompareOp> compare;
 };
 
 // ---------------------------------------------------------------- pipelines
@@ -140,7 +155,6 @@ struct SamplerDesc {
 enum class PrimitiveTopology : std::uint8_t { TriangleList, TriangleStrip, LineList };
 enum class VertexFormat : std::uint8_t { Float2, Float3, Float4 };
 enum class CullMode : std::uint8_t { None, Back, Front };
-enum class CompareOp : std::uint8_t { Never, Less, Equal, LessEqual, Greater, NotEqual, GreaterEqual, Always };
 enum class IndexType : std::uint8_t { Uint16, Uint32 };
 
 // One vertex attribute; `location` is [[attribute(n)]] in MSL.
@@ -344,6 +358,9 @@ public:
     [[nodiscard]] ShaderFormat shader_format() const noexcept;
     // The best depth format this GPU supports as a render target.
     [[nodiscard]] TextureFormat preferred_depth_format() const noexcept;
+    // Whether a texture of this format can be created for these uses at all
+    // (sampling a depth format, say).
+    [[nodiscard]] bool supports_texture(TextureFormat format, TextureUsage usage) const noexcept;
     // True once a window is attached with an sRGB-encoded swapchain.
     [[nodiscard]] bool swapchain_is_linear() const noexcept { return swapchain_linear_; }
     // The swapchain's format once a window is attached: what a pipeline that
