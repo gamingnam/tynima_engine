@@ -4,10 +4,13 @@
 // camera. Falls back to Phase 0's triangle when there is no model.
 //
 //   tynima-sandbox [--headless] [--frames N] [--model path.glb] [--physics tynima|jolt]
-//                  [--record log.tyrec | --replay log.tyrec]
+//                  [--rhi sdl|metal] [--record log.tyrec | --replay log.tyrec]
 //
 // The pile runs on the engine's own physics by default; --physics jolt
 // drops the same pile through Jolt, and the report line at exit compares.
+// --rhi metal draws through the engine's native Metal backend instead of
+// SDL GPU: the same frame, the same shaders, the engine's own path to the
+// tile hardware.
 // --headless runs without a window or a GPU, at a fixed sixtieth of a
 // second a frame, with a scripted player at the keyboard.
 //
@@ -432,6 +435,7 @@ struct Options {
     long max_frames = -1; // -1: run until closed
     std::string model = TYNIMA_SANDBOX_ASSETS_DIR "/WaterBottle.glb";
     bool jolt = false;   // the reference physics instead of the engine's own
+    rhi::Backend rhi = rhi::Backend::SdlGpu;
     std::string record; // write the input log here at exit
     std::string replay; // play this input log instead of live input and time
 };
@@ -457,13 +461,24 @@ Options parse_options(int argc, char** argv) {
                 std::fprintf(stderr, "--physics: expected 'tynima' or 'jolt', got '%s'\n", which);
                 std::exit(kExitUsage);
             }
+        } else if (std::strcmp(argv[i], "--rhi") == 0 && i + 1 < argc) {
+            const char* which = argv[++i];
+            if (std::strcmp(which, "metal") == 0) {
+                options.rhi = rhi::Backend::Metal;
+            } else if (std::strcmp(which, "sdl") == 0) {
+                options.rhi = rhi::Backend::SdlGpu;
+            } else {
+                std::fprintf(stderr, "--rhi: expected 'sdl' or 'metal', got '%s'\n", which);
+                std::exit(kExitUsage);
+            }
         } else if (std::strcmp(argv[i], "--record") == 0 && i + 1 < argc) {
             options.record = argv[++i];
         } else if (std::strcmp(argv[i], "--replay") == 0 && i + 1 < argc) {
             options.replay = argv[++i];
         } else {
             std::fprintf(stderr, "usage: tynima-sandbox [--headless] [--frames N] [--model path.glb] "
-                                 "[--physics tynima|jolt] [--record log.tyrec | --replay log.tyrec]\n");
+                                 "[--physics tynima|jolt] [--rhi sdl|metal] "
+                                 "[--record log.tyrec | --replay log.tyrec]\n");
             std::exit(kExitUsage);
         }
     }
@@ -1127,15 +1142,16 @@ rhi::PipelineHandle make_pipeline(rhi::Device& device, const char* msl, const rh
 
 // Everything GPU-side. On failure the sandbox keeps running without drawing,
 // and says why — a missing backend is a message, not a crash.
-Renderer create_renderer(platform::Window& window, const render::ModelData* model_data) {
+Renderer create_renderer(platform::Window& window, const render::ModelData* model_data,
+                         rhi::Backend backend) {
     Renderer r;
-    r.device = rhi::Device::create({.debug = kGpuDebug});
+    r.device = rhi::Device::create({.backend = backend, .debug = kGpuDebug});
     if (r.device == nullptr) {
         TY_LOG_ERROR("gpu", "unavailable: %s", platform::last_error());
         return r;
     }
-    TY_LOG_INFO("gpu", "%s, wants %s shaders, depth %s", r.device->backend_name(),
-                rhi::shader_format_name(r.device->shader_format()),
+    TY_LOG_INFO("gpu", "%s backend on %s, wants %s shaders, depth %s", rhi::backend_name(r.device->backend()),
+                r.device->backend_name(), rhi::shader_format_name(r.device->shader_format()),
                 rhi::texture_format_name(r.device->preferred_depth_format()));
     if (!r.device->attach_window(window)) {
         TY_LOG_ERROR("gpu", "cannot present to this window: %s", platform::last_error());
@@ -1652,7 +1668,9 @@ int main(int argc, char** argv) {
                             "lights, G bloom; T cycles the tonemapper, H the anti-aliasing; arrows move "
                             "the sun");
 
-    Renderer renderer = options.headless ? Renderer{} : create_renderer(*window, has_model ? &model_data : nullptr);
+    Renderer renderer = options.headless
+                            ? Renderer{}
+                            : create_renderer(*window, has_model ? &model_data : nullptr, options.rhi);
     bool reported_swapchain = false;
 
     // The scene: the floor and a pile of the model, every one a rigid body.

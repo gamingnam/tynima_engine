@@ -48,7 +48,7 @@ struct ShaderDesc {
     const void* code = nullptr; // MSL: source text (no terminator needed); otherwise bytecode
     std::size_t code_size = 0;
     const char* entry_point = "main";
-    std::uint32_t num_uniform_buffers = 0; // pushed with RenderPass::push_*_uniforms, slot n = [[buffer(n)]] in MSL
+    std::uint32_t num_uniform_buffers = 0; // pushed per draw; slot n is [[buffer(n)]] in MSL
     std::uint32_t num_samplers = 0;
     std::uint32_t num_storage_buffers = 0; // Storage buffers bound for reading, after the uniforms in MSL
 };
@@ -298,17 +298,17 @@ public:
     void push_fragment_uniforms(std::uint32_t slot, const void* data, std::uint32_t size) noexcept;
 
     void draw(std::uint32_t vertex_count, std::uint32_t instance_count = 1) noexcept;
-    void draw_indexed(std::uint32_t index_count, std::uint32_t first_index = 0, std::int32_t vertex_offset = 0,
-                      std::uint32_t instance_count = 1) noexcept;
+    void draw_indexed(std::uint32_t index_count, std::uint32_t first_index = 0,
+                      std::int32_t vertex_offset = 0, std::uint32_t instance_count = 1) noexcept;
     void end() noexcept;
 
 private:
-    friend class Frame;
+    friend class Device;
     RenderPass(Device* device, void* command_buffer, void* pass, bool labelled) noexcept
         : device_(device), command_buffer_(command_buffer), pass_(pass), labelled_(labelled) {}
-    Device* device_;       // resolves handles; not owned
-    void* command_buffer_; // SDL_GPUCommandBuffer*, not owned
-    void* pass_;           // SDL_GPURenderPass*
+    Device* device_;       // not owned
+    void* command_buffer_; // the backend's command buffer, not owned
+    void* pass_;           // the backend's pass or encoder
     bool labelled_;        // a debug group was pushed for the pass's name; end() pops it
 };
 
@@ -332,12 +332,12 @@ public:
     void end() noexcept;
 
 private:
-    friend class Frame;
+    friend class Device;
     ComputePass(Device* device, void* command_buffer, void* pass, bool labelled) noexcept
         : device_(device), command_buffer_(command_buffer), pass_(pass), labelled_(labelled) {}
     Device* device_;
-    void* command_buffer_; // SDL_GPUCommandBuffer*, not owned
-    void* pass_;           // SDL_GPUComputePass*
+    void* command_buffer_;
+    void* pass_;
     bool labelled_;
 };
 
@@ -375,7 +375,8 @@ public:
     // The common case: clear the swapchain image and, if given, the depth
     // texture (which must match the swapchain size), and discard depth after
     // the pass. nullopt when there is no image.
-    [[nodiscard]] std::optional<RenderPass> begin_swapchain_pass(const ClearColor& clear, TextureHandle depth = {},
+    [[nodiscard]] std::optional<RenderPass> begin_swapchain_pass(const ClearColor& clear,
+                                                                 TextureHandle depth = {},
                                                                  float depth_clear = 0.0f) noexcept;
     void submit() noexcept;
 
@@ -383,8 +384,8 @@ private:
     friend class Device;
     Frame(Device* device, void* command_buffer, TextureHandle swapchain, std::uint32_t width,
           std::uint32_t height) noexcept;
-    Device* device_;         // resolves handles; not owned
-    void* command_buffer_;   // SDL_GPUCommandBuffer*
+    Device* device_;          // not owned
+    void* command_buffer_;    // the backend's command buffer
     TextureHandle swapchain_; // a borrowed entry in the texture pool, gone after submit()
     std::uint32_t width_;
     std::uint32_t height_;
@@ -392,8 +393,15 @@ private:
 
 // ------------------------------------------------------------------- device
 
+// Which implementation stands behind the Device. SDL GPU runs everywhere
+// SDL does (Metal, Vulkan, D3D12 underneath); the native Metal backend is
+// the engine's own, on Apple GPUs, and the one that can fuse tile passes.
+enum class Backend : std::uint8_t { Auto, SdlGpu, Metal };
+const char* backend_name(Backend backend) noexcept;
+
 struct DeviceDesc {
-    bool debug = false; // validation layers; slow, loud, and worth it in Debug builds
+    Backend backend = Backend::Auto; // Auto: SDL GPU
+    bool debug = false;              // validation layers; slow, loud, and worth it in Debug builds
     bool vsync = true;
     // An sRGB-encoded swapchain: shaders write linear light and the display
     // encoding happens in hardware. Falls back to a plain SDR swapchain where
@@ -409,118 +417,159 @@ struct DeviceDesc {
     std::uint32_t max_samplers = 64;
 };
 
+// The GPU, in engine vocabulary. One implementation per backend; every
+// call here is the same on all of them, and the shaders bind the same way
+// (see ShaderDesc and ComputePipelineDesc for the MSL slot order).
 class Device {
 public:
-    // Creates a device with no window attached — enough to compile shaders
-    // and upload buffers, which is how tests exercise the GPU path headless.
-    // nullptr on failure; platform::last_error() says why. Fails where no
-    // backend consumes the shader formats we can supply: until SDL_shadercross
-    // joins the build, that means Windows.
+    // Creates a device with no window attached — enough to compile shaders,
+    // upload buffers and run compute, which is how tests exercise the GPU
+    // path headless. nullptr on failure; platform::last_error() says why.
+    // Fails where no backend consumes the shader formats we can supply:
+    // until SDL_shadercross joins the build, that means Windows.
     [[nodiscard]] static std::unique_ptr<Device> create(const DeviceDesc& desc = {});
-    ~Device();
+    virtual ~Device() = default;
     Device(const Device&) = delete;
     Device& operator=(const Device&) = delete;
 
-    // Claims the window for presentation. Required before begin_frame() and
-    // before creating pipelines (they target the swapchain format). Fails on
-    // a headless window: there is no surface to present to.
-    [[nodiscard]] bool attach_window(platform::Window& window) noexcept;
+    // Claims the window for presentation. Required before begin_frame() can
+    // present. Fails on a headless window: there is no surface to present to.
+    [[nodiscard]] virtual bool attach_window(platform::Window& window) noexcept = 0;
 
-    [[nodiscard]] const char* backend_name() const noexcept; // "metal", "vulkan", "direct3d12"
-    [[nodiscard]] ShaderFormat shader_format() const noexcept;
+    [[nodiscard]] virtual Backend backend() const noexcept = 0;
+    // What runs underneath: "metal", "vulkan", "direct3d12".
+    [[nodiscard]] virtual const char* backend_name() const noexcept = 0;
+    [[nodiscard]] virtual ShaderFormat shader_format() const noexcept = 0;
     // The best depth format this GPU supports as a render target.
-    [[nodiscard]] TextureFormat preferred_depth_format() const noexcept;
+    [[nodiscard]] virtual TextureFormat preferred_depth_format() const noexcept = 0;
     // Whether a texture of this format can be created for these uses at all
     // (sampling a depth format, say).
-    [[nodiscard]] bool supports_texture(TextureFormat format, TextureUsage usage) const noexcept;
+    [[nodiscard]] virtual bool supports_texture(TextureFormat format, TextureUsage usage) const noexcept = 0;
     // True once a window is attached with an sRGB-encoded swapchain.
-    [[nodiscard]] bool swapchain_is_linear() const noexcept { return swapchain_linear_; }
+    [[nodiscard]] virtual bool swapchain_is_linear() const noexcept = 0;
     // The swapchain's format once a window is attached: what a pipeline that
     // draws to it must be built for.
-    [[nodiscard]] TextureFormat swapchain_format() const noexcept { return swapchain_format_; }
+    [[nodiscard]] virtual TextureFormat swapchain_format() const noexcept = 0;
 
     // Handle validity: false for null handles and for anything destroyed.
-    [[nodiscard]] bool valid(ShaderHandle handle) const noexcept;
-    [[nodiscard]] bool valid(PipelineHandle handle) const noexcept;
-    [[nodiscard]] bool valid(BufferHandle handle) const noexcept;
-    [[nodiscard]] bool valid(TextureHandle handle) const noexcept;
-    [[nodiscard]] bool valid(SamplerHandle handle) const noexcept;
+    [[nodiscard]] virtual bool valid(ShaderHandle handle) const noexcept = 0;
+    [[nodiscard]] virtual bool valid(PipelineHandle handle) const noexcept = 0;
+    [[nodiscard]] virtual bool valid(ComputePipelineHandle handle) const noexcept = 0;
+    [[nodiscard]] virtual bool valid(BufferHandle handle) const noexcept = 0;
+    [[nodiscard]] virtual bool valid(TextureHandle handle) const noexcept = 0;
+    [[nodiscard]] virtual bool valid(SamplerHandle handle) const noexcept = 0;
 
-    [[nodiscard]] ShaderHandle create_shader(const ShaderDesc& desc) noexcept;
-    void destroy_shader(ShaderHandle shader) noexcept;
+    [[nodiscard]] virtual ShaderHandle create_shader(const ShaderDesc& desc) noexcept = 0;
+    virtual void destroy_shader(ShaderHandle shader) noexcept = 0;
 
     // Shaders may be destroyed as soon as the pipeline exists.
-    [[nodiscard]] PipelineHandle create_graphics_pipeline(const GraphicsPipelineDesc& desc) noexcept;
-    void destroy_graphics_pipeline(PipelineHandle pipeline) noexcept;
+    [[nodiscard]] virtual PipelineHandle
+    create_graphics_pipeline(const GraphicsPipelineDesc& desc) noexcept = 0;
+    virtual void destroy_graphics_pipeline(PipelineHandle pipeline) noexcept = 0;
 
-    [[nodiscard]] ComputePipelineHandle create_compute_pipeline(const ComputePipelineDesc& desc) noexcept;
-    void destroy_compute_pipeline(ComputePipelineHandle pipeline) noexcept;
-    [[nodiscard]] bool valid(ComputePipelineHandle handle) const noexcept;
+    [[nodiscard]] virtual ComputePipelineHandle
+    create_compute_pipeline(const ComputePipelineDesc& desc) noexcept = 0;
+    virtual void destroy_compute_pipeline(ComputePipelineHandle pipeline) noexcept = 0;
 
-    [[nodiscard]] BufferHandle create_buffer(const BufferDesc& desc) noexcept;
+    [[nodiscard]] virtual BufferHandle create_buffer(const BufferDesc& desc) noexcept = 0;
     // Copies `size` bytes into `buffer` at `offset` and waits for the copy:
     // for loading, not for per-frame streaming.
-    [[nodiscard]] bool upload_buffer(BufferHandle buffer, const void* data, std::uint32_t size,
-                                     std::uint32_t offset = 0) noexcept;
+    [[nodiscard]] virtual bool upload_buffer(BufferHandle buffer, const void* data, std::uint32_t size,
+                                             std::uint32_t offset = 0) noexcept = 0;
     [[nodiscard]] BufferHandle create_buffer_with_data(BufferUsage usage, const void* data,
                                                        std::uint32_t size) noexcept;
     // Copies `size` bytes out of `buffer` at `offset` and waits for the GPU
     // to finish everything submitted so far: a readback for tests and tools,
     // never for a frame.
-    [[nodiscard]] bool download_buffer(BufferHandle buffer, void* out, std::uint32_t size,
-                                       std::uint32_t offset = 0) noexcept;
-    void destroy_buffer(BufferHandle buffer) noexcept;
+    [[nodiscard]] virtual bool download_buffer(BufferHandle buffer, void* out, std::uint32_t size,
+                                               std::uint32_t offset = 0) noexcept = 0;
+    virtual void destroy_buffer(BufferHandle buffer) noexcept = 0;
 
-    [[nodiscard]] TextureHandle create_texture(const TextureDesc& desc) noexcept;
+    [[nodiscard]] virtual TextureHandle create_texture(const TextureDesc& desc) noexcept = 0;
     // {0, 0} for an invalid handle.
-    [[nodiscard]] Extent2D texture_extent(TextureHandle texture) const noexcept;
+    [[nodiscard]] virtual Extent2D texture_extent(TextureHandle texture) const noexcept = 0;
     // Uploads tightly packed pixels for one mip level and waits for the copy.
     // `size` must equal width * height * bytes_per_pixel at that level.
-    [[nodiscard]] bool upload_texture(TextureHandle texture, const void* pixels, std::uint32_t size,
-                                      std::uint32_t mip_level = 0) noexcept;
+    [[nodiscard]] virtual bool upload_texture(TextureHandle texture, const void* pixels, std::uint32_t size,
+                                              std::uint32_t mip_level = 0) noexcept = 0;
     // Fills levels 1..n from level 0 on the GPU and waits. The texture needs
     // more than one level and ColorTarget usage.
-    [[nodiscard]] bool generate_mipmaps(TextureHandle texture) noexcept;
+    [[nodiscard]] virtual bool generate_mipmaps(TextureHandle texture) noexcept = 0;
     // A sampled color texture with a full mip chain: created, uploaded, mipmapped.
     [[nodiscard]] TextureHandle create_texture_with_data(TextureFormat format, std::uint32_t width,
                                                          std::uint32_t height, const void* pixels,
                                                          std::uint32_t size, bool mipmaps = true) noexcept;
-    void destroy_texture(TextureHandle texture) noexcept;
+    virtual void destroy_texture(TextureHandle texture) noexcept = 0;
 
-    [[nodiscard]] SamplerHandle create_sampler(const SamplerDesc& desc) noexcept;
-    void destroy_sampler(SamplerHandle sampler) noexcept;
+    [[nodiscard]] virtual SamplerHandle create_sampler(const SamplerDesc& desc) noexcept = 0;
+    virtual void destroy_sampler(SamplerHandle sampler) noexcept = 0;
 
     // Live objects per pool: a leak check, and a view of the budgets.
     struct ResourceCounts {
         std::uint32_t shaders = 0, pipelines = 0, compute_pipelines = 0, buffers = 0, textures = 0,
                       samplers = 0;
     };
-    [[nodiscard]] ResourceCounts resource_counts() const noexcept;
+    [[nodiscard]] virtual ResourceCounts resource_counts() const noexcept = 0;
 
     // Acquires this frame's command buffer and swapchain image; with vsync on
     // this is where the loop waits for the display. nullopt on error. With no
     // window attached the frame has no image: compute and copies only.
-    [[nodiscard]] std::optional<Frame> begin_frame() noexcept;
+    [[nodiscard]] virtual std::optional<Frame> begin_frame() noexcept = 0;
 
-private:
+protected:
+    Device() = default;
+    // What Frame, RenderPass and ComputePass call: the backend's side of each
+    // of their methods, with the backend's own objects passed back in.
     friend class Frame;
     friend class RenderPass;
     friend class ComputePass;
-    struct Pools; // the resource pools; complete in device.cpp
-    Device(void* device, const DeviceDesc& desc) noexcept;
-    [[nodiscard]] bool run_copy_and_wait(void* transfer, void* target, std::uint32_t size, std::uint32_t level_or_offset,
-                                         Extent2D extent, bool is_texture) noexcept;
-    // The streaming transfer buffer behind Frame::write_buffer, grown to fit.
-    [[nodiscard]] void* stream_transfer(std::uint32_t size) noexcept;
-    void* device_;           // SDL_GPUDevice*
-    void* window_ = nullptr; // SDL_Window*, once attached
-    Pools* pools_;
-    void* stream_ = nullptr; // SDL_GPUTransferBuffer* for Frame::write_buffer
-    std::uint32_t stream_size_ = 0;
-    bool vsync_;
-    bool want_linear_swapchain_;
-    bool swapchain_linear_ = false;
-    TextureFormat swapchain_format_ = TextureFormat::Bgra8Unorm;
+    [[nodiscard]] virtual std::optional<RenderPass> frame_begin_pass(void* command_buffer,
+                                                                     const RenderPassDesc& desc) noexcept = 0;
+    [[nodiscard]] virtual std::optional<ComputePass>
+    frame_begin_compute_pass(void* command_buffer, const ComputePassDesc& desc) noexcept = 0;
+    [[nodiscard]] virtual bool frame_write_buffer(void* command_buffer, BufferHandle buffer, const void* data,
+                                                  std::uint32_t size, std::uint32_t offset) noexcept = 0;
+    virtual void frame_submit(void* command_buffer, TextureHandle swapchain) noexcept = 0;
+
+    virtual void pass_bind_pipeline(void* pass, PipelineHandle pipeline) noexcept = 0;
+    virtual void pass_bind_vertex_buffer(void* pass, BufferHandle buffer, std::uint32_t offset) noexcept = 0;
+    virtual void pass_bind_index_buffer(void* pass, BufferHandle buffer, IndexType type,
+                                        std::uint32_t offset) noexcept = 0;
+    virtual void pass_bind_fragment_texture(void* pass, std::uint32_t slot, TextureHandle texture,
+                                            SamplerHandle sampler) noexcept = 0;
+    virtual void pass_bind_fragment_storage_buffer(void* pass, std::uint32_t slot,
+                                                   BufferHandle buffer) noexcept = 0;
+    virtual void pass_push_vertex_uniforms(void* command_buffer, void* pass, std::uint32_t slot,
+                                           const void* data, std::uint32_t size) noexcept = 0;
+    virtual void pass_push_fragment_uniforms(void* command_buffer, void* pass, std::uint32_t slot,
+                                             const void* data, std::uint32_t size) noexcept = 0;
+    virtual void pass_draw(void* pass, std::uint32_t vertex_count, std::uint32_t instance_count) noexcept = 0;
+    virtual void pass_draw_indexed(void* pass, std::uint32_t index_count, std::uint32_t first_index,
+                                   std::int32_t vertex_offset, std::uint32_t instance_count) noexcept = 0;
+    virtual void pass_end(void* command_buffer, void* pass, bool labelled) noexcept = 0;
+
+    virtual void compute_bind_pipeline(void* pass, ComputePipelineHandle pipeline) noexcept = 0;
+    virtual void compute_bind_storage_buffer(void* pass, std::uint32_t slot,
+                                             BufferHandle buffer) noexcept = 0;
+    virtual void compute_push_uniforms(void* command_buffer, void* pass, std::uint32_t slot, const void* data,
+                                       std::uint32_t size) noexcept = 0;
+    virtual void compute_dispatch(void* pass, std::uint32_t groups_x, std::uint32_t groups_y,
+                                  std::uint32_t groups_z) noexcept = 0;
+    virtual void compute_end(void* command_buffer, void* pass, bool labelled) noexcept = 0;
+
+    // For the backends, which cannot reach the private constructors themselves.
+    static Frame make_frame(Device* device, void* command_buffer, TextureHandle swapchain,
+                            std::uint32_t width, std::uint32_t height) noexcept {
+        return Frame(device, command_buffer, swapchain, width, height);
+    }
+    static RenderPass make_render_pass(Device* device, void* command_buffer, void* pass,
+                                       bool labelled) noexcept {
+        return RenderPass(device, command_buffer, pass, labelled);
+    }
+    static ComputePass make_compute_pass(Device* device, void* command_buffer, void* pass,
+                                         bool labelled) noexcept {
+        return ComputePass(device, command_buffer, pass, labelled);
+    }
 };
 
 } // namespace tynima::rhi

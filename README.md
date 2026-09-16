@@ -22,7 +22,7 @@ past that declaration.
 | `engine/scene/`   | `core render physics`                | Archetype ECS, transforms, the systems that drive the rest  |
 | `engine/physics/` | `core`                               | Rigid bodies behind `PhysicsWorld`: Jolt now, ours next     |
 | `engine/render/`  | `core platform rhi`                  | Frame graph, passes, materials, culling                     |
-| `engine/rhi/`     | `core platform`                      | Render hardware interface — SDL3 GPU, then native Metal     |
+| `engine/rhi/`     | `core platform`                      | Render hardware interface — SDL3 GPU and native Metal       |
 | `engine/platform/`| `core`                               | Window, input, filesystem, time, threads (wraps SDL3)       |
 | `engine/core/`    | —                                    | Allocators, containers, math, jobs, logging, reflection     |
 | `apps/sandbox/`   | any engine module                    | Engine developer's playground — a test bed, not a template  |
@@ -64,7 +64,8 @@ them off; `G` toggles bloom, `T` cycles the tonemapper (off, ACES, AgX) and
 `H` the anti-aliasing (off, FXAA, TAA); the arrow keys move the sun. `--model path.glb` loads
 something else. `--headless --frames N` runs the same loop with no window and
 no GPU (the model still loads) with a scripted player at the keyboard, which
-is what the `sandbox_headless` CTest does on CI. `--record run.tyrec` writes
+is what the `sandbox_headless` CTest does on CI. `--rhi metal` draws through
+the engine's native Metal backend instead of SDL GPU. `--record run.tyrec` writes
 every frame's input and frame time, and the physics world's hash at the end,
 to a text log; `--replay run.tyrec` plays it back in place of the clock and
 the keyboard and exits 3 if the run does not end on the same hash — see
@@ -283,6 +284,25 @@ frame (`Frame::swapchain_texture()`). The render tests compile graphs with
 no device at all — culling, ordering, aliasing, stores, and every way a
 graph can be malformed — and the RHI tests draw offscreen and sample it
 back where a GPU exists.
+
+### Two backends
+
+`rhi::Device` ([`device.h`](engine/rhi/include/tynima/rhi/device.h)) is
+an interface with two implementations behind `Device::create()`:
+[`sdl_device.cpp`](engine/rhi/src/sdl_device.cpp), SDL3 GPU over Metal,
+Vulkan or D3D12, and [`metal_device.mm`](engine/rhi/src/metal_device.mm),
+the engine's own path onto Apple GPUs with nothing between the calls and
+the Metal API — Objective-C++ under ARC, the pools holding Metal objects
+as retained pointers, a per-frame autorelease pool, three frames in flight
+on a semaphore, streamed writes through per-frame shared memory and a blit,
+uniforms pushed as inline bytes. Both bind shaders the same way (uniforms
+first at `[[buffer(n)]]`, storage buffers after, the vertex buffer at
+`[[buffer(14)]]`), so every shader the engine has runs on either unchanged,
+and every GPU test in `rhi` and `render` runs on both — the same calls, the
+same expectations, the way the physics tests hold the engine's solver to
+Jolt. `tynima-sandbox --rhi metal` draws the whole frame through the native
+backend; SDL GPU stays the default until the next task gives Metal something
+SDL cannot do: attachments that never leave tile memory.
 
 Buffers go through the graph as imported resources with the same versioned
 handles: a compute pass (`add_compute_pass`) writes them, any pass reads

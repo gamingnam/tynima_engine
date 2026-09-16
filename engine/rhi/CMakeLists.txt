@@ -4,3 +4,9 @@
 tynima_add_module(NAME rhi
   DEPENDS core platform
   LINK    SDL3::SDL3)
+
+# The native Metal backend: Objective-C++ under ARC, against the frameworks.
+if(APPLE)
+  set_source_files_properties(src/metal_device.mm PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
+  target_link_libraries(tynima_rhi PUBLIC "-framework Metal" "-framework QuartzCore" "-framework Foundation")
+endif()

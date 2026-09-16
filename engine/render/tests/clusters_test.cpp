@@ -150,19 +150,21 @@ TEST_CASE("every light lands in the cells it reaches and in no others") {
 }
 
 TEST_CASE("the kernel on the GPU agrees with the CPU assignment") {
-    // Needs a device: skipped where SDL has no GPU backend.
+    // Needs a device: skipped where there is none. Every backend the
+    // platform has gets the same check.
     const bool real_driver = platform::init();
     if (!real_driver) {
         platform::shutdown();
         REQUIRE(platform::init({.headless = true}));
     }
-    auto device = rhi::Device::create({.debug = false});
-    if (device == nullptr) {
-        MESSAGE("skipped: no GPU device (", std::string(platform::last_error()), ")");
-        platform::shutdown();
-        return;
-    }
-    {
+    for (const rhi::Backend backend : {rhi::Backend::SdlGpu, rhi::Backend::Metal}) {
+        auto device = rhi::Device::create({.backend = backend, .debug = false});
+        if (device == nullptr) {
+            MESSAGE("skipped ", std::string(rhi::backend_name(backend)), ": ",
+                    std::string(platform::last_error()));
+            continue;
+        }
+        MESSAGE("on ", std::string(rhi::backend_name(backend)));
         View view;
         view.camera.position = {-1.0f, 2.0f, 4.0f};
         view.camera.rotation = Quat::from_axis_angle(normalize(Vec3{0.1f, 1.0f, 0.0f}), -0.4f);
@@ -216,6 +218,5 @@ TEST_CASE("the kernel on the GPU agrees with the CPU assignment") {
         device->destroy_buffer(cell_buffer);
         device->destroy_compute_pipeline(kernel);
     }
-    device.reset();
     platform::shutdown();
 }
