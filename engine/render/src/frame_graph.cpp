@@ -64,6 +64,10 @@ rhi::TextureHandle PassResources::texture(GraphTexture texture) const noexcept {
     return graph_.resolve(texture);
 }
 
+rhi::BufferHandle PassResources::buffer(GraphBuffer buffer) const noexcept {
+    return graph_.resolve(buffer);
+}
+
 // -------------------------------------------------------------- PassBuilder
 
 GraphTexture PassBuilder::read(GraphTexture texture) noexcept {
@@ -123,6 +127,40 @@ GraphTexture PassBuilder::write_depth(GraphTexture texture, rhi::LoadOp load, fl
     return GraphTexture{texture.index, node.versions};
 }
 
+GraphBuffer PassBuilder::read_buffer(GraphBuffer buffer) noexcept {
+    FrameGraph::Pass& pass = graph_.passes_[pass_];
+    if (!buffer || buffer.index >= graph_.buffers_.size()) {
+        graph_.fail("a pass reads a buffer the graph does not know");
+        return buffer;
+    }
+    if (pass.buffer_read_count == FrameGraph::kMaxReads) {
+        graph_.fail("a pass reads more buffers than the graph allows");
+        return buffer;
+    }
+    pass.buffer_reads[pass.buffer_read_count++] = buffer;
+    return buffer;
+}
+
+GraphBuffer PassBuilder::write_buffer(GraphBuffer buffer) noexcept {
+    FrameGraph::Pass& pass = graph_.passes_[pass_];
+    if (!buffer || buffer.index >= graph_.buffers_.size()) {
+        graph_.fail("a pass writes a buffer the graph does not know");
+        return buffer;
+    }
+    FrameGraph::Buffer& node = graph_.buffers_[buffer.index];
+    if (buffer.version != node.versions) {
+        graph_.fail("a pass writes an old version of a buffer: write the one the last writer returned");
+        return buffer;
+    }
+    if (pass.buffer_write_count == FrameGraph::kMaxBufferWrites) {
+        graph_.fail("a pass writes more buffers than the RHI allows");
+        return buffer;
+    }
+    pass.buffer_writes[pass.buffer_write_count++] = buffer;
+    ++node.versions;
+    return GraphBuffer{buffer.index, node.versions};
+}
+
 void PassBuilder::side_effect() noexcept {
     graph_.passes_[pass_].side_effect = true;
 }
@@ -135,6 +173,7 @@ FrameGraph::FrameGraph(rhi::Device* device, const Limits& limits) : device_(devi
     limits_.max_passes = std::min<std::uint32_t>(limits_.max_passes, 64); // dependencies are one bit per pass
     passes_.reserve(limits_.max_passes);
     textures_.reserve(limits_.max_textures);
+    buffers_.reserve(limits_.max_buffers);
     physicals_.reserve(limits_.max_physical);
     order_.reserve(limits_.max_passes);
     scratch_.reserve(limits_.max_textures);
@@ -151,6 +190,7 @@ FrameGraph::~FrameGraph() {
 void FrameGraph::begin() noexcept {
     passes_.clear();
     textures_.clear();
+    buffers_.clear();
     order_.clear();
     scratch_.clear();
     stats_ = Stats{};
@@ -190,12 +230,25 @@ GraphTexture FrameGraph::create(const char* name, const TextureInfo& info) noexc
     return GraphTexture{static_cast<std::uint16_t>(textures_.size() - 1), 0};
 }
 
-std::uint32_t FrameGraph::open_pass(const char* name) noexcept {
+GraphBuffer FrameGraph::import_buffer(const char* name, rhi::BufferHandle buffer) noexcept {
+    if (buffers_.size() == buffers_.capacity()) {
+        fail("more buffers than the graph allows");
+        return {};
+    }
+    if (!buffer) {
+        fail("an imported buffer handle is null");
+        return {};
+    }
+    buffers_.push_back(Buffer{.name = name, .handle = buffer});
+    return GraphBuffer{static_cast<std::uint16_t>(buffers_.size() - 1), 0};
+}
+
+std::uint32_t FrameGraph::open_pass(const char* name, bool compute) noexcept {
     if (passes_.size() == passes_.capacity()) {
         fail("more passes than the graph allows");
         return kNone;
     }
-    passes_.push_back(Pass{.name = name});
+    passes_.push_back(Pass{.name = name, .compute = compute});
     return static_cast<std::uint32_t>(passes_.size() - 1);
 }
 
@@ -225,11 +278,50 @@ std::uint32_t FrameGraph::writer_of(GraphTexture texture) const noexcept {
     return kNone;
 }
 
+std::uint32_t FrameGraph::writer_of(GraphBuffer buffer) const noexcept {
+    if (buffer.version == 0) {
+        return kNone; // the imported contents
+    }
+    for (std::uint32_t p = 0; p < passes_.size(); ++p) {
+        const Pass& pass = passes_[p];
+        for (std::uint32_t i = 0; i < pass.buffer_write_count; ++i) {
+            const GraphBuffer& written = pass.buffer_writes[i];
+            if (written.index == buffer.index && written.version + 1 == buffer.version) {
+                return p;
+            }
+        }
+    }
+    return kNone;
+}
+
 bool FrameGraph::validate() noexcept {
     for (const Pass& pass : passes_) {
-        if (pass.color_count == 0 && !pass.has_depth) {
-            fail("a pass writes nothing: every pass needs an attachment");
-            return false;
+        if (pass.compute) {
+            if (pass.color_count > 0 || pass.has_depth || pass.read_count > 0) {
+                fail("a compute pass reads and writes buffers, not textures");
+                return false;
+            }
+            if (pass.buffer_write_count == 0 && !pass.side_effect) {
+                fail("a compute pass writes nothing: it needs a buffer to write, or a side effect");
+                return false;
+            }
+        } else {
+            if (pass.buffer_write_count > 0) {
+                fail("a render pass cannot write a buffer: that takes a compute pass");
+                return false;
+            }
+            if (pass.color_count == 0 && !pass.has_depth) {
+                fail("a pass writes nothing: every pass needs an attachment");
+                return false;
+            }
+        }
+        for (std::uint32_t r = 0; r < pass.buffer_read_count; ++r) {
+            for (std::uint32_t w = 0; w < pass.buffer_write_count; ++w) {
+                if (pass.buffer_reads[r].index == pass.buffer_writes[w].index) {
+                    fail("a pass reads a buffer it also writes");
+                    return false;
+                }
+            }
         }
         // Attachments: the right kind of format, one size for all of them,
         // and contents to load when loading.
@@ -321,6 +413,31 @@ bool FrameGraph::order_passes() noexcept {
         if (pass.has_depth) {
             overwrite(pass.depth);
         }
+        // Buffers: the same rules, versioned the same way.
+        for (std::uint32_t r = 0; r < pass.buffer_read_count; ++r) {
+            const std::uint32_t writer = writer_of(pass.buffer_reads[r]);
+            if (writer != kNone) {
+                pass.depends_on |= bit(writer);
+            }
+        }
+        for (std::uint32_t w = 0; w < pass.buffer_write_count; ++w) {
+            const GraphBuffer over = pass.buffer_writes[w];
+            const std::uint32_t writer = writer_of(over);
+            if (writer != kNone) {
+                pass.depends_on |= bit(writer);
+            }
+            for (std::uint32_t q = 0; q < count; ++q) {
+                if (q == p) {
+                    continue;
+                }
+                for (std::uint32_t r = 0; r < passes_[q].buffer_read_count; ++r) {
+                    if (passes_[q].buffer_reads[r].index == over.index &&
+                        passes_[q].buffer_reads[r].version == over.version) {
+                        pass.depends_on |= bit(q);
+                    }
+                }
+            }
+        }
         pass.order = kNone;
     }
 
@@ -351,7 +468,9 @@ bool FrameGraph::order_passes() noexcept {
 void FrameGraph::cull() noexcept {
     for (Pass& pass : passes_) {
         pass.culled = true;
-        if (pass.side_effect) {
+        // A written buffer is always imported: its contents persist, so the
+        // pass counts as a side effect.
+        if (pass.side_effect || pass.buffer_write_count > 0) {
             pass.culled = false;
         }
         for (std::uint32_t i = 0; i < pass.color_count; ++i) {
@@ -385,6 +504,12 @@ void FrameGraph::cull() noexcept {
         if (pass.has_depth && pass.depth.load == rhi::LoadOp::Load) {
             keep_writer(pass.depth.texture);
         }
+        for (std::uint32_t r = 0; r < pass.buffer_read_count; ++r) {
+            const std::uint32_t writer = writer_of(pass.buffer_reads[r]);
+            if (writer != kNone) {
+                passes_[writer].culled = false;
+            }
+        }
     }
     stats_.passes = static_cast<std::uint32_t>(passes_.size());
     stats_.culled = 0;
@@ -409,6 +534,9 @@ void FrameGraph::decide_lifetimes() noexcept {
         node.first_use = node.first_use == kNone ? order : std::min(node.first_use, order);
         node.last_use = node.last_use == kNone ? order : std::max(node.last_use, order);
     };
+    for (Buffer& node : buffers_) {
+        node.used = false;
+    }
     for (const Pass& pass : passes_) {
         if (pass.culled) {
             continue;
@@ -421,6 +549,12 @@ void FrameGraph::decide_lifetimes() noexcept {
         }
         if (pass.has_depth) {
             touch(pass.depth.texture.index, pass.order, rhi::TextureUsage::DepthStencilTarget);
+        }
+        for (std::uint32_t r = 0; r < pass.buffer_read_count; ++r) {
+            buffers_[pass.buffer_reads[r].index].used = true;
+        }
+        for (std::uint32_t w = 0; w < pass.buffer_write_count; ++w) {
+            buffers_[pass.buffer_writes[w].index].used = true;
         }
     }
 }
@@ -590,6 +724,13 @@ rhi::TextureHandle FrameGraph::resolve(GraphTexture texture) const noexcept {
     return node.physical == kNone ? rhi::TextureHandle{} : physicals_[node.physical].handle;
 }
 
+rhi::BufferHandle FrameGraph::resolve(GraphBuffer buffer) const noexcept {
+    if (!buffer || buffer.index >= buffers_.size()) {
+        return {};
+    }
+    return buffers_[buffer.index].handle;
+}
+
 void FrameGraph::execute(rhi::Frame& frame) noexcept {
     TY_PROFILE_SCOPE_NAMED("FrameGraph::execute");
     TY_ASSERT(device_ != nullptr, "FrameGraph::execute needs a device");
@@ -616,6 +757,22 @@ void FrameGraph::execute(rhi::Frame& frame) noexcept {
     for (const std::uint32_t index : order_) {
         Pass& pass = passes_[index];
         if (pass.culled) {
+            continue;
+        }
+        if (pass.compute) {
+            rhi::ComputePassDesc desc{.name = pass.name};
+            for (std::uint32_t w = 0; w < pass.buffer_write_count; ++w) {
+                desc.writes[w] = resolve(pass.buffer_writes[w]);
+            }
+            desc.write_count = pass.buffer_write_count;
+            auto compute_pass = frame.begin_compute_pass(desc);
+            if (!compute_pass) {
+                TY_LOG_ERROR("graph", "compute pass '%s' could not begin: %s", pass.name,
+                             platform::last_error());
+                continue;
+            }
+            pass.compute_execute(*compute_pass, resources);
+            compute_pass->end();
             continue;
         }
         rhi::RenderPassDesc desc{.name = pass.name};
@@ -671,23 +828,32 @@ std::size_t FrameGraph::describe(char* out, std::size_t capacity) const noexcept
             w.put(": culled\n");
             return;
         }
-        w.put(": ");
-        if (pass.read_count > 0) {
+        w.put(pass.compute ? ": compute; " : ": ");
+        if (pass.read_count + pass.buffer_read_count > 0) {
             w.put("reads ");
             for (std::uint32_t r = 0; r < pass.read_count; ++r) {
                 w.put(r > 0 ? ", " : "");
                 w.put(textures_[pass.reads[r].index].name);
             }
+            for (std::uint32_t r = 0; r < pass.buffer_read_count; ++r) {
+                w.put(r + pass.read_count > 0 ? ", " : "");
+                w.put(buffers_[pass.buffer_reads[r].index].name);
+            }
             w.put("; ");
         }
         w.put("writes ");
+        std::uint32_t written = 0;
         for (std::uint32_t i = 0; i < pass.color_count; ++i) {
-            w.put(i > 0 ? ", " : "");
+            w.put(written++ > 0 ? ", " : "");
             attachment(pass.colors[i]);
         }
         if (pass.has_depth) {
-            w.put(pass.color_count > 0 ? ", " : "");
+            w.put(written++ > 0 ? ", " : "");
             attachment(pass.depth);
+        }
+        for (std::uint32_t b = 0; b < pass.buffer_write_count; ++b) {
+            w.put(written++ > 0 ? ", " : "");
+            w.put(buffers_[pass.buffer_writes[b].index].name);
         }
         w.put("\n");
     };

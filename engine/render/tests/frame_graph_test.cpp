@@ -7,6 +7,7 @@
 
 using namespace tynima;
 using render::FrameGraph;
+using render::GraphBuffer;
 using render::GraphTexture;
 using render::PassBuilder;
 using render::PassResources;
@@ -441,4 +442,113 @@ TEST_CASE("declaring and compiling a frame's graph allocates nothing") {
         REQUIRE(graph.compile());
     }
     CHECK(scope.allocations() == 0);
+}
+
+TEST_CASE("a compute pass writes a buffer the scene reads, and runs before it") {
+    FrameGraph graph(nullptr);
+    graph.begin();
+    GraphTexture swapchain = graph.import("swapchain", kFakeSwapchain, kSwapchain);
+    const rhi::BufferHandle lights_handle{3, 1};
+    const rhi::BufferHandle clusters_handle{4, 1};
+    GraphBuffer lights = graph.import_buffer("lights", lights_handle);
+    GraphBuffer clusters = graph.import_buffer("clusters", clusters_handle);
+    int ran = 0;
+    // Added after the pass that reads its result: the order comes from the versions.
+    graph.add_pass(
+        "scene",
+        [&](PassBuilder& b) {
+            b.read_buffer(GraphBuffer{clusters.index, 1});
+            b.read_buffer(lights);
+            swapchain = b.write_color(swapchain);
+        },
+        nothing);
+    graph.add_compute_pass(
+        "cull lights",
+        [&](PassBuilder& b) {
+            b.read_buffer(lights);
+            clusters = b.write_buffer(clusters);
+        },
+        [&](rhi::ComputePass&, const PassResources& r) {
+            ran += r.buffer(clusters) == clusters_handle ? 1 : 0;
+        });
+    REQUIRE_MESSAGE(graph.compile(), graph.error());
+    CHECK(clusters.version == 1);
+    CHECK(graph.pass(1).compute);
+    CHECK_FALSE(graph.pass(1).culled);
+    CHECK(graph.pass(1).order == 0);
+    CHECK(graph.pass(0).order == 1);
+    CHECK(graph.pass(0).depends_on == (1u << 1));
+    CHECK(graph.buffer(lights.index).used);
+    const std::string text = described(graph);
+    CHECK(text.find("cull lights: compute; reads lights; writes clusters\n") != std::string::npos);
+    CHECK(text.find("scene: reads clusters, lights; writes swapchain (clear, store)\n") != std::string::npos);
+    CHECK(ran == 0); // nothing executed without a device
+}
+
+TEST_CASE("compute passes keep to buffers, render passes to attachments") {
+    FrameGraph graph(nullptr);
+    SUBCASE("a compute pass with an attachment") {
+        graph.begin();
+        const GraphTexture t = graph.create("t", kSmall);
+        graph.add_compute_pass(
+            "wrong", [&](PassBuilder& b) { (void)b.write_color(t); },
+            [](rhi::ComputePass&, const PassResources&) {});
+        CHECK_FALSE(graph.compile());
+        CHECK(std::strstr(graph.error(), "not textures") != nullptr);
+    }
+    SUBCASE("a compute pass that writes nothing") {
+        graph.begin();
+        const GraphBuffer buf = graph.import_buffer("buf", rhi::BufferHandle{1, 1});
+        graph.add_compute_pass(
+            "idle", [&](PassBuilder& b) { b.read_buffer(buf); },
+            [](rhi::ComputePass&, const PassResources&) {});
+        CHECK_FALSE(graph.compile());
+        CHECK(std::strstr(graph.error(), "writes nothing") != nullptr);
+    }
+    SUBCASE("a render pass that writes a buffer") {
+        graph.begin();
+        const GraphBuffer buf = graph.import_buffer("buf", rhi::BufferHandle{1, 1});
+        const GraphTexture t = graph.create("t", kSmall);
+        graph.add_pass(
+            "wrong",
+            [&](PassBuilder& b) {
+                (void)b.write_color(t);
+                (void)b.write_buffer(buf);
+            },
+            nothing);
+        CHECK_FALSE(graph.compile());
+        CHECK(std::strstr(graph.error(), "takes a compute pass") != nullptr);
+    }
+    SUBCASE("a pass that writes an old version of a buffer") {
+        graph.begin();
+        const GraphBuffer buf = graph.import_buffer("buf", rhi::BufferHandle{1, 1});
+        graph.add_compute_pass(
+            "first", [&](PassBuilder& b) { (void)b.write_buffer(buf); },
+            [](rhi::ComputePass&, const PassResources&) {});
+        graph.add_compute_pass(
+            "second", [&](PassBuilder& b) { (void)b.write_buffer(buf); },
+            [](rhi::ComputePass&, const PassResources&) {});
+        CHECK_FALSE(graph.compile());
+        CHECK(std::strstr(graph.error(), "old version of a buffer") != nullptr);
+    }
+}
+
+TEST_CASE("a compute pass whose buffer a later pass overwrites still runs, in order") {
+    // Two in-place updates of one table: the second depends on the first
+    // (it may read what is there), and both stay since buffers persist.
+    FrameGraph graph(nullptr);
+    graph.begin();
+    GraphBuffer table = graph.import_buffer("table", rhi::BufferHandle{2, 1});
+    graph.add_compute_pass(
+        "clear", [&](PassBuilder& b) { table = b.write_buffer(table); },
+        [](rhi::ComputePass&, const PassResources&) {});
+    graph.add_compute_pass(
+        "fill", [&](PassBuilder& b) { table = b.write_buffer(table); },
+        [](rhi::ComputePass&, const PassResources&) {});
+    REQUIRE_MESSAGE(graph.compile(), graph.error());
+    CHECK(table.version == 2);
+    CHECK_FALSE(graph.pass(0).culled);
+    CHECK_FALSE(graph.pass(1).culled);
+    CHECK(graph.pass(1).depends_on == 1u);
+    CHECK(graph.pass(0).order == 0);
 }

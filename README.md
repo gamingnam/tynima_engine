@@ -58,8 +58,9 @@ runs, and it can shove bottles about, push the gate open and swing the
 hanging chain. `1`/`2`/`3` switch between
 unlit, Blinn-Phong and Cook-Torrance shading; `N`/`M`/`O`/`V`/`B` show the
 mapped normals, metallic/roughness, occlusion, vertex normals and tangents;
-`C` tints the picture by shadow cascade and `X` turns shadows off; `T`
-toggles tonemapping; the arrow keys move the light. `--model path.glb` loads
+`C` tints the picture by shadow cascade and `X` turns shadows off; `K`
+shows how many point lights each cluster holds and `P` turns the hundred of
+them off; `T` toggles tonemapping; the arrow keys move the sun. `--model path.glb` loads
 something else. `--headless --frames N` runs the same loop with no window and
 no GPU (the model still loads) with a scripted player at the keyboard, which
 is what the `sandbox_headless` CTest does on CI. `--record run.tyrec` writes
@@ -282,6 +283,13 @@ no device at all — culling, ordering, aliasing, stores, and every way a
 graph can be malformed — and the RHI tests draw offscreen and sample it
 back where a GPU exists.
 
+Buffers go through the graph as imported resources with the same versioned
+handles: a compute pass (`add_compute_pass`) writes them, any pass reads
+them, and the versions order the passes. Compute came with it in the RHI —
+`ComputePipelineDesc`, `Frame::begin_compute_pass`, `Storage` buffers,
+`Frame::write_buffer` to stream a frame's data in without a wait, and
+`Device::download_buffer` so a test can read a kernel's result back.
+
 ### Shadows
 
 The sun casts cascaded shadow maps ([`shadows.h`](engine/render/include/tynima/render/shadows.h)):
@@ -300,6 +308,23 @@ light against acne. The tests check that every corner of every slice lands
 inside its cascade at a depth the map can hold, that nearer the light means
 deeper into 1, and that a step smaller than a texel moves the map's contents
 by a whole texel or not at all.
+
+### Lights
+
+A hundred coloured point lights circle the pile, and each pixel shades only
+the ones that reach it ([`clusters.h`](engine/render/include/tynima/render/clusters.h)).
+The view frustum is a grid of 16 × 9 screen tiles by 24 depth slices spaced
+by equal ratios out to 80 m; every frame a compute pass (`cluster lights`
+in the graph, one thread per cell) tests each light's sphere against each
+cell's box and writes the cell's list, and the scene shader finds its
+pixel's cell from the window position and the view depth, then runs the
+same BRDF as the sun over that list with an inverse-square falloff windowed
+to nothing at the light's radius. `ClusterGrid` on the CPU is the same
+arithmetic the shaders use — slice from depth, cell box from tile and slice
+— and `assign_lights()` is the kernel's reference: the tests hold every
+light inside the grid to be listed by its own cell and every listed light to
+actually reach its cell, and where a GPU exists they run the kernel and
+compare its table with the CPU's cell for cell.
 
 ## Logging and asserts
 

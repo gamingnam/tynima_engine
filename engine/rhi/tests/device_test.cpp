@@ -476,3 +476,96 @@ TEST_CASE("offscreen passes: draw into a texture, then sample it into the swapch
     device.reset();
     window.reset();
 }
+
+TEST_CASE("compute: a kernel reads one storage buffer, writes another, and the result comes back") {
+    Session session;
+    auto device = rhi::Device::create({.debug = false});
+    if (device == nullptr) {
+        MESSAGE("skipped: no GPU device (", std::string(platform::last_error()), ")");
+        return;
+    }
+    // Doubles every value, plus the uniform's offset: [[buffer(0)]] is the
+    // uniform, then the read-only storage buffer, then the read-write one.
+    constexpr const char* kKernel = R"(
+#include <metal_stdlib>
+using namespace metal;
+struct Params { uint count; uint offset; uint pad0; uint pad1; };
+kernel void cs_main(constant Params& p [[buffer(0)]], const device uint* in [[buffer(1)]],
+                    device uint* out [[buffer(2)]], uint id [[thread_position_in_grid]]) {
+    if (id < p.count) {
+        out[id] = in[id] * 2 + p.offset;
+    }
+}
+)";
+    const rhi::ComputePipelineHandle pipeline =
+        device->create_compute_pipeline({.code = kKernel,
+                                         .code_size = std::strlen(kKernel),
+                                         .entry_point = "cs_main",
+                                         .num_uniform_buffers = 1,
+                                         .num_readonly_storage_buffers = 1,
+                                         .num_readwrite_storage_buffers = 1,
+                                         .threads_x = 64});
+    REQUIRE_MESSAGE(static_cast<bool>(pipeline), platform::last_error());
+    CHECK(device->valid(pipeline));
+    CHECK(device->resource_counts().compute_pipelines == 1);
+
+    constexpr std::uint32_t kCount = 1000;
+    std::uint32_t values[kCount];
+    for (std::uint32_t i = 0; i < kCount; ++i) {
+        values[i] = i * 3;
+    }
+    const rhi::BufferDesc storage{.usage = rhi::BufferUsage::Storage, .size = sizeof values};
+    const rhi::BufferHandle in = device->create_buffer(storage);
+    const rhi::BufferHandle out = device->create_buffer(storage);
+    REQUIRE(static_cast<bool>(in));
+    REQUIRE(static_cast<bool>(out));
+
+    // Two frames: the input streamed in, the kernel run; no window needed.
+    for (std::uint32_t offset = 1; offset <= 2; ++offset) {
+        auto frame = device->begin_frame();
+        REQUIRE_MESSAGE(frame.has_value(), platform::last_error());
+        CHECK_FALSE(frame->has_swapchain_image());
+        REQUIRE_MESSAGE(frame->write_buffer(in, values, sizeof values), platform::last_error());
+        rhi::ComputePassDesc desc{.name = "double"};
+        desc.writes[0] = out;
+        desc.write_count = 1;
+        auto pass = frame->begin_compute_pass(desc);
+        REQUIRE_MESSAGE(pass.has_value(), platform::last_error());
+        pass->bind_pipeline(pipeline);
+        pass->bind_storage_buffer(0, in);
+        const std::uint32_t params[4] = {kCount, offset, 0, 0};
+        pass->push_uniforms(0, params, sizeof params);
+        pass->dispatch((kCount + 63) / 64);
+        pass->end();
+        frame->submit();
+
+        std::uint32_t result[kCount];
+        REQUIRE_MESSAGE(device->download_buffer(out, result, sizeof result), platform::last_error());
+        std::uint32_t wrong = 0;
+        for (std::uint32_t i = 0; i < kCount; ++i) {
+            wrong += result[i] == values[i] * 2 + offset ? 0 : 1;
+        }
+        CHECK(wrong == 0);
+    }
+    // A partial write, at an offset.
+    {
+        const std::uint32_t patch[2] = {7, 9};
+        auto frame = device->begin_frame();
+        REQUIRE(frame.has_value());
+        REQUIRE(frame->write_buffer(out, patch, sizeof patch, 8));
+        CHECK_FALSE(frame->write_buffer(out, patch, sizeof patch, sizeof values)); // past the end
+        frame->submit();
+        std::uint32_t head[4];
+        REQUIRE(device->download_buffer(out, head, sizeof head));
+        CHECK(head[0] == 0 * 6 + 2);
+        CHECK(head[1] == 1 * 6 + 2);
+        CHECK(head[2] == 7);
+        CHECK(head[3] == 9);
+    }
+
+    device->destroy_buffer(in);
+    device->destroy_buffer(out);
+    device->destroy_compute_pipeline(pipeline);
+    CHECK(device->resource_counts().compute_pipelines == 0);
+    CHECK(device->resource_counts().buffers == 0);
+}

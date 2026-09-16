@@ -20,7 +20,8 @@
 // Controls: hold the right mouse button to look; W/A/S/D move, Q/E descend
 // and climb, Shift runs; R drops the pile again; L (the game module)
 // launches it; F follows the character; C shows the shadow cascades, X
-// toggles shadows; Escape quits.
+// toggles shadows, K shows the lights per cluster, P toggles the point
+// lights; Escape quits.
 #include <tynima/assets/gltf.h>
 #include <tynima/core/arena.h>
 #include <tynima/core/assert.h>
@@ -39,6 +40,7 @@
 #include <tynima/platform/time.h>
 #include <tynima/platform/window.h>
 #include <tynima/render/camera.h>
+#include <tynima/render/clusters.h>
 #include <tynima/render/frame_graph.h>
 #include <tynima/render/mesh.h>
 #include <tynima/render/model.h>
@@ -516,6 +518,7 @@ vertex VSOut vs_main(VertexIn in [[stage_in]], constant Uniforms& u [[buffer(0)]
 
 struct FrameUniforms {
     float4 camera_position; // xyz
+    float4 camera_forward;  // xyz: the view direction, for a pixel's depth
     float4 light_direction; // xyz: towards the light; w: intensity
     float4 light_color;     // rgb; w: ambient intensity
     float4 params;          // x: shading model, y: debug view
@@ -531,6 +534,24 @@ struct ShadowUniforms {
     float4x4 cascade_matrix[4]; // world -> light clip, reverse-Z
     float4 cascade_param[4];    // x: texel size (m), y: depth per metre, z: texel size in uv
     float4 settings;            // x: cascades, y: strength (0: off), z: normal offset, w: bias (in texels)
+};
+
+// The clustered point lights: render/clusters.h, exactly.
+struct ClusterUniforms {
+    float4 grid;   // tiles_x, tiles_y, slices, light count
+    float4 depth;  // slice_scale, slice_bias, near, far
+    float4 screen; // width, height, tan_half_x, tan_half_y
+    float4x4 view;
+};
+
+struct PointLight {
+    float4 position_radius;
+    float4 color;
+};
+
+struct ClusterLights {
+    uint count;
+    uint indices[31];
 };
 
 constant float kPi = 3.14159265358979;
@@ -567,6 +588,37 @@ float3 f_schlick(float v_dot_h, float3 f0) {
     return f0 + (float3(1.0) - f0) * f;
 }
 
+// What a surface reflects of light from `l` towards `v`, per unit of
+// irradiance: the BRDF, before the cosine. Every light — the sun and each
+// point light — goes through this once.
+float3 surface_brdf(int mode, float3 n, float3 v, float3 l, float3 base, float metallic, float roughness) {
+    float3 h = normalize(l + v);
+    float n_dot_l = saturate(dot(n, l));
+    float n_dot_v = max(dot(n, v), 1e-4);
+    float n_dot_h = saturate(dot(n, h));
+    float v_dot_h = saturate(dot(v, h));
+    float alpha = roughness * roughness;
+    if (mode == 1) {
+        // Normalized Blinn-Phong. Shininess is derived from roughness so both
+        // models agree on how glossy a surface is; what differs is the shape
+        // of the highlight and the missing Fresnel and masking terms.
+        float shininess = 2.0 / (alpha * alpha) - 2.0;
+        float3 spec_color = mix(float3(0.04), base, metallic);
+        float3 diffuse = base * (1.0 - metallic) / kPi;
+        float3 specular = spec_color * pow(n_dot_h, shininess) * (shininess + 8.0) / (8.0 * kPi);
+        return diffuse + specular;
+    }
+    // Cook-Torrance with the metallic workflow: dielectrics reflect 4% at
+    // normal incidence and keep their albedo as diffuse; metals reflect
+    // their albedo as specular and have no diffuse at all.
+    float3 f0 = mix(float3(0.04), base, metallic);
+    float3 diffuse_color = base * (1.0 - metallic);
+    float3 f = f_schlick(v_dot_h, f0);
+    float d = d_ggx(n_dot_h, alpha);
+    float vis = v_smith_ggx_correlated(n_dot_v, n_dot_l, alpha);
+    return (float3(1.0) - f) * diffuse_color / kPi + d * vis * f;
+}
+
 // Linear light out, into an HDR target: the tonemap pass makes it a picture.
 fragment float4 fs_main(VSOut in [[stage_in]],
                         texture2d<float> base_color_map [[texture(0)]],
@@ -582,7 +634,10 @@ fragment float4 fs_main(VSOut in [[stage_in]],
                         sampler shadow_sampler [[sampler(5)]],
                         constant FrameUniforms& frame [[buffer(0)]],
                         constant MaterialUniforms& m [[buffer(1)]],
-                        constant ShadowUniforms& shadows [[buffer(2)]]) {
+                        constant ShadowUniforms& shadows [[buffer(2)]],
+                        constant ClusterUniforms& clusters [[buffer(3)]],
+                        const device PointLight* lights [[buffer(4)]],
+                        const device ClusterLights* cells [[buffer(5)]]) {
     float4 base = base_color_map.sample(map_sampler, in.uv) * m.base_color_factor;
     float4 mr = metallic_roughness_map.sample(map_sampler, in.uv);
     float metallic = mr.b * m.factors.x;                        // glTF: metallic in B
@@ -602,11 +657,7 @@ fragment float4 fs_main(VSOut in [[stage_in]],
 
     float3 v = normalize(frame.camera_position.xyz - in.world_position);
     float3 l = normalize(frame.light_direction.xyz);
-    float3 h = normalize(l + v);
     float n_dot_l = saturate(dot(n, l));
-    float n_dot_v = max(dot(n, v), 1e-4);
-    float n_dot_h = saturate(dot(n, h));
-    float v_dot_h = saturate(dot(v, h));
     float3 radiance = frame.light_color.rgb * frame.light_direction.w;
     float ambient = frame.light_color.w;
 
@@ -643,6 +694,17 @@ fragment float4 fs_main(VSOut in [[stage_in]],
         shadow = 1.0 - (1.0 - shadow) * shadows.settings.y;
     }
 
+    // The point lights that reach this pixel: those listed for its cell —
+    // the tile under the pixel, the slice at its depth.
+    float view_depth = max(dot(in.world_position - frame.camera_position.xyz, frame.camera_forward.xyz),
+                           clusters.depth.z);
+    uint slice = uint(clamp(floor(log(view_depth) * clusters.depth.x + clusters.depth.y), 0.0,
+                            clusters.grid.z - 1.0));
+    uint tx = min(uint(in.position.x / clusters.screen.x * clusters.grid.x), uint(clusters.grid.x) - 1);
+    uint ty = min(uint(in.position.y / clusters.screen.y * clusters.grid.y), uint(clusters.grid.y) - 1);
+    uint cell = (slice * uint(clusters.grid.y) + ty) * uint(clusters.grid.x) + tx;
+    uint cell_lights = cells[cell].count;
+
     int mode = int(frame.params.x);
     int debug_view = int(frame.params.y);
     float3 color;
@@ -656,35 +718,40 @@ fragment float4 fs_main(VSOut in [[stage_in]],
         color = geometric_n * 0.5 + 0.5;
     } else if (debug_view == 5) {
         color = t * 0.5 + 0.5;
+    } else if (debug_view == 7) {
+        // How many lights the pixel's cell holds: black, blue, green, yellow, red for 0, 4, 8, 12, 16+.
+        float heat = min(float(cell_lights) / 16.0, 1.0) * 4.0;
+        float3 stops[5] = {float3(0.0), float3(0.0, 0.2, 1.0), float3(0.0, 1.0, 0.2), float3(1.0, 1.0, 0.0),
+                           float3(1.0, 0.1, 0.0)};
+        int stop = int(heat);
+        color = mix(stops[stop], stops[min(stop + 1, 4)], heat - float(stop));
     } else if (mode == 0) {
         color = base.rgb;
-    } else if (mode == 1) {
-        // Normalized Blinn-Phong. Shininess is derived from roughness so both
-        // models agree on how glossy a surface is; what differs is the shape
-        // of the highlight and the missing Fresnel and masking terms.
-        float alpha = roughness * roughness;
-        float shininess = 2.0 / (alpha * alpha) - 2.0;
-        float3 spec_color = mix(float3(0.04), base.rgb, metallic);
-        float3 diffuse = base.rgb * (1.0 - metallic) / kPi;
-        float3 specular = spec_color * pow(n_dot_h, shininess) * (shininess + 8.0) / (8.0 * kPi);
-        float3 direct = (diffuse + specular) * radiance * n_dot_l * shadow;
-        color = direct + base.rgb * ambient * occlusion + emissive;
     } else {
-        // Cook-Torrance with the metallic workflow: dielectrics reflect 4% at
-        // normal incidence and keep their albedo as diffuse; metals reflect
-        // their albedo as specular and have no diffuse at all.
-        float alpha = roughness * roughness;
+        // The sun, shadowed; then the cell's point lights, each an inverse
+        // square windowed to nothing at its radius (Karis, 2013); then a
+        // uniform grey environment standing in for image-based lighting.
+        float3 sun = surface_brdf(mode, n, v, l, base.rgb, metallic, roughness) * radiance * n_dot_l * shadow;
+        float3 local = float3(0.0);
+        for (uint k = 0; k < cell_lights; ++k) {
+            PointLight light = lights[cells[cell].indices[k]];
+            float3 to_light = light.position_radius.xyz - in.world_position;
+            float d2 = dot(to_light, to_light);
+            float r = light.position_radius.w;
+            if (d2 >= r * r) {
+                continue;
+            }
+            float3 ll = to_light * rsqrt(d2);
+            float ratio = d2 / (r * r);
+            float window = saturate(1.0 - ratio * ratio);
+            float attenuation = window * window / (d2 + 0.01);
+            float3 brdf = surface_brdf(mode, n, v, ll, base.rgb, metallic, roughness);
+            local += brdf * light.color.rgb * attenuation * saturate(dot(n, ll));
+        }
         float3 f0 = mix(float3(0.04), base.rgb, metallic);
-        float3 diffuse_color = base.rgb * (1.0 - metallic);
-        float3 f = f_schlick(v_dot_h, f0);
-        float d = d_ggx(n_dot_h, alpha);
-        float vis = v_smith_ggx_correlated(n_dot_v, n_dot_l, alpha);
-        float3 specular = d * vis * f;
-        float3 diffuse = (float3(1.0) - f) * diffuse_color / kPi;
-        float3 direct = (diffuse + specular) * radiance * n_dot_l * shadow;
-        // A uniform grey environment stands in for image-based lighting (Phase 4).
-        float3 indirect = (diffuse_color + f0 * 0.5) * ambient * occlusion;
-        color = direct + indirect + emissive;
+        float3 indirect = mode == 1 ? base.rgb * ambient * occlusion
+                                    : (base.rgb * (1.0 - metallic) + f0 * 0.5) * ambient * occlusion;
+        color = sun + local + indirect + emissive;
     }
     if (debug_view == 6) {
         // Which cascade shadowed the pixel: red, green, blue, yellow; grey for none.
@@ -798,11 +865,12 @@ static_assert(sizeof(MeshUniforms) == 128, "matches the MSL Uniforms struct");
 // Mirror the MSL uniform structs: float4 members only, so C++ and Metal agree on layout.
 struct FrameUniforms {
     Vec4 camera_position;
+    Vec4 camera_forward;
     Vec4 light_direction;
     Vec4 light_color;
     Vec4 params;
 };
-static_assert(sizeof(FrameUniforms) == 64, "matches the MSL FrameUniforms struct");
+static_assert(sizeof(FrameUniforms) == 80, "matches the MSL FrameUniforms struct");
 
 struct MaterialUniforms {
     Vec4 base_color_factor;
@@ -827,9 +895,10 @@ static_assert(sizeof(ShadowUniforms) == 336, "matches the MSL ShadowUniforms str
 struct Shading {
     int model = 2;      // 0 unlit, 1 Blinn-Phong, 2 Cook-Torrance
     int debug_view = 0; // 0 lit, 1 shading normals, 2 metallic/roughness, 3 occlusion, 4 vertex normals,
-                        // 5 tangents, 6 lit with the shadow cascades tinted
+                        // 5 tangents, 6 lit with the shadow cascades tinted, 7 lights per cluster
     bool tonemap = true;
     bool shadows = true;
+    bool point_lights = true;
     float light_azimuth = radians(35.0f);   // around +y, from +z
     float light_elevation = radians(50.0f); // above the horizon
     float light_intensity = 3.0f;           // linear radiance; >1 is what tonemapping is for
@@ -849,19 +918,22 @@ struct Shading {
         static constexpr const char* kViews[] = {"lit",       "shading normals (mapped)",
                                                  "metallic (r) / roughness (g)",
                                                  "occlusion", "vertex normals",
-                                                 "tangents",  "shadow cascades"};
+                                                 "tangents",  "shadow cascades",
+                                                 "lights per cluster"};
         float azimuth = std::fmod(degrees(light_azimuth), 360.0f);
         if (azimuth < 0.0f) azimuth += 360.0f;
-        TY_LOG_INFO("shading", "%s | view %s | tonemap %s | shadows %s | light az %.0f el %.0f",
+        TY_LOG_INFO("shading",
+                    "%s | view %s | tonemap %s | shadows %s | point lights %s | sun az %.0f el %.0f",
                     kModels[model], kViews[debug_view], tonemap ? "aces" : "off", shadows ? "on" : "off",
-                    static_cast<double>(azimuth), static_cast<double>(degrees(light_elevation)));
+                    point_lights ? "on" : "off", static_cast<double>(azimuth),
+                    static_cast<double>(degrees(light_elevation)));
     }
 
     // Returns true when something changed.
     bool update(const platform::Input& input, float dt) {
         using platform::Key;
         const int old_model = model, old_view = debug_view;
-        const bool old_tonemap = tonemap, old_shadows = shadows;
+        const bool old_tonemap = tonemap, old_shadows = shadows, old_lights = point_lights;
         if (input.key_pressed(Key::Digit1)) model = 0;
         if (input.key_pressed(Key::Digit2)) model = 1;
         if (input.key_pressed(Key::Digit3)) model = 2;
@@ -871,17 +943,19 @@ struct Shading {
         if (input.key_pressed(Key::V)) debug_view = debug_view == 4 ? 0 : 4;
         if (input.key_pressed(Key::B)) debug_view = debug_view == 5 ? 0 : 5;
         if (input.key_pressed(Key::C)) debug_view = debug_view == 6 ? 0 : 6;
+        if (input.key_pressed(Key::K)) debug_view = debug_view == 7 ? 0 : 7;
         if (input.key_pressed(Key::Digit0)) debug_view = 0;
         if (input.key_pressed(Key::T)) tonemap = !tonemap;
         if (input.key_pressed(Key::X)) shadows = !shadows;
+        if (input.key_pressed(Key::P)) point_lights = !point_lights;
         const float turn = radians(60.0f) * dt;
         bool moved = false;
         if (input.key_down(Key::Left)) { light_azimuth -= turn; moved = true; }
         if (input.key_down(Key::Right)) { light_azimuth += turn; moved = true; }
         if (input.key_down(Key::Up)) { light_elevation = std::min(light_elevation + turn, radians(89.0f)); moved = true; }
         if (input.key_down(Key::Down)) { light_elevation = std::max(light_elevation - turn, radians(-10.0f)); moved = true; }
-        const bool changed =
-            model != old_model || debug_view != old_view || tonemap != old_tonemap || shadows != old_shadows;
+        const bool changed = model != old_model || debug_view != old_view || tonemap != old_tonemap ||
+                             shadows != old_shadows || point_lights != old_lights;
         if (changed) print();
         return changed || moved;
     }
@@ -978,6 +1052,13 @@ constexpr std::uint32_t kShadowTextureSlot = 5; // after the five material maps
 constexpr const char* kShadowPassNames[render::kMaxCascades] = {"shadow 0", "shadow 1", "shadow 2",
                                                                  "shadow 3"};
 
+// A hundred coloured point lights circling the pile, listed per cell of a
+// 16 x 9 x 24 cluster grid by a compute pass each frame.
+constexpr std::uint32_t kLightCount = 100;
+constexpr std::uint32_t kMaxLights = 256;
+constexpr render::ClusterGridSettings kClusterSettings{.tiles_x = 16, .tiles_y = 9, .slices = 24,
+                                                       .max_distance = 80.0f};
+
 struct Renderer {
     std::unique_ptr<rhi::Device> device;
     std::unique_ptr<render::FrameGraph> graph; // owns the frame's transient textures
@@ -990,8 +1071,12 @@ struct Renderer {
     rhi::SamplerHandle post_sampler;   // the HDR image: one texel per pixel, clamped
     rhi::SamplerHandle shadow_sampler; // the shadow maps: compared, bilinear, clamped
     rhi::TextureHandle shadow_fallback; // a 1x1 depth texture for the shadow slots when there are no maps
+    rhi::ComputePipelineHandle cluster_kernel; // lists the lights per cell
+    rhi::BufferHandle light_buffer;            // kMaxLights PointLights, streamed in each frame
+    rhi::BufferHandle cluster_buffer;          // one ClusterLights per cell, written by the kernel
     render::Model models[kModelCount]; // by kModel* slot
     bool shadows = false; // the device can sample its depth format and the shadow pipeline built
+    bool clusters = false; // the kernel and both buffers exist
 
     Renderer() = default;
     Renderer(Renderer&& other) noexcept
@@ -1003,7 +1088,11 @@ struct Renderer {
           fallbacks(std::exchange(other.fallbacks, render::FallbackTextures{})),
           sampler(std::exchange(other.sampler, {})), post_sampler(std::exchange(other.post_sampler, {})),
           shadow_sampler(std::exchange(other.shadow_sampler, {})),
-          shadow_fallback(std::exchange(other.shadow_fallback, {})), shadows(other.shadows) {
+          shadow_fallback(std::exchange(other.shadow_fallback, {})),
+          cluster_kernel(std::exchange(other.cluster_kernel, {})),
+          light_buffer(std::exchange(other.light_buffer, {})),
+          cluster_buffer(std::exchange(other.cluster_buffer, {})), shadows(other.shadows),
+          clusters(other.clusters) {
         for (std::uint32_t i = 0; i < kModelCount; ++i) {
             models[i] = std::exchange(other.models[i], render::Model{});
         }
@@ -1022,6 +1111,9 @@ struct Renderer {
             device->destroy_sampler(post_sampler);
             device->destroy_sampler(shadow_sampler);
             device->destroy_texture(shadow_fallback);
+            device->destroy_compute_pipeline(cluster_kernel);
+            device->destroy_buffer(light_buffer);
+            device->destroy_buffer(cluster_buffer);
             render::destroy_fallback_textures(*device, fallbacks);
             device->destroy_graphics_pipeline(mesh_pipeline);
             device->destroy_graphics_pipeline(triangle_pipeline);
@@ -1030,6 +1122,8 @@ struct Renderer {
             mesh_pipeline = triangle_pipeline = tonemap_pipeline = shadow_pipeline = {};
             sampler = post_sampler = shadow_sampler = {};
             shadow_fallback = {};
+            cluster_kernel = {};
+            light_buffer = cluster_buffer = {};
             device.reset();
         }
     }
@@ -1037,7 +1131,8 @@ struct Renderer {
 
 rhi::PipelineHandle make_pipeline(rhi::Device& device, const char* msl, const rhi::GraphicsPipelineDesc& base,
                                   std::uint32_t vertex_uniforms, std::uint32_t fragment_uniforms,
-                                  std::uint32_t fragment_samplers) {
+                                  std::uint32_t fragment_samplers,
+                                  std::uint32_t fragment_storage_buffers = 0) {
     const rhi::ShaderDesc common{.format = rhi::ShaderFormat::Msl, .code = msl, .code_size = std::strlen(msl)};
     rhi::ShaderDesc vs_desc = common;
     vs_desc.stage = rhi::ShaderStage::Vertex;
@@ -1048,6 +1143,7 @@ rhi::PipelineHandle make_pipeline(rhi::Device& device, const char* msl, const rh
     fs_desc.entry_point = "fs_main";
     fs_desc.num_uniform_buffers = fragment_uniforms;
     fs_desc.num_samplers = fragment_samplers;
+    fs_desc.num_storage_buffers = fragment_storage_buffers;
 
     const rhi::ShaderHandle vs = device.create_shader(vs_desc);
     const rhi::ShaderHandle fs = device.create_shader(fs_desc);
@@ -1101,7 +1197,7 @@ Renderer create_renderer(platform::Window& window, const render::ModelData* mode
     mesh_desc.color_target_count = 1;
     mesh_desc.depth_format = r.device->preferred_depth_format();
     r.mesh_pipeline =
-        make_pipeline(*r.device, kMeshMsl, mesh_desc, 1, 3, kShadowTextureSlot + render::kMaxCascades);
+        make_pipeline(*r.device, kMeshMsl, mesh_desc, 1, 4, kShadowTextureSlot + render::kMaxCascades, 2);
 
     rhi::GraphicsPipelineDesc triangle_desc;
     triangle_desc.color_formats[0] = kHdrFormat; // same pass, so the same targets, even with the test off
@@ -1139,6 +1235,21 @@ Renderer create_renderer(platform::Window& window, const render::ModelData* mode
     if (!r.shadows) {
         TY_LOG_WARN("gpu", "no shadows: %s cannot be sampled here, or the shadow pipeline failed",
                     rhi::texture_format_name(depth_format));
+    }
+
+    // The point lights: the kernel that sorts them into cells, the buffer
+    // they arrive in and the table they land in.
+    r.cluster_kernel = r.device->create_compute_pipeline(render::cluster_kernel_pipeline_desc());
+    r.light_buffer = r.device->create_buffer(
+        {.usage = rhi::BufferUsage::Storage,
+         .size = static_cast<std::uint32_t>(kMaxLights * sizeof(render::PointLight))});
+    const render::ClusterGrid grid = render::ClusterGrid::make(kClusterSettings, 0.05f);
+    r.cluster_buffer = r.device->create_buffer(
+        {.usage = rhi::BufferUsage::Storage,
+         .size = static_cast<std::uint32_t>(grid.cluster_count() * sizeof(render::ClusterLights))});
+    r.clusters = r.cluster_kernel && r.light_buffer && r.cluster_buffer;
+    if (!r.clusters) {
+        TY_LOG_ERROR("gpu", "no clustered lights: %s", platform::last_error());
     }
 
     r.sampler = r.device->create_sampler({.max_anisotropy = 8.0f});
@@ -1245,14 +1356,45 @@ void each_drawable(scene::World& world, Renderer& renderer, rhi::RenderPass& pas
         });
 }
 
+// A hue as linear RGB, fully saturated.
+Vec3 hue_color(float hue) {
+    const float h = hue * 6.0f;
+    const float x = 1.0f - std::fabs(std::fmod(h, 2.0f) - 1.0f);
+    switch (static_cast<int>(h) % 6) {
+    case 0: return {1.0f, x, 0.0f};
+    case 1: return {x, 1.0f, 0.0f};
+    case 2: return {0.0f, 1.0f, x};
+    case 3: return {0.0f, x, 1.0f};
+    case 4: return {x, 0.0f, 1.0f};
+    default: return {1.0f, 0.0f, x};
+    }
+}
+
+// The point lights at time t: each on its own circle around the pile, at
+// its own height, bobbing, coloured by where it is in the hundred.
+void animate_lights(float t, render::PointLight* out, std::uint32_t count) {
+    for (std::uint32_t i = 0; i < count; ++i) {
+        const float direction = noise(i, 21) > 0.5f ? 1.0f : -1.0f;
+        const float angle = t * direction * (0.15f + 0.35f * noise(i, 20)) + noise(i, 22) * kTwoPi;
+        const float radius = 1.2f + 4.5f * noise(i, 23);
+        const float bob = std::sin(t * (0.4f + 0.8f * noise(i, 24)) + noise(i, 25) * kTwoPi);
+        const float height = 0.4f + 1.6f * (0.5f + 0.5f * bob);
+        const Vec3 position{radius * std::cos(angle), height, radius * std::sin(angle)};
+        const float reach = 1.8f + 1.4f * noise(i, 26);
+        out[i].position_radius = {position, reach};
+        out[i].color = {hue_color(static_cast<float>(i) / static_cast<float>(count)) * 4.0f, 0.0f};
+    }
+}
+
 // The frame as a graph: the sun's shadow maps, one depth-only pass per
-// cascade; the scene into an HDR transient with a depth transient beside
-// it, reading the shadow maps; then the tonemap pass reading that onto the
-// swapchain. Declared, compiled and run every frame — the graph decides that
-// the scene's depth is never stored and that the shadow maps and HDR are,
-// and would drop any pass whose result nothing consumed.
+// cascade; a compute pass sorting the point lights into the cluster grid;
+// the scene into an HDR transient with a depth transient beside it, reading
+// the shadow maps and the cluster table; then the tonemap pass reading that
+// onto the swapchain. Declared, compiled and run every frame — the graph
+// decides that the scene's depth is never stored and that the shadow maps
+// and HDR are, and would drop any pass whose result nothing consumed.
 void draw_frame(Renderer& renderer, rhi::Frame& frame, scene::World& world, const FlyCamera& fly,
-                const Shading& shading) {
+                const Shading& shading, float time) {
     render::FrameGraph& graph = *renderer.graph;
     const rhi::TextureFormat depth_format = renderer.device->preferred_depth_format();
     const render::TextureInfo screen{.format = kHdrFormat, .width = frame.width(), .height = frame.height()};
@@ -1267,8 +1409,42 @@ void draw_frame(Renderer& renderer, rhi::Frame& frame, scene::World& world, cons
     const float aspect = static_cast<float>(frame.width()) / static_cast<float>(frame.height());
     const Mat4 view_projection = fly.camera.view_projection(aspect);
     const Vec3 light = shading.light_direction();
-    const bool have_scene = renderer.models[kModelBottle].mesh.index_count > 0 && renderer.mesh_pipeline;
+    // The scene shader reads the cluster table whether or not any light is
+    // on, so without the cluster resources there is no scene to draw.
+    const bool have_scene =
+        renderer.models[kModelBottle].mesh.index_count > 0 && renderer.mesh_pipeline && renderer.clusters;
     const bool shadows = have_scene && renderer.shadows && shading.shadows;
+    const bool point_lights = have_scene && shading.point_lights;
+
+    // The point lights, moved on and streamed in; the kernel sorts them into
+    // the cells before the scene reads them. With the lights off the table
+    // still exists, empty, so the shader reads nothing from it.
+    render::PointLight lights[kLightCount];
+    const std::uint32_t light_count = point_lights ? kLightCount : 0;
+    animate_lights(time, lights, light_count);
+    const render::ClusterGrid grid = render::ClusterGrid::make(kClusterSettings, fly.camera.near);
+    const float tan_half_y = std::tan(0.5f * fly.camera.fov_y);
+    const render::ClusterUniforms cluster_uniforms =
+        render::cluster_uniforms(grid, light_count, static_cast<float>(frame.width()),
+                                 static_cast<float>(frame.height()), tan_half_y * aspect, tan_half_y,
+                                 fly.camera.view());
+    render::GraphBuffer light_list, cluster_table;
+    if (renderer.clusters) {
+        light_list = graph.import_buffer("lights", renderer.light_buffer);
+        cluster_table = graph.import_buffer("clusters", renderer.cluster_buffer);
+        graph.add_compute_pass(
+            "cluster lights",
+            [&](render::PassBuilder& b) {
+                b.read_buffer(light_list);
+                cluster_table = b.write_buffer(cluster_table);
+            },
+            [&](rhi::ComputePass& pass, const render::PassResources& resources) {
+                pass.bind_pipeline(renderer.cluster_kernel);
+                pass.bind_storage_buffer(0, resources.buffer(light_list));
+                pass.push_uniforms(0, &cluster_uniforms, sizeof cluster_uniforms);
+                pass.dispatch((grid.cluster_count() + 63) / 64);
+            });
+    }
 
     // The cascades: fitted to this frame's view, each drawn from the light.
     render::CascadeSet cascades;
@@ -1309,6 +1485,10 @@ void draw_frame(Renderer& renderer, rhi::Frame& frame, scene::World& world, cons
             for (std::uint32_t i = 0; i < cascades.count; ++i) {
                 b.read(shadow_maps[i]);
             }
+            if (renderer.clusters) {
+                b.read_buffer(light_list);
+                b.read_buffer(cluster_table);
+            }
             hdr = b.write_color(hdr, rhi::LoadOp::Clear, kSkyColor);
             depth = b.write_depth(depth, rhi::LoadOp::Clear, 0.0f);
         },
@@ -1322,12 +1502,18 @@ void draw_frame(Renderer& renderer, rhi::Frame& frame, scene::World& world, cons
             }
             pass.bind_pipeline(renderer.mesh_pipeline);
             const FrameUniforms frame_uniforms{{fly.camera.position, 1.0f},
+                                               {fly.camera.forward(), 0.0f},
                                                {light, shading.light_intensity},
                                                {1.0f, 0.97f, 0.92f, shading.ambient},
                                                {static_cast<float>(shading.model),
                                                 static_cast<float>(shading.debug_view), 0.0f, 0.0f}};
             pass.push_fragment_uniforms(0, &frame_uniforms, sizeof(frame_uniforms));
             pass.push_fragment_uniforms(2, &shadow_uniforms, sizeof(shadow_uniforms));
+            pass.push_fragment_uniforms(3, &cluster_uniforms, sizeof(cluster_uniforms));
+            if (renderer.clusters) {
+                pass.bind_fragment_storage_buffer(0, resources.buffer(light_list));
+                pass.bind_fragment_storage_buffer(1, resources.buffer(cluster_table));
+            }
             // Every shadow slot gets a depth texture, since the shader declares
             // four: the cascades, then the last one again, or the 1x1 stand-in
             // when shadows are off (the shader never reads it then).
@@ -1386,6 +1572,13 @@ void draw_frame(Renderer& renderer, rhi::Frame& frame, scene::World& world, cons
             pass.draw(3);
         });
     if (graph.compile()) {
+        // The lights go up before any pass runs: a copy on the frame's
+        // timeline, no wait.
+        const auto light_bytes = static_cast<std::uint32_t>(light_count * sizeof(render::PointLight));
+        if (renderer.clusters && light_count > 0 &&
+            !frame.write_buffer(renderer.light_buffer, lights, light_bytes)) {
+            TY_LOG_ERROR("gpu", "light upload failed: %s", platform::last_error());
+        }
         graph.execute(frame);
     } else {
         TY_LOG_ERROR("graph", "%s", graph.error());
@@ -1507,7 +1700,8 @@ int main(int argc, char** argv) {
                             "L launches it, Escape quits");
     TY_LOG_INFO("controls", "F follows the character: then WASD walk it, Space jumps, Shift runs");
     TY_LOG_INFO("controls", "1/2/3 unlit / Blinn-Phong / Cook-Torrance, N/M/O/V/B debug views, C shows the "
-                            "shadow cascades, X toggles shadows, T tonemap, arrows move the light");
+                            "shadow cascades, K the lights per cluster; X toggles shadows, P the point "
+                            "lights, T tonemap; arrows move the sun");
 
     Renderer renderer = options.headless ? Renderer{} : create_renderer(*window, has_model ? &model_data : nullptr);
     bool reported_swapchain = false;
@@ -1665,7 +1859,7 @@ int main(int argc, char** argv) {
                         TY_LOG_INFO("swap", "%ux%u pixels", frame->width(), frame->height());
                         reported_swapchain = true;
                     }
-                    draw_frame(renderer, *frame, world, fly, shading);
+                    draw_frame(renderer, *frame, world, fly, shading, static_cast<float>(game_time));
                     const std::uint32_t culled = renderer.graph->stats().culled;
                     if (frame_count == 60 || (frame_count > 60 && culled != last_culled)) {
                         report_graph(*renderer.graph);

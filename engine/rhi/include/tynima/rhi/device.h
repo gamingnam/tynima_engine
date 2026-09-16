@@ -21,11 +21,13 @@ namespace tynima::rhi {
 // binds and uploads with a stale handle are refused (and assert in Debug).
 struct ShaderTag {};
 struct PipelineTag {};
+struct ComputePipelineTag {};
 struct BufferTag {};
 struct TextureTag {};
 struct SamplerTag {};
 using ShaderHandle = core::Handle<ShaderTag>;
 using PipelineHandle = core::Handle<PipelineTag>;
+using ComputePipelineHandle = core::Handle<ComputePipelineTag>;
 using BufferHandle = core::Handle<BufferTag>;
 using TextureHandle = core::Handle<TextureTag>;
 using SamplerHandle = core::Handle<SamplerTag>;
@@ -48,11 +50,31 @@ struct ShaderDesc {
     const char* entry_point = "main";
     std::uint32_t num_uniform_buffers = 0; // pushed with RenderPass::push_*_uniforms, slot n = [[buffer(n)]] in MSL
     std::uint32_t num_samplers = 0;
+    std::uint32_t num_storage_buffers = 0; // Storage buffers bound for reading, after the uniforms in MSL
+};
+
+// A compute shader and the counts of what it binds. In MSL the [[buffer(n)]]
+// slots run uniform buffers first, then read-only storage buffers, then the
+// read-write ones (which a compute pass fixes when it begins); sampled
+// textures take [[texture(n)]] with matching [[sampler(n)]].
+struct ComputePipelineDesc {
+    ShaderFormat format = ShaderFormat::Msl;
+    const void* code = nullptr;
+    std::size_t code_size = 0;
+    const char* entry_point = "main";
+    std::uint32_t num_uniform_buffers = 0;
+    std::uint32_t num_readonly_storage_buffers = 0;
+    std::uint32_t num_readwrite_storage_buffers = 0;
+    std::uint32_t num_samplers = 0;
+    std::uint32_t threads_x = 64; // the threadgroup size the shader declares
+    std::uint32_t threads_y = 1;
+    std::uint32_t threads_z = 1;
 };
 
 // ---------------------------------------------------------------- resources
 
-enum class BufferUsage : std::uint8_t { Vertex, Index };
+// Storage: read by any stage as a storage buffer and written by compute.
+enum class BufferUsage : std::uint8_t { Vertex, Index, Storage };
 
 struct BufferDesc {
     BufferUsage usage = BufferUsage::Vertex;
@@ -236,6 +258,16 @@ struct RenderPassDesc {
     std::optional<DepthAttachment> depth;
 };
 
+inline constexpr std::uint32_t kMaxComputeWrites = 4;
+
+// A compute pass: the storage buffers it writes are fixed when it begins,
+// bound in order after the pipeline's read-only ones.
+struct ComputePassDesc {
+    const char* name = nullptr;
+    BufferHandle writes[kMaxComputeWrites]{};
+    std::uint32_t write_count = 0;
+};
+
 // ---------------------------------------------------------------- recording
 
 class Device;
@@ -256,6 +288,9 @@ public:
     // Slot n is [[texture(n)]] and [[sampler(n)]] in the fragment shader; the
     // shader's ShaderDesc::num_samplers must cover it.
     void bind_fragment_texture(std::uint32_t slot, TextureHandle texture, SamplerHandle sampler) noexcept;
+    // A Storage buffer for the fragment shader to read: slot n is
+    // [[buffer(num_uniform_buffers + n)]] in MSL.
+    void bind_fragment_storage_buffer(std::uint32_t slot, BufferHandle buffer) noexcept;
 
     // Uniform data for the next draws; `size` bytes are copied immediately.
     // Slot n is [[buffer(n)]] in MSL. Keep structs 16-byte aligned like the shader expects.
@@ -275,6 +310,35 @@ private:
     void* command_buffer_; // SDL_GPUCommandBuffer*, not owned
     void* pass_;           // SDL_GPURenderPass*
     bool labelled_;        // a debug group was pushed for the pass's name; end() pops it
+};
+
+// Compute work on the frame's command buffer. end() closes it; the
+// destructor closes it if you forget. Never inside a render pass.
+class ComputePass {
+public:
+    ComputePass(ComputePass&& other) noexcept;
+    ComputePass& operator=(ComputePass&& other) noexcept;
+    ComputePass(const ComputePass&) = delete;
+    ComputePass& operator=(const ComputePass&) = delete;
+    ~ComputePass();
+
+    void bind_pipeline(ComputePipelineHandle pipeline) noexcept;
+    // A Storage buffer the shader reads: slot n is [[buffer(num_uniform_buffers + n)]].
+    void bind_storage_buffer(std::uint32_t slot, BufferHandle buffer) noexcept;
+    // Uniform data for the next dispatches; `size` bytes are copied at once.
+    void push_uniforms(std::uint32_t slot, const void* data, std::uint32_t size) noexcept;
+    // Threadgroups, not threads: the pipeline's threads_x/y/z go in each.
+    void dispatch(std::uint32_t groups_x, std::uint32_t groups_y = 1, std::uint32_t groups_z = 1) noexcept;
+    void end() noexcept;
+
+private:
+    friend class Frame;
+    ComputePass(Device* device, void* command_buffer, void* pass, bool labelled) noexcept
+        : device_(device), command_buffer_(command_buffer), pass_(pass), labelled_(labelled) {}
+    Device* device_;
+    void* command_buffer_; // SDL_GPUCommandBuffer*, not owned
+    void* pass_;           // SDL_GPUComputePass*
+    bool labelled_;
 };
 
 // One frame's command buffer and, when the window is visible, its swapchain
@@ -301,6 +365,13 @@ public:
     // platform::last_error()) for no attachments, a destroyed or misused
     // handle, or sizes that differ.
     [[nodiscard]] std::optional<RenderPass> begin_pass(const RenderPassDesc& desc) noexcept;
+    // Begins a compute pass writing the given Storage buffers.
+    [[nodiscard]] std::optional<ComputePass> begin_compute_pass(const ComputePassDesc& desc) noexcept;
+    // Streams `size` bytes into `buffer` at `offset` on this frame's timeline:
+    // every pass begun after this sees them, and nothing waits — per-frame
+    // data (lights, instances) goes this way. Only between passes.
+    [[nodiscard]] bool write_buffer(BufferHandle buffer, const void* data, std::uint32_t size,
+                                    std::uint32_t offset = 0) noexcept;
     // The common case: clear the swapchain image and, if given, the depth
     // texture (which must match the swapchain size), and discard depth after
     // the pass. nullopt when there is no image.
@@ -332,6 +403,7 @@ struct DeviceDesc {
     // the null handle rather than growing.
     std::uint32_t max_shaders = 256;
     std::uint32_t max_pipelines = 256;
+    std::uint32_t max_compute_pipelines = 64;
     std::uint32_t max_buffers = 4096;
     std::uint32_t max_textures = 4096;
     std::uint32_t max_samplers = 64;
@@ -381,6 +453,10 @@ public:
     [[nodiscard]] PipelineHandle create_graphics_pipeline(const GraphicsPipelineDesc& desc) noexcept;
     void destroy_graphics_pipeline(PipelineHandle pipeline) noexcept;
 
+    [[nodiscard]] ComputePipelineHandle create_compute_pipeline(const ComputePipelineDesc& desc) noexcept;
+    void destroy_compute_pipeline(ComputePipelineHandle pipeline) noexcept;
+    [[nodiscard]] bool valid(ComputePipelineHandle handle) const noexcept;
+
     [[nodiscard]] BufferHandle create_buffer(const BufferDesc& desc) noexcept;
     // Copies `size` bytes into `buffer` at `offset` and waits for the copy:
     // for loading, not for per-frame streaming.
@@ -388,6 +464,11 @@ public:
                                      std::uint32_t offset = 0) noexcept;
     [[nodiscard]] BufferHandle create_buffer_with_data(BufferUsage usage, const void* data,
                                                        std::uint32_t size) noexcept;
+    // Copies `size` bytes out of `buffer` at `offset` and waits for the GPU
+    // to finish everything submitted so far: a readback for tests and tools,
+    // never for a frame.
+    [[nodiscard]] bool download_buffer(BufferHandle buffer, void* out, std::uint32_t size,
+                                       std::uint32_t offset = 0) noexcept;
     void destroy_buffer(BufferHandle buffer) noexcept;
 
     [[nodiscard]] TextureHandle create_texture(const TextureDesc& desc) noexcept;
@@ -411,24 +492,31 @@ public:
 
     // Live objects per pool: a leak check, and a view of the budgets.
     struct ResourceCounts {
-        std::uint32_t shaders = 0, pipelines = 0, buffers = 0, textures = 0, samplers = 0;
+        std::uint32_t shaders = 0, pipelines = 0, compute_pipelines = 0, buffers = 0, textures = 0,
+                      samplers = 0;
     };
     [[nodiscard]] ResourceCounts resource_counts() const noexcept;
 
     // Acquires this frame's command buffer and swapchain image; with vsync on
-    // this is where the loop waits for the display. nullopt on error.
+    // this is where the loop waits for the display. nullopt on error. With no
+    // window attached the frame has no image: compute and copies only.
     [[nodiscard]] std::optional<Frame> begin_frame() noexcept;
 
 private:
     friend class Frame;
     friend class RenderPass;
+    friend class ComputePass;
     struct Pools; // the resource pools; complete in device.cpp
     Device(void* device, const DeviceDesc& desc) noexcept;
     [[nodiscard]] bool run_copy_and_wait(void* transfer, void* target, std::uint32_t size, std::uint32_t level_or_offset,
                                          Extent2D extent, bool is_texture) noexcept;
+    // The streaming transfer buffer behind Frame::write_buffer, grown to fit.
+    [[nodiscard]] void* stream_transfer(std::uint32_t size) noexcept;
     void* device_;           // SDL_GPUDevice*
     void* window_ = nullptr; // SDL_Window*, once attached
     Pools* pools_;
+    void* stream_ = nullptr; // SDL_GPUTransferBuffer* for Frame::write_buffer
+    std::uint32_t stream_size_ = 0;
     bool vsync_;
     bool want_linear_swapchain_;
     bool swapchain_linear_ = false;

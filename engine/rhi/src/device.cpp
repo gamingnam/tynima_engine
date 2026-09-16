@@ -24,6 +24,10 @@ struct GraphicsPipeline {
     SDL_GPUGraphicsPipeline* handle;
 };
 
+struct ComputePipeline {
+    SDL_GPUComputePipeline* handle;
+};
+
 struct Buffer {
     SDL_GPUBuffer* handle;
     std::uint32_t size;
@@ -53,6 +57,9 @@ SDL_GPUCommandBuffer* cmd(void* p) noexcept {
 }
 SDL_GPURenderPass* rp(void* p) noexcept {
     return static_cast<SDL_GPURenderPass*>(p);
+}
+SDL_GPUComputePass* cp(void* p) noexcept {
+    return static_cast<SDL_GPUComputePass*>(p);
 }
 
 SDL_GPUShaderFormat to_sdl(ShaderFormat format) noexcept {
@@ -176,6 +183,9 @@ SDL_GPUBufferUsageFlags to_sdl(BufferUsage usage) noexcept {
     switch (usage) {
     case BufferUsage::Vertex: return SDL_GPU_BUFFERUSAGE_VERTEX;
     case BufferUsage::Index: return SDL_GPU_BUFFERUSAGE_INDEX;
+    case BufferUsage::Storage:
+        return SDL_GPU_BUFFERUSAGE_GRAPHICS_STORAGE_READ | SDL_GPU_BUFFERUSAGE_COMPUTE_STORAGE_READ |
+               SDL_GPU_BUFFERUSAGE_COMPUTE_STORAGE_WRITE;
     }
     return SDL_GPU_BUFFERUSAGE_VERTEX;
 }
@@ -206,12 +216,14 @@ SDL_GPUTransferBuffer* stage(SDL_GPUDevice* device, const void* data, std::uint3
 struct Device::Pools {
     core::HandlePool<Shader, ShaderTag> shaders;
     core::HandlePool<GraphicsPipeline, PipelineTag> pipelines;
+    core::HandlePool<ComputePipeline, ComputePipelineTag> compute_pipelines;
     core::HandlePool<Buffer, BufferTag> buffers;
     core::HandlePool<Texture, TextureTag> textures;
     core::HandlePool<Sampler, SamplerTag> samplers;
 
     explicit Pools(const DeviceDesc& desc) noexcept
-        : shaders(desc.max_shaders), pipelines(desc.max_pipelines), buffers(desc.max_buffers),
+        : shaders(desc.max_shaders), pipelines(desc.max_pipelines),
+          compute_pipelines(desc.max_compute_pipelines), buffers(desc.max_buffers),
           textures(desc.max_textures), samplers(desc.max_samplers) {}
 };
 
@@ -310,6 +322,16 @@ void RenderPass::bind_fragment_texture(std::uint32_t slot, TextureHandle texture
     }
 }
 
+void RenderPass::bind_fragment_storage_buffer(std::uint32_t slot, BufferHandle buffer) noexcept {
+    TY_EXTERNAL_ALLOCATIONS();
+    const Buffer* object = device_->pools_->buffers.get(buffer);
+    TY_ASSERT(object != nullptr, "bind_fragment_storage_buffer: null or destroyed buffer handle");
+    if (object != nullptr) {
+        SDL_GPUBuffer* const handle = object->handle;
+        SDL_BindGPUFragmentStorageBuffers(rp(pass_), slot, &handle, 1);
+    }
+}
+
 void RenderPass::push_vertex_uniforms(std::uint32_t slot, const void* data, std::uint32_t size) noexcept {
     TY_EXTERNAL_ALLOCATIONS();
     SDL_PushGPUVertexUniformData(cmd(command_buffer_), slot, data, size);
@@ -335,6 +357,67 @@ void RenderPass::end() noexcept {
     TY_EXTERNAL_ALLOCATIONS();
     if (pass_ != nullptr) {
         SDL_EndGPURenderPass(rp(pass_));
+        pass_ = nullptr;
+        if (labelled_) {
+            SDL_PopGPUDebugGroup(cmd(command_buffer_));
+        }
+    }
+}
+
+// --------------------------------------------------------------- ComputePass
+
+ComputePass::ComputePass(ComputePass&& other) noexcept
+    : device_(other.device_), command_buffer_(other.command_buffer_),
+      pass_(std::exchange(other.pass_, nullptr)), labelled_(other.labelled_) {}
+
+ComputePass& ComputePass::operator=(ComputePass&& other) noexcept {
+    if (this != &other) {
+        end();
+        device_ = other.device_;
+        command_buffer_ = other.command_buffer_;
+        pass_ = std::exchange(other.pass_, nullptr);
+        labelled_ = other.labelled_;
+    }
+    return *this;
+}
+
+ComputePass::~ComputePass() {
+    end();
+}
+
+void ComputePass::bind_pipeline(ComputePipelineHandle pipeline) noexcept {
+    TY_EXTERNAL_ALLOCATIONS();
+    const ComputePipeline* object = device_->pools_->compute_pipelines.get(pipeline);
+    TY_ASSERT(object != nullptr, "ComputePass::bind_pipeline: null or destroyed pipeline handle");
+    if (object != nullptr) {
+        SDL_BindGPUComputePipeline(cp(pass_), object->handle);
+    }
+}
+
+void ComputePass::bind_storage_buffer(std::uint32_t slot, BufferHandle buffer) noexcept {
+    TY_EXTERNAL_ALLOCATIONS();
+    const Buffer* object = device_->pools_->buffers.get(buffer);
+    TY_ASSERT(object != nullptr, "ComputePass::bind_storage_buffer: null or destroyed buffer handle");
+    if (object != nullptr) {
+        SDL_GPUBuffer* const handle = object->handle;
+        SDL_BindGPUComputeStorageBuffers(cp(pass_), slot, &handle, 1);
+    }
+}
+
+void ComputePass::push_uniforms(std::uint32_t slot, const void* data, std::uint32_t size) noexcept {
+    TY_EXTERNAL_ALLOCATIONS();
+    SDL_PushGPUComputeUniformData(cmd(command_buffer_), slot, data, size);
+}
+
+void ComputePass::dispatch(std::uint32_t groups_x, std::uint32_t groups_y, std::uint32_t groups_z) noexcept {
+    TY_EXTERNAL_ALLOCATIONS();
+    SDL_DispatchGPUCompute(cp(pass_), groups_x, groups_y, groups_z);
+}
+
+void ComputePass::end() noexcept {
+    TY_EXTERNAL_ALLOCATIONS();
+    if (pass_ != nullptr) {
+        SDL_EndGPUComputePass(cp(pass_));
         pass_ = nullptr;
         if (labelled_) {
             SDL_PopGPUDebugGroup(cmd(command_buffer_));
@@ -457,6 +540,85 @@ std::optional<RenderPass> Frame::begin_pass(const RenderPassDesc& desc) noexcept
     return RenderPass(device_, command_buffer_, pass, labelled);
 }
 
+std::optional<ComputePass> Frame::begin_compute_pass(const ComputePassDesc& desc) noexcept {
+    TY_EXTERNAL_ALLOCATIONS();
+    if (command_buffer_ == nullptr) {
+        SDL_SetError("rhi::Frame::begin_compute_pass: the frame was submitted");
+        return std::nullopt;
+    }
+    if (desc.write_count > kMaxComputeWrites) {
+        SDL_SetError("rhi::Frame::begin_compute_pass: %u buffers written (at most %u)", desc.write_count,
+                     kMaxComputeWrites);
+        return std::nullopt;
+    }
+    SDL_GPUStorageBufferReadWriteBinding writes[kMaxComputeWrites]{};
+    for (std::uint32_t i = 0; i < desc.write_count; ++i) {
+        const Buffer* object = device_->pools_->buffers.get(desc.writes[i]);
+        TY_ASSERT(object != nullptr, "rhi::Frame::begin_compute_pass: null or destroyed buffer handle");
+        if (object == nullptr) {
+            SDL_SetError("rhi::Frame::begin_compute_pass: written buffer %u is null or destroyed", i);
+            return std::nullopt;
+        }
+        writes[i].buffer = object->handle;
+        writes[i].cycle = false; // what was there stays: a pass may update a table in place
+    }
+    const bool labelled = desc.name != nullptr;
+    if (labelled) {
+        SDL_PushGPUDebugGroup(cmd(command_buffer_), desc.name);
+    }
+    SDL_GPUComputePass* pass =
+        SDL_BeginGPUComputePass(cmd(command_buffer_), nullptr, 0, writes, desc.write_count);
+    if (pass == nullptr) {
+        if (labelled) {
+            SDL_PopGPUDebugGroup(cmd(command_buffer_));
+        }
+        return std::nullopt;
+    }
+    return ComputePass(device_, command_buffer_, pass, labelled);
+}
+
+bool Frame::write_buffer(BufferHandle buffer, const void* data, std::uint32_t size,
+                         std::uint32_t offset) noexcept {
+    TY_EXTERNAL_ALLOCATIONS();
+    if (command_buffer_ == nullptr) {
+        SDL_SetError("rhi::Frame::write_buffer: the frame was submitted");
+        return false;
+    }
+    const Buffer* object = device_->pools_->buffers.get(buffer);
+    if (object == nullptr) {
+        SDL_SetError("rhi::Frame::write_buffer: null or destroyed buffer handle");
+        return false;
+    }
+    if (size == 0 || offset + size > object->size) {
+        SDL_SetError("rhi::Frame::write_buffer: %u bytes at %u do not fit a %u byte buffer", size, offset,
+                     object->size);
+        return false;
+    }
+    SDL_GPUTransferBuffer* transfer = static_cast<SDL_GPUTransferBuffer*>(device_->stream_transfer(size));
+    if (transfer == nullptr) {
+        return false;
+    }
+    // Cycling the transfer buffer hands us fresh memory if the last write is
+    // still being copied; cycling the destination likewise, when the whole
+    // buffer is replaced — anything still reading last frame's contents keeps
+    // them, and nothing waits.
+    void* mapped = SDL_MapGPUTransferBuffer(dev(device_->device_), transfer, true);
+    if (mapped == nullptr) {
+        return false;
+    }
+    std::memcpy(mapped, data, size);
+    SDL_UnmapGPUTransferBuffer(dev(device_->device_), transfer);
+    SDL_GPUCopyPass* copy = SDL_BeginGPUCopyPass(cmd(command_buffer_));
+    if (copy == nullptr) {
+        return false;
+    }
+    const SDL_GPUTransferBufferLocation source{transfer, 0};
+    const SDL_GPUBufferRegion destination{object->handle, offset, size};
+    SDL_UploadToGPUBuffer(copy, &source, &destination, offset == 0 && size == object->size);
+    SDL_EndGPUCopyPass(copy);
+    return true;
+}
+
 std::optional<RenderPass> Frame::begin_swapchain_pass(const ClearColor& clear, TextureHandle depth,
                                                       float depth_clear) noexcept {
     if (!swapchain_) {
@@ -510,14 +672,24 @@ Device::~Device() {
     // Whatever is still alive is a leak by the caller; release it anyway so
     // the driver does not keep it, and say so.
     const ResourceCounts leaked = resource_counts();
-    if (leaked.shaders + leaked.pipelines + leaked.buffers + leaked.textures + leaked.samplers > 0) {
-        TY_LOG_WARN("rhi", "%u shader(s), %u pipeline(s), %u buffer(s), %u texture(s), %u sampler(s) were never "
-                           "destroyed",
-                    leaked.shaders, leaked.pipelines, leaked.buffers, leaked.textures, leaked.samplers);
+    if (leaked.shaders + leaked.pipelines + leaked.compute_pipelines + leaked.buffers + leaked.textures +
+            leaked.samplers >
+        0) {
+        TY_LOG_WARN("rhi",
+                    "%u shader(s), %u pipeline(s), %u compute pipeline(s), %u buffer(s), %u texture(s), "
+                    "%u sampler(s) were never destroyed",
+                    leaked.shaders, leaked.pipelines, leaked.compute_pipelines, leaked.buffers,
+                    leaked.textures, leaked.samplers);
     }
     pools_->pipelines.for_each([&](PipelineHandle, GraphicsPipeline& p) {
         SDL_ReleaseGPUGraphicsPipeline(dev(device_), p.handle);
     });
+    pools_->compute_pipelines.for_each([&](ComputePipelineHandle, ComputePipeline& p) {
+        SDL_ReleaseGPUComputePipeline(dev(device_), p.handle);
+    });
+    if (stream_ != nullptr) {
+        SDL_ReleaseGPUTransferBuffer(dev(device_), static_cast<SDL_GPUTransferBuffer*>(stream_));
+    }
     pools_->shaders.for_each([&](ShaderHandle, Shader& s) { SDL_ReleaseGPUShader(dev(device_), s.handle); });
     pools_->buffers.for_each([&](BufferHandle, Buffer& b) { SDL_ReleaseGPUBuffer(dev(device_), b.handle); });
     pools_->textures.for_each([&](TextureHandle, Texture& t) { SDL_ReleaseGPUTexture(dev(device_), t.handle); });
@@ -598,6 +770,9 @@ bool Device::valid(ShaderHandle handle) const noexcept {
 bool Device::valid(PipelineHandle handle) const noexcept {
     return pools_->pipelines.contains(handle);
 }
+bool Device::valid(ComputePipelineHandle handle) const noexcept {
+    return pools_->compute_pipelines.get(handle) != nullptr;
+}
 bool Device::valid(BufferHandle handle) const noexcept {
     return pools_->buffers.contains(handle);
 }
@@ -609,8 +784,8 @@ bool Device::valid(SamplerHandle handle) const noexcept {
 }
 
 Device::ResourceCounts Device::resource_counts() const noexcept {
-    return {pools_->shaders.size(), pools_->pipelines.size(), pools_->buffers.size(), pools_->textures.size(),
-            pools_->samplers.size()};
+    return {pools_->shaders.size(),  pools_->pipelines.size(), pools_->compute_pipelines.size(),
+            pools_->buffers.size(), pools_->textures.size(),  pools_->samplers.size()};
 }
 
 ShaderHandle Device::create_shader(const ShaderDesc& desc) noexcept {
@@ -627,6 +802,7 @@ ShaderHandle Device::create_shader(const ShaderDesc& desc) noexcept {
     info.stage = desc.stage == ShaderStage::Vertex ? SDL_GPU_SHADERSTAGE_VERTEX : SDL_GPU_SHADERSTAGE_FRAGMENT;
     info.num_samplers = desc.num_samplers;
     info.num_uniform_buffers = desc.num_uniform_buffers;
+    info.num_storage_buffers = desc.num_storage_buffers;
     SDL_GPUShader* handle = SDL_CreateGPUShader(dev(device_), &info);
     if (handle == nullptr) {
         return {};
@@ -733,6 +909,117 @@ void Device::destroy_graphics_pipeline(PipelineHandle pipeline) noexcept {
         SDL_ReleaseGPUGraphicsPipeline(dev(device_), object->handle);
         pools_->pipelines.destroy(pipeline);
     }
+}
+
+ComputePipelineHandle Device::create_compute_pipeline(const ComputePipelineDesc& desc) noexcept {
+    TY_EXTERNAL_ALLOCATIONS();
+    if (desc.code == nullptr || desc.code_size == 0) {
+        SDL_SetError("rhi::Device::create_compute_pipeline: no shader code");
+        return {};
+    }
+    if (desc.threads_x == 0 || desc.threads_y == 0 || desc.threads_z == 0) {
+        SDL_SetError("rhi::Device::create_compute_pipeline: a threadgroup dimension is zero");
+        return {};
+    }
+    if (pools_->compute_pipelines.full()) {
+        SDL_SetError("rhi: compute pipeline budget of %u exhausted", pools_->compute_pipelines.capacity());
+        return {};
+    }
+    SDL_GPUComputePipelineCreateInfo info{};
+    info.code_size = desc.code_size;
+    info.code = static_cast<const Uint8*>(desc.code);
+    info.entrypoint = desc.entry_point;
+    info.format = to_sdl(desc.format);
+    info.num_samplers = desc.num_samplers;
+    info.num_readonly_storage_buffers = desc.num_readonly_storage_buffers;
+    info.num_readwrite_storage_buffers = desc.num_readwrite_storage_buffers;
+    info.num_uniform_buffers = desc.num_uniform_buffers;
+    info.threadcount_x = desc.threads_x;
+    info.threadcount_y = desc.threads_y;
+    info.threadcount_z = desc.threads_z;
+    SDL_GPUComputePipeline* handle = SDL_CreateGPUComputePipeline(dev(device_), &info);
+    if (handle == nullptr) {
+        return {};
+    }
+    return pools_->compute_pipelines.create(ComputePipeline{handle});
+}
+
+void Device::destroy_compute_pipeline(ComputePipelineHandle pipeline) noexcept {
+    TY_EXTERNAL_ALLOCATIONS();
+    if (const ComputePipeline* object = pools_->compute_pipelines.get(pipeline)) {
+        SDL_ReleaseGPUComputePipeline(dev(device_), object->handle);
+        pools_->compute_pipelines.destroy(pipeline);
+    }
+}
+
+void* Device::stream_transfer(std::uint32_t size) noexcept {
+    if (stream_ != nullptr && stream_size_ >= size) {
+        return stream_;
+    }
+    // Grown in steps, so a few frames of growth settle it; the old one is
+    // released — SDL keeps it alive for whatever is still copying from it.
+    std::uint32_t new_size = stream_size_ > 0 ? stream_size_ : 64 * 1024;
+    while (new_size < size) {
+        new_size *= 2;
+    }
+    SDL_GPUTransferBufferCreateInfo info{};
+    info.usage = SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD;
+    info.size = new_size;
+    SDL_GPUTransferBuffer* transfer = SDL_CreateGPUTransferBuffer(dev(device_), &info);
+    if (transfer == nullptr) {
+        return nullptr;
+    }
+    if (stream_ != nullptr) {
+        SDL_ReleaseGPUTransferBuffer(dev(device_), static_cast<SDL_GPUTransferBuffer*>(stream_));
+    }
+    stream_ = transfer;
+    stream_size_ = new_size;
+    return stream_;
+}
+
+bool Device::download_buffer(BufferHandle buffer, void* out, std::uint32_t size,
+                             std::uint32_t offset) noexcept {
+    TY_PROFILE_SCOPE_NAMED("rhi::download_buffer");
+    TY_EXTERNAL_ALLOCATIONS();
+    const Buffer* object = pools_->buffers.get(buffer);
+    if (object == nullptr) {
+        SDL_SetError("rhi::Device::download_buffer: null or destroyed buffer handle");
+        return false;
+    }
+    if (size == 0 || offset + size > object->size) {
+        SDL_SetError("rhi::Device::download_buffer: %u bytes at %u do not fit a %u byte buffer", size, offset,
+                     object->size);
+        return false;
+    }
+    SDL_GPUTransferBufferCreateInfo info{};
+    info.usage = SDL_GPU_TRANSFERBUFFERUSAGE_DOWNLOAD;
+    info.size = size;
+    SDL_GPUTransferBuffer* transfer = SDL_CreateGPUTransferBuffer(dev(device_), &info);
+    if (transfer == nullptr) {
+        return false;
+    }
+    bool ok = false;
+    if (SDL_GPUCommandBuffer* command_buffer = SDL_AcquireGPUCommandBuffer(dev(device_))) {
+        SDL_GPUCopyPass* copy = SDL_BeginGPUCopyPass(command_buffer);
+        const SDL_GPUBufferRegion source{object->handle, offset, size};
+        const SDL_GPUTransferBufferLocation destination{transfer, 0};
+        SDL_DownloadFromGPUBuffer(copy, &source, &destination);
+        SDL_EndGPUCopyPass(copy);
+        if (SDL_GPUFence* fence = SDL_SubmitGPUCommandBufferAndAcquireFence(command_buffer)) {
+            ok = SDL_WaitForGPUFences(dev(device_), true, &fence, 1);
+            SDL_ReleaseGPUFence(dev(device_), fence);
+        }
+    }
+    if (ok) {
+        if (void* mapped = SDL_MapGPUTransferBuffer(dev(device_), transfer, false)) {
+            std::memcpy(out, mapped, size);
+            SDL_UnmapGPUTransferBuffer(dev(device_), transfer);
+        } else {
+            ok = false;
+        }
+    }
+    SDL_ReleaseGPUTransferBuffer(dev(device_), transfer);
+    return ok;
 }
 
 BufferHandle Device::create_buffer(const BufferDesc& desc) noexcept {
@@ -1002,13 +1289,13 @@ void Device::destroy_sampler(SamplerHandle sampler) noexcept {
 
 std::optional<Frame> Device::begin_frame() noexcept {
     TY_EXTERNAL_ALLOCATIONS();
-    if (window_ == nullptr) {
-        SDL_SetError("rhi::Device::begin_frame: no window attached");
-        return std::nullopt;
-    }
     SDL_GPUCommandBuffer* command_buffer = SDL_AcquireGPUCommandBuffer(dev(device_));
     if (command_buffer == nullptr) {
         return std::nullopt;
+    }
+    if (window_ == nullptr) {
+        // No window: a frame of compute and copies, with nothing to present.
+        return Frame(this, command_buffer, TextureHandle{}, 0, 0);
     }
     SDL_GPUTexture* texture = nullptr;
     Uint32 width = 0;
