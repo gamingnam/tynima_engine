@@ -4,6 +4,7 @@
 
 #include <doctest/doctest.h>
 
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <string>
@@ -620,6 +621,130 @@ kernel void cs_main(constant Params& p [[buffer(0)]], const device uint* in [[bu
             device->destroy_compute_pipeline(pipeline);
             CHECK(device->resource_counts().compute_pipelines == 0);
             CHECK(device->resource_counts().buffers == 0);
+        }
+    }
+}
+
+TEST_CASE("an attachment written and read back in one pass, through the tile, never stored") {
+    // The fused-pass idea at its smallest: one draw fills a scratch
+    // attachment, a second reads it as a [[color(n)]] input in the same
+    // pass and writes the result to the attachment that is kept. The scratch
+    // is memoryless where the backend can make it so, and never stored
+    // anywhere.
+    constexpr const char* kFusedMsl = R"(
+#include <metal_stdlib>
+using namespace metal;
+struct VSOut { float4 position [[position]]; };
+constant float2 kCorners[3] = { float2(-1.0, -1.0), float2(3.0, -1.0), float2(-1.0, 3.0) };
+vertex VSOut vs_main(uint vid [[vertex_id]]) {
+    VSOut out;
+    out.position = float4(kCorners[vid], 0.0, 1.0);
+    return out;
+}
+struct ScratchOut { float4 scratch [[color(1)]]; };
+fragment ScratchOut fs_write(VSOut in [[stage_in]]) {
+    ScratchOut out;
+    out.scratch = float4(1.0, 0.5, 0.0, 1.0);
+    return out;
+}
+struct ScratchIn { float4 scratch [[color(1)]]; };
+fragment float4 fs_read(VSOut in [[stage_in]], ScratchIn g) { return g.scratch * 0.5 + 0.25; }
+)";
+    Session session;
+    for (const rhi::Backend backend : kBackends) {
+        SUBCASE(rhi::backend_name(backend)) {
+            auto device = make_device(backend);
+            if (device == nullptr) {
+                continue;
+            }
+            MESSAGE(std::string(rhi::backend_name(backend)), device->supports_memoryless()
+                                                                 ? ": memoryless attachments"
+                                                                 : ": no memoryless attachments");
+            const rhi::ShaderHandle vs =
+                device->create_shader(msl_shader(rhi::ShaderStage::Vertex, "vs_main", kFusedMsl));
+            const rhi::ShaderHandle write_fs =
+                device->create_shader(msl_shader(rhi::ShaderStage::Fragment, "fs_write", kFusedMsl));
+            const rhi::ShaderHandle read_fs =
+                device->create_shader(msl_shader(rhi::ShaderStage::Fragment, "fs_read", kFusedMsl));
+            REQUIRE_MESSAGE(static_cast<bool>(vs), platform::last_error());
+            REQUIRE_MESSAGE(static_cast<bool>(write_fs), platform::last_error());
+            REQUIRE_MESSAGE(static_cast<bool>(read_fs), platform::last_error());
+            rhi::GraphicsPipelineDesc write{.vertex_shader = vs, .fragment_shader = write_fs};
+            write.color_formats[0] = rhi::TextureFormat::Rgba8Unorm;
+            write.color_formats[1] = rhi::TextureFormat::Rgba8Unorm;
+            write.color_target_count = 2;
+            write.color_write[0] = false; // this draw touches the scratch only
+            rhi::GraphicsPipelineDesc read = write;
+            read.fragment_shader = read_fs;
+            read.color_write[0] = true;
+            read.color_write[1] = false; // and this one the kept attachment only
+            const rhi::PipelineHandle write_pipeline = device->create_graphics_pipeline(write);
+            const rhi::PipelineHandle read_pipeline = device->create_graphics_pipeline(read);
+            REQUIRE_MESSAGE(static_cast<bool>(write_pipeline), platform::last_error());
+            REQUIRE_MESSAGE(static_cast<bool>(read_pipeline), platform::last_error());
+            device->destroy_shader(vs);
+            device->destroy_shader(write_fs);
+            device->destroy_shader(read_fs);
+
+            const rhi::TextureHandle kept = device->create_texture({.format = rhi::TextureFormat::Rgba8Unorm,
+                                                                    .width = 8,
+                                                                    .height = 8,
+                                                                    .usage = rhi::TextureUsage::ColorTarget});
+            const rhi::TextureHandle scratch =
+                device->create_texture({.format = rhi::TextureFormat::Rgba8Unorm,
+                                        .width = 8,
+                                        .height = 8,
+                                        .usage = rhi::TextureUsage::ColorTarget,
+                                        .memoryless = device->supports_memoryless()});
+            REQUIRE_MESSAGE(static_cast<bool>(kept), platform::last_error());
+            REQUIRE_MESSAGE(static_cast<bool>(scratch), platform::last_error());
+            // A memoryless texture cannot be sampled, so asking for that is refused.
+            if (device->supports_memoryless()) {
+                CHECK_FALSE(device->create_texture(
+                    {.format = rhi::TextureFormat::Rgba8Unorm,
+                     .width = 8,
+                     .height = 8,
+                     .usage = rhi::TextureUsage::ColorTarget | rhi::TextureUsage::Sampled,
+                     .memoryless = true}));
+            }
+
+            auto frame = device->begin_frame();
+            REQUIRE_MESSAGE(frame.has_value(), platform::last_error());
+            rhi::RenderPassDesc desc{.name = "fused"};
+            desc.colors[0] = {.texture = kept, .load = rhi::LoadOp::Clear, .store = rhi::StoreOp::Store};
+            desc.colors[1] = {
+                .texture = scratch, .load = rhi::LoadOp::DontCare, .store = rhi::StoreOp::DontCare};
+            desc.color_count = 2;
+            {
+                auto pass = frame->begin_pass(desc);
+                REQUIRE_MESSAGE(pass.has_value(), platform::last_error());
+                pass->bind_pipeline(write_pipeline);
+                pass->draw(3);
+                pass->bind_pipeline(read_pipeline);
+                pass->draw(3);
+                pass->end();
+            }
+            frame->submit();
+
+            std::uint8_t pixels[8 * 8 * 4];
+            REQUIRE_MESSAGE(device->download_texture(kept, pixels, sizeof pixels), platform::last_error());
+            // (1, 0.5, 0, 1) * 0.5 + 0.25 = (0.75, 0.5, 0.25, 0.75): 191, 128, 64, 191, give or take one.
+            int wrong = 0;
+            for (int i = 0; i < 64; ++i) {
+                const std::uint8_t* p = pixels + i * 4;
+                wrong += std::abs(int{p[0]} - 191) <= 1 && std::abs(int{p[1]} - 128) <= 1 &&
+                                 std::abs(int{p[2]} - 64) <= 1 && std::abs(int{p[3]} - 191) <= 1
+                             ? 0
+                             : 1;
+            }
+            MESSAGE("pixel 0: ", int{pixels[0]}, " ", int{pixels[1]}, " ", int{pixels[2]}, " ",
+                    int{pixels[3]});
+            CHECK(wrong == 0);
+
+            device->destroy_texture(kept);
+            device->destroy_texture(scratch);
+            device->destroy_graphics_pipeline(write_pipeline);
+            device->destroy_graphics_pipeline(read_pipeline);
         }
     }
 }

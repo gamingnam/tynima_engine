@@ -37,9 +37,10 @@
 //   unused for a while.
 // - Load/store: a write that nothing reads afterwards is stored DontCare —
 //   which is what lets a tile-based GPU keep it on-chip and never write it
-//   out. A transient never stored and never sampled is noted as one that
-//   could live entirely in tile memory (memoryless on Metal; Phase 4's
-//   native backend acts on that, SDL GPU cannot).
+//   out. A transient never stored and never sampled lives entirely in tile
+//   memory: on the native Metal backend the graph creates it memoryless,
+//   and it never takes a byte of DRAM (SDL GPU cannot, and gets an ordinary
+//   texture that is simply never written out).
 //
 // Buffers go through the graph too, as imported resources (a light list the
 // frame streams in, a cluster table a compute pass fills): a compute pass
@@ -199,7 +200,8 @@ public:
         std::uint32_t transients_used = 0;
         std::uint32_t physical_textures = 0; // in use this frame
         std::uint64_t bytes_requested = 0;   // every used transient at full size
-        std::uint64_t bytes_allocated = 0;   // what the physical textures take
+        std::uint64_t bytes_allocated = 0;   // what the physical textures take in memory
+        std::uint64_t bytes_memoryless = 0;  // what the memoryless ones would have taken
         std::uint32_t attachments_stored = 0;
         std::uint32_t attachments_discarded = 0;
         std::uint32_t memoryless = 0;
@@ -280,6 +282,7 @@ private:
         rhi::TextureHandle handle;
         TextureInfo info{};
         rhi::TextureUsage usage = rhi::TextureUsage::Default;
+        bool memoryless = false; // tile memory only: created so on a backend that can
         bool used_this_frame = false;
         std::uint32_t last_use = kNone; // in this frame's execution order
         std::uint32_t idle_frames = 0;

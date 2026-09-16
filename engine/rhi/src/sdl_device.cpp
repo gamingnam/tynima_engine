@@ -143,6 +143,8 @@ SDL_GPUTextureFormat to_sdl(TextureFormat format) noexcept {
         return SDL_GPU_TEXTUREFORMAT_B8G8R8A8_UNORM_SRGB;
     case TextureFormat::Rgba16Float:
         return SDL_GPU_TEXTUREFORMAT_R16G16B16A16_FLOAT;
+    case TextureFormat::Rg32Float:
+        return SDL_GPU_TEXTUREFORMAT_R32G32_FLOAT;
     case TextureFormat::Depth32Float:
         return SDL_GPU_TEXTUREFORMAT_D32_FLOAT;
     case TextureFormat::Depth24Stencil8:
@@ -259,6 +261,7 @@ public:
     ShaderFormat shader_format() const noexcept override;
     TextureFormat preferred_depth_format() const noexcept override;
     bool supports_texture(TextureFormat format, TextureUsage usage) const noexcept override;
+    bool supports_memoryless() const noexcept override { return false; }
     bool swapchain_is_linear() const noexcept override { return swapchain_linear_; }
     TextureFormat swapchain_format() const noexcept override { return swapchain_format_; }
 
@@ -286,10 +289,12 @@ public:
     bool upload_texture(TextureHandle texture, const void* pixels, std::uint32_t size,
                         std::uint32_t mip_level) noexcept override;
     bool generate_mipmaps(TextureHandle texture) noexcept override;
+    bool download_texture(TextureHandle texture, void* out, std::uint32_t size) noexcept override;
     void destroy_texture(TextureHandle texture) noexcept override;
     SamplerHandle create_sampler(const SamplerDesc& desc) noexcept override;
     void destroy_sampler(SamplerHandle sampler) noexcept override;
     ResourceCounts resource_counts() const noexcept override;
+    GpuStats gpu_stats() const noexcept override { return {}; } // SDL GPU has no counters to ask
     std::optional<Frame> begin_frame() noexcept override;
 
 protected:
@@ -869,6 +874,10 @@ PipelineHandle SdlDevice::create_graphics_pipeline(const GraphicsPipelineDesc& d
     SDL_GPUColorTargetDescription colors[kMaxColorTargets]{};
     for (std::uint32_t i = 0; i < desc.color_target_count; ++i) {
         colors[i].format = to_sdl(desc.color_formats[i]);
+        if (!desc.color_write[i]) {
+            colors[i].blend_state.enable_color_write_mask = true;
+            colors[i].blend_state.color_write_mask = 0;
+        }
     }
 
     SDL_GPUVertexBufferDescription vertex_buffer{};
@@ -1016,6 +1025,58 @@ bool SdlDevice::download_buffer(BufferHandle buffer, void* out, std::uint32_t si
         const SDL_GPUBufferRegion source{object->handle, offset, size};
         const SDL_GPUTransferBufferLocation destination{transfer, 0};
         SDL_DownloadFromGPUBuffer(copy, &source, &destination);
+        SDL_EndGPUCopyPass(copy);
+        if (SDL_GPUFence* fence = SDL_SubmitGPUCommandBufferAndAcquireFence(command_buffer)) {
+            ok = SDL_WaitForGPUFences(dev(device_), true, &fence, 1);
+            SDL_ReleaseGPUFence(dev(device_), fence);
+        }
+    }
+    if (ok) {
+        if (void* mapped = SDL_MapGPUTransferBuffer(dev(device_), transfer, false)) {
+            std::memcpy(out, mapped, size);
+            SDL_UnmapGPUTransferBuffer(dev(device_), transfer);
+        } else {
+            ok = false;
+        }
+    }
+    SDL_ReleaseGPUTransferBuffer(dev(device_), transfer);
+    return ok;
+}
+
+bool SdlDevice::download_texture(TextureHandle texture, void* out, std::uint32_t size) noexcept {
+    TY_PROFILE_SCOPE_NAMED("rhi::download_texture");
+    TY_EXTERNAL_ALLOCATIONS();
+    const Texture* object = pools_->textures.get(texture);
+    if (object == nullptr || object->borrowed) {
+        SDL_SetError("rhi::Device::download_texture: null, destroyed or borrowed texture handle");
+        return false;
+    }
+    const std::uint32_t expected =
+        object->extent.width * object->extent.height * bytes_per_pixel(object->format);
+    if (is_depth_format(object->format) || expected == 0 || size != expected) {
+        SDL_SetError("rhi::Device::download_texture: a color texture of %u bytes, got %u", expected, size);
+        return false;
+    }
+    SDL_GPUTransferBufferCreateInfo info{};
+    info.usage = SDL_GPU_TRANSFERBUFFERUSAGE_DOWNLOAD;
+    info.size = size;
+    SDL_GPUTransferBuffer* transfer = SDL_CreateGPUTransferBuffer(dev(device_), &info);
+    if (transfer == nullptr) {
+        return false;
+    }
+    bool ok = false;
+    if (SDL_GPUCommandBuffer* command_buffer = SDL_AcquireGPUCommandBuffer(dev(device_))) {
+        SDL_GPUCopyPass* copy = SDL_BeginGPUCopyPass(command_buffer);
+        SDL_GPUTextureRegion source{};
+        source.texture = object->handle;
+        source.w = object->extent.width;
+        source.h = object->extent.height;
+        source.d = 1;
+        SDL_GPUTextureTransferInfo destination{};
+        destination.transfer_buffer = transfer;
+        destination.pixels_per_row = object->extent.width;
+        destination.rows_per_layer = object->extent.height;
+        SDL_DownloadFromGPUTexture(copy, &source, &destination);
         SDL_EndGPUCopyPass(copy);
         if (SDL_GPUFence* fence = SDL_SubmitGPUCommandBufferAndAcquireFence(command_buffer)) {
             ok = SDL_WaitForGPUFences(dev(device_), true, &fence, 1);

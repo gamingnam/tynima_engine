@@ -43,6 +43,8 @@ const char* texture_format_name(TextureFormat format) noexcept {
         return "BGRA8_SRGB";
     case TextureFormat::Rgba16Float:
         return "RGBA16_FLOAT";
+    case TextureFormat::Rg32Float:
+        return "RG32_FLOAT";
     case TextureFormat::Depth32Float:
         return "D32_FLOAT";
     case TextureFormat::Depth24Stencil8:
@@ -110,6 +112,14 @@ std::unique_ptr<Device> Device::create(const DeviceDesc& desc) {
         return nullptr;
 #endif
     case Backend::Auto:
+#if defined(__APPLE__)
+        // The engine's own path onto Apple GPUs, where it exists; SDL GPU if
+        // it somehow does not.
+        if (std::unique_ptr<Device> metal = create_metal_device(desc)) {
+            return metal;
+        }
+#endif
+        return create_sdl_device(desc);
     case Backend::SdlGpu:
         return create_sdl_device(desc);
     }

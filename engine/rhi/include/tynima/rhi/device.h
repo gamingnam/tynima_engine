@@ -85,13 +85,15 @@ struct BufferDesc {
 // linear when sampling — the right format for color textures authored for
 // the eye (base color, emissive); data textures (normals, roughness) stay
 // Unorm. The Bgra8 pair is what swapchains come in; Rgba16Float is the
-// working format for light before tonemapping.
+// working format for light before tonemapping; Rg32Float holds two exact
+// floats (a G-buffer's depth, say).
 enum class TextureFormat : std::uint8_t {
     Rgba8Unorm,
     Rgba8Srgb,
     Bgra8Unorm,
     Bgra8Srgb,
     Rgba16Float,
+    Rg32Float,
     Depth32Float,
     Depth24Stencil8,
     Depth16
@@ -113,6 +115,7 @@ const char* texture_format_name(TextureFormat format) noexcept;
     case TextureFormat::Depth24Stencil8:
         return 4;
     case TextureFormat::Rgba16Float:
+    case TextureFormat::Rg32Float:
         return 8;
     case TextureFormat::Depth16:
         return 2;
@@ -138,6 +141,11 @@ struct TextureDesc {
     std::uint32_t height = 0;
     std::uint32_t mip_levels = 1; // 0 = full chain
     TextureUsage usage = TextureUsage::Default;
+    // A texture that exists only in tile memory, for the length of a pass:
+    // an attachment that is cleared or don't-cared in and don't-cared out and
+    // never sampled — it takes no memory at all. Only a render target, only
+    // one level. Where the backend cannot (SDL GPU), an ordinary texture.
+    bool memoryless = false;
 };
 
 struct Extent2D {
@@ -217,6 +225,10 @@ struct GraphicsPipelineDesc {
     DepthState depth{};
     TextureFormat color_formats[kMaxColorTargets]{};
     std::uint32_t color_target_count = 0;
+    // false leaves a color target as it is: a draw that reads an attachment
+    // in place (MSL's [[color(n)]] inputs, on tile-based GPUs) and writes
+    // another declares the ones it only reads this way.
+    bool color_write[kMaxColorTargets] = {true, true, true, true};
     std::optional<TextureFormat> depth_format; // nullopt: no depth target
 };
 
@@ -400,7 +412,7 @@ enum class Backend : std::uint8_t { Auto, SdlGpu, Metal };
 const char* backend_name(Backend backend) noexcept;
 
 struct DeviceDesc {
-    Backend backend = Backend::Auto; // Auto: SDL GPU
+    Backend backend = Backend::Auto; // Auto: native Metal on Apple platforms, SDL GPU elsewhere
     bool debug = false;              // validation layers; slow, loud, and worth it in Debug builds
     bool vsync = true;
     // An sRGB-encoded swapchain: shaders write linear light and the display
@@ -445,6 +457,8 @@ public:
     // Whether a texture of this format can be created for these uses at all
     // (sampling a depth format, say).
     [[nodiscard]] virtual bool supports_texture(TextureFormat format, TextureUsage usage) const noexcept = 0;
+    // Whether TextureDesc::memoryless does anything here.
+    [[nodiscard]] virtual bool supports_memoryless() const noexcept = 0;
     // True once a window is attached with an sRGB-encoded swapchain.
     [[nodiscard]] virtual bool swapchain_is_linear() const noexcept = 0;
     // The swapchain's format once a window is attached: what a pipeline that
@@ -495,6 +509,11 @@ public:
     // Fills levels 1..n from level 0 on the GPU and waits. The texture needs
     // more than one level and ColorTarget usage.
     [[nodiscard]] virtual bool generate_mipmaps(TextureHandle texture) noexcept = 0;
+    // Copies level 0 of a color texture out, tightly packed, and waits for
+    // the GPU to finish everything submitted so far: a readback for tests,
+    // never for a frame. `size` must equal width * height * bytes_per_pixel.
+    [[nodiscard]] virtual bool download_texture(TextureHandle texture, void* out,
+                                                std::uint32_t size) noexcept = 0;
     // A sampled color texture with a full mip chain: created, uploaded, mipmapped.
     [[nodiscard]] TextureHandle create_texture_with_data(TextureFormat format, std::uint32_t width,
                                                          std::uint32_t height, const void* pixels,
@@ -510,6 +529,14 @@ public:
                       samplers = 0;
     };
     [[nodiscard]] virtual ResourceCounts resource_counts() const noexcept = 0;
+    // What the GPU is doing: the time the last completed frame's commands
+    // took on it, and the memory the device holds for our resources. Zero
+    // where a backend cannot say (SDL GPU).
+    struct GpuStats {
+        double frame_ms = 0.0;
+        std::uint64_t allocated_bytes = 0;
+    };
+    [[nodiscard]] virtual GpuStats gpu_stats() const noexcept = 0;
 
     // Acquires this frame's command buffer and swapchain image; with vsync on
     // this is where the loop waits for the display. nullopt on error. With no

@@ -552,3 +552,97 @@ TEST_CASE("a compute pass whose buffer a later pass overwrites still runs, in or
     CHECK(graph.pass(1).depends_on == 1u);
     CHECK(graph.pass(0).order == 0);
 }
+
+TEST_CASE("a fused G-buffer pass keeps its attachments on the tile; a split one stores them") {
+    const TextureInfo albedo{rhi::TextureFormat::Rgba8Unorm, 1280, 720};
+    const TextureInfo normal{rhi::TextureFormat::Rgba16Float, 1280, 720};
+    const TextureInfo depth_occlusion{rhi::TextureFormat::Rg32Float, 1280, 720};
+
+    SUBCASE("fused: material and lighting in one pass") {
+        FrameGraph graph(nullptr);
+        graph.begin();
+        GraphTexture swapchain = graph.import("swapchain", kFakeSwapchain, kSwapchain);
+        GraphTexture hdr = graph.create("hdr", kHdr);
+        GraphTexture depth = graph.create("depth", kDepth);
+        GraphTexture g1 = graph.create("g albedo", albedo);
+        GraphTexture g2 = graph.create("g normal", normal);
+        GraphTexture g3 = graph.create("g depth", depth_occlusion);
+        graph.add_pass(
+            "gbuffer+lighting",
+            [&](PassBuilder& b) {
+                hdr = b.write_color(hdr);
+                g1 = b.write_color(g1, rhi::LoadOp::DontCare);
+                g2 = b.write_color(g2, rhi::LoadOp::DontCare);
+                g3 = b.write_color(g3);
+                depth = b.write_depth(depth);
+            },
+            nothing);
+        graph.add_pass(
+            "tonemap",
+            [&](PassBuilder& b) {
+                b.read(hdr);
+                swapchain = b.write_color(swapchain);
+            },
+            nothing);
+        REQUIRE_MESSAGE(graph.compile(), graph.error());
+        // Only HDR is read afterwards: the G-buffer and the depth never leave the tile.
+        CHECK(graph.stats().memoryless == 4);
+        CHECK(graph.texture(g1.index).memoryless);
+        CHECK(graph.texture(g2.index).memoryless);
+        CHECK(graph.texture(g3.index).memoryless);
+        CHECK(graph.texture(depth.index).memoryless);
+        CHECK_FALSE(graph.texture(hdr.index).memoryless);
+        CHECK(graph.stats().attachments_stored == 2); // hdr and the swapchain
+        CHECK(graph.stats().attachments_discarded == 4);
+        // Twenty bytes a pixel of G-buffer plus four of depth, asked for and — with a
+        // backend that can — never allocated. Without one they are counted as
+        // ordinary textures, which is what a null device gets here.
+        CHECK(graph.stats().bytes_memoryless == 0);
+        CHECK(graph.stats().bytes_requested == 1280u * 720u * (8u + 4u + 4u + 8u + 8u));
+    }
+    SUBCASE("split: the G-buffer stored by one pass and sampled by the next") {
+        FrameGraph graph(nullptr);
+        graph.begin();
+        GraphTexture swapchain = graph.import("swapchain", kFakeSwapchain, kSwapchain);
+        GraphTexture emissive = graph.create("g emissive", kHdr);
+        GraphTexture hdr = graph.create("hdr", kHdr);
+        GraphTexture depth = graph.create("depth", kDepth);
+        GraphTexture g1 = graph.create("g albedo", albedo);
+        GraphTexture g2 = graph.create("g normal", normal);
+        GraphTexture g3 = graph.create("g depth", depth_occlusion);
+        graph.add_pass(
+            "gbuffer",
+            [&](PassBuilder& b) {
+                emissive = b.write_color(emissive);
+                g1 = b.write_color(g1, rhi::LoadOp::DontCare);
+                g2 = b.write_color(g2, rhi::LoadOp::DontCare);
+                g3 = b.write_color(g3);
+                depth = b.write_depth(depth);
+            },
+            nothing);
+        graph.add_pass(
+            "lighting",
+            [&](PassBuilder& b) {
+                b.read(emissive);
+                b.read(g1);
+                b.read(g2);
+                b.read(g3);
+                hdr = b.write_color(hdr, rhi::LoadOp::DontCare);
+            },
+            nothing);
+        graph.add_pass(
+            "tonemap",
+            [&](PassBuilder& b) {
+                b.read(hdr);
+                swapchain = b.write_color(swapchain);
+            },
+            nothing);
+        REQUIRE_MESSAGE(graph.compile(), graph.error());
+        CHECK(graph.stats().memoryless == 1); // only the depth
+        CHECK(graph.stats().attachments_stored == 6);
+        CHECK(graph.stats().attachments_discarded == 1);
+        // Two more textures in memory than the fused frame, and the G-buffer
+        // written out and read back: what the fused pass saves.
+        CHECK(graph.stats().physical_textures == 6);
+    }
+}

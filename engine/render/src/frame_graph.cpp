@@ -654,15 +654,18 @@ void FrameGraph::assign_physical() noexcept {
     });
     stats_.transients_used = static_cast<std::uint32_t>(scratch_.size());
     stats_.bytes_requested = 0;
+    const bool can_be_memoryless = device_ != nullptr && device_->supports_memoryless();
     for (const std::uint32_t t : scratch_) {
         Texture& node = textures_[t];
         stats_.bytes_requested += texture_bytes(node.info);
+        const bool memoryless = node.memoryless && can_be_memoryless;
         std::uint32_t slot = kNone;
         for (std::uint32_t p = 0; p < physicals_.size(); ++p) {
             const Physical& physical = physicals_[p];
             const bool same = physical.info.format == node.info.format &&
                               physical.info.width == node.info.width &&
-                              physical.info.height == node.info.height && physical.usage == node.usage;
+                              physical.info.height == node.info.height && physical.usage == node.usage &&
+                              physical.memoryless == memoryless;
             const bool free = !physical.used_this_frame || physical.last_use < node.first_use;
             if (same && free) {
                 slot = p;
@@ -674,7 +677,7 @@ void FrameGraph::assign_physical() noexcept {
                 fail("more transient textures alive at once than the graph allows");
                 return;
             }
-            physicals_.push_back(Physical{.info = node.info, .usage = node.usage});
+            physicals_.push_back(Physical{.info = node.info, .usage = node.usage, .memoryless = memoryless});
             slot = static_cast<std::uint32_t>(physicals_.size() - 1);
         }
         Physical& physical = physicals_[slot];
@@ -685,10 +688,12 @@ void FrameGraph::assign_physical() noexcept {
     }
     stats_.physical_textures = 0;
     stats_.bytes_allocated = 0;
+    stats_.bytes_memoryless = 0;
     for (const Physical& physical : physicals_) {
         if (physical.used_this_frame) {
             ++stats_.physical_textures;
-            stats_.bytes_allocated += texture_bytes(physical.info);
+            std::uint64_t& bytes = physical.memoryless ? stats_.bytes_memoryless : stats_.bytes_allocated;
+            bytes += texture_bytes(physical.info);
         }
     }
 }
@@ -743,7 +748,8 @@ void FrameGraph::execute(rhi::Frame& frame) noexcept {
             physical.handle = device_->create_texture({.format = physical.info.format,
                                                        .width = physical.info.width,
                                                        .height = physical.info.height,
-                                                       .usage = physical.usage});
+                                                       .usage = physical.usage,
+                                                       .memoryless = physical.memoryless});
             if (!physical.handle) {
                 TY_LOG_ERROR("graph", "cannot create a %ux%u %s transient: %s", physical.info.width,
                              physical.info.height, rhi::texture_format_name(physical.info.format),

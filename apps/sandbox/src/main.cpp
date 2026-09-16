@@ -4,13 +4,17 @@
 // camera. Falls back to Phase 0's triangle when there is no model.
 //
 //   tynima-sandbox [--headless] [--frames N] [--model path.glb] [--physics tynima|jolt]
-//                  [--rhi sdl|metal] [--record log.tyrec | --replay log.tyrec]
+//                  [--rhi sdl|metal] [--shading forward|fused|split]
+//                  [--record log.tyrec | --replay log.tyrec]
 //
 // The pile runs on the engine's own physics by default; --physics jolt
 // drops the same pile through Jolt, and the report line at exit compares.
-// --rhi metal draws through the engine's native Metal backend instead of
-// SDL GPU: the same frame, the same shaders, the engine's own path to the
-// tile hardware.
+// The frame is drawn through the engine's native Metal backend on a Mac
+// and SDL GPU elsewhere; --rhi sdl asks for SDL GPU on a Mac too: the same
+// frame, the same shaders, through SDL's Metal instead of ours. --shading
+// fused lights the scene from a G-buffer that never leaves the GPU's tile
+// memory; --shading split stores and reads it back the way a desktop GPU
+// must, for comparison (Y cycles them).
 // --headless runs without a window or a GPU, at a fixed sixtieth of a
 // second a frame, with a scripted player at the keyboard.
 //
@@ -430,12 +434,21 @@ constexpr bool kGpuDebug = false;
 #define TYNIMA_SANDBOX_ASSETS_DIR "."
 #endif
 
+// How the scene is lit: forward, every mesh fragment lit as it is drawn;
+// fused, the material into a G-buffer and the lighting from it in the same
+// render pass, the G-buffer read from the tile and never stored; split,
+// the G-buffer stored by one pass and sampled by the next, as on a GPU
+// without tile memory — the fused path's yardstick.
+enum class ShadingPath : int { Forward, Fused, Split };
+constexpr const char* kShadingPathNames[] = {"forward", "fused deferred", "split deferred"};
+
 struct Options {
     bool headless = false;
     long max_frames = -1; // -1: run until closed
     std::string model = TYNIMA_SANDBOX_ASSETS_DIR "/WaterBottle.glb";
     bool jolt = false;   // the reference physics instead of the engine's own
-    rhi::Backend rhi = rhi::Backend::SdlGpu;
+    rhi::Backend rhi = rhi::Backend::Auto;
+    ShadingPath shading = ShadingPath::Forward;
     std::string record; // write the input log here at exit
     std::string replay; // play this input log instead of live input and time
 };
@@ -471,13 +484,25 @@ Options parse_options(int argc, char** argv) {
                 std::fprintf(stderr, "--rhi: expected 'sdl' or 'metal', got '%s'\n", which);
                 std::exit(kExitUsage);
             }
+        } else if (std::strcmp(argv[i], "--shading") == 0 && i + 1 < argc) {
+            const char* which = argv[++i];
+            if (std::strcmp(which, "forward") == 0) {
+                options.shading = ShadingPath::Forward;
+            } else if (std::strcmp(which, "fused") == 0) {
+                options.shading = ShadingPath::Fused;
+            } else if (std::strcmp(which, "split") == 0) {
+                options.shading = ShadingPath::Split;
+            } else {
+                std::fprintf(stderr, "--shading: expected 'forward', 'fused' or 'split', got '%s'\n", which);
+                std::exit(kExitUsage);
+            }
         } else if (std::strcmp(argv[i], "--record") == 0 && i + 1 < argc) {
             options.record = argv[++i];
         } else if (std::strcmp(argv[i], "--replay") == 0 && i + 1 < argc) {
             options.replay = argv[++i];
         } else {
             std::fprintf(stderr, "usage: tynima-sandbox [--headless] [--frames N] [--model path.glb] "
-                                 "[--physics tynima|jolt] [--rhi sdl|metal] "
+                                 "[--physics tynima|jolt] [--rhi sdl|metal] [--shading forward|fused|split] "
                                  "[--record log.tyrec | --replay log.tyrec]\n");
             std::exit(kExitUsage);
         }
@@ -498,40 +523,15 @@ Options parse_options(int argc, char** argv) {
 // Every texel is linear by the time it is sampled (sRGB formats decode in
 // hardware), lighting happens in linear, and the swapchain encodes on the way
 // out. Blinn-Phong is here for comparison; Cook-Torrance is the real thing.
-constexpr const char* kMeshMsl = R"(
+// The scene's shaders are assembled from pieces, so the forward path and
+// the deferred one light a pixel with the same code: kMslCommon (the
+// uniform structs and the BRDF), kMslMeshVertex (the vertex shader every
+// mesh pass shares), kMslSurface (a material sampled into a Surface),
+// kMslLighting (a Surface lit by the sun, its shadow and the cell's point
+// lights), and then one fragment function per path.
+constexpr const char* kMslCommon = R"(
 #include <metal_stdlib>
 using namespace metal;
-
-struct VertexIn {
-    float3 position [[attribute(0)]];
-    float3 normal   [[attribute(1)]];
-    float2 uv       [[attribute(2)]];
-    float4 tangent  [[attribute(3)]]; // xyz along +u, w = handedness
-};
-
-struct Uniforms {
-    float4x4 mvp;
-    float4x4 model;
-};
-
-struct VSOut {
-    float4 position [[position]];
-    float3 world_position;
-    float3 world_normal;
-    float4 world_tangent;
-    float2 uv;
-};
-
-vertex VSOut vs_main(VertexIn in [[stage_in]], constant Uniforms& u [[buffer(0)]]) {
-    VSOut out;
-    float4 world = u.model * float4(in.position, 1.0);
-    out.position = u.mvp * float4(in.position, 1.0);
-    out.world_position = world.xyz;
-    out.world_normal = (u.model * float4(in.normal, 0.0)).xyz;
-    out.world_tangent = float4((u.model * float4(in.tangent.xyz, 0.0)).xyz, in.tangent.w);
-    out.uv = in.uv;
-    return out;
-}
 
 struct FrameUniforms {
     float4 camera_position; // xyz
@@ -561,6 +561,12 @@ struct ClusterUniforms {
     float4x4 view;
 };
 
+// What the deferred lighting pass needs to put a pixel back in the world.
+struct DeferredUniforms {
+    float4x4 inverse_view;
+    float4 params; // x, y: tan of the half angles; z, w: the screen in pixels
+};
+
 struct PointLight {
     float4 position_radius;
     float4 color;
@@ -571,18 +577,20 @@ struct ClusterLights {
     uint indices[31];
 };
 
-constant float kPi = 3.14159265358979;
+// What a material amounts to at one pixel, whichever path sampled it.
+struct Surface {
+    float3 albedo;
+    float3 n;           // the shading normal, mapped
+    float3 geometric_n; // the mesh's own, for the shadow bias
+    float3 t;           // the tangent, for one debug view
+    float metallic;
+    float roughness;
+    float occlusion;
+    float3 emissive;
+    float alpha;
+};
 
-// 3x3 taps of the hardware's own 2x2 compare: a soft edge four texels wide.
-float shadow_pcf(depth2d<float> map, sampler s, float2 uv, float depth, float texel_uv) {
-    float sum = 0.0;
-    for (int y = -1; y <= 1; ++y) {
-        for (int x = -1; x <= 1; ++x) {
-            sum += map.sample_compare(s, uv + float2(x, y) * texel_uv, depth);
-        }
-    }
-    return sum / 9.0;
-}
+constant float kPi = 3.14159265358979;
 
 // GGX / Trowbridge-Reitz normal distribution: how many microfacets face h.
 float d_ggx(float n_dot_h, float alpha) {
@@ -635,8 +643,213 @@ float3 surface_brdf(int mode, float3 n, float3 v, float3 l, float3 base, float m
     float vis = v_smith_ggx_correlated(n_dot_v, n_dot_l, alpha);
     return (float3(1.0) - f) * diffuse_color / kPi + d * vis * f;
 }
+)";
 
-// Linear light out, into an HDR target: the tonemap pass makes it a picture.
+constexpr const char* kMslMeshVertex = R"(
+struct VertexIn {
+    float3 position [[attribute(0)]];
+    float3 normal   [[attribute(1)]];
+    float2 uv       [[attribute(2)]];
+    float4 tangent  [[attribute(3)]]; // xyz along +u, w = handedness
+};
+
+struct Uniforms {
+    float4x4 mvp;
+    float4x4 model;
+};
+
+struct VSOut {
+    float4 position [[position]];
+    float3 world_position;
+    float3 world_normal;
+    float4 world_tangent;
+    float2 uv;
+};
+
+vertex VSOut vs_main(VertexIn in [[stage_in]], constant Uniforms& u [[buffer(0)]]) {
+    VSOut out;
+    float4 world = u.model * float4(in.position, 1.0);
+    out.position = u.mvp * float4(in.position, 1.0);
+    out.world_position = world.xyz;
+    out.world_normal = (u.model * float4(in.normal, 0.0)).xyz;
+    out.world_tangent = float4((u.model * float4(in.tangent.xyz, 0.0)).xyz, in.tangent.w);
+    out.uv = in.uv;
+    return out;
+}
+)";
+
+// The material at a pixel: its five maps sampled and its tangent frame
+// re-orthogonalized, into a Surface.
+constexpr const char* kMslSurface = R"(
+Surface sample_surface(VSOut in, texture2d<float> base_color_map, texture2d<float> metallic_roughness_map,
+                       texture2d<float> occlusion_map, texture2d<float> emissive_map,
+                       texture2d<float> normal_map, sampler map_sampler, constant MaterialUniforms& m) {
+    Surface s;
+    float4 base = base_color_map.sample(map_sampler, in.uv) * m.base_color_factor;
+    float4 mr = metallic_roughness_map.sample(map_sampler, in.uv);
+    s.albedo = base.rgb;
+    s.alpha = base.a;
+    s.metallic = mr.b * m.factors.x;                        // glTF: metallic in B
+    s.roughness = clamp(mr.g * m.factors.y, 0.045, 1.0);    // roughness in G; 0 would make GGX blow up
+    s.occlusion = mix(1.0, occlusion_map.sample(map_sampler, in.uv).r, m.factors.z);
+    s.emissive = emissive_map.sample(map_sampler, in.uv).rgb * m.emissive_factor.rgb;
+
+    // Tangent frame: re-orthogonalize the interpolated tangent against the
+    // interpolated normal, then the bitangent follows from the handedness.
+    s.geometric_n = normalize(in.world_normal);
+    float3 t = in.world_tangent.xyz;
+    t = normalize(t - s.geometric_n * dot(s.geometric_n, t));
+    float3 b = cross(s.geometric_n, t) * (in.world_tangent.w < 0.0 ? -1.0 : 1.0);
+    float3 nm = normal_map.sample(map_sampler, in.uv).xyz * 2.0 - 1.0; // tangent space, +z straight up
+    nm.xy *= m.factors.w;
+    s.n = normalize(t * nm.x + b * nm.y + s.geometric_n * nm.z);
+    s.t = t;
+    return s;
+}
+)";
+
+// A Surface at a world position, lit: the sun through its shadow map, the
+// point lights of the pixel's cluster cell, a uniform environment — or one
+// of the debug views instead.
+constexpr const char* kMslLighting = R"(
+// 3x3 taps of the hardware's own 2x2 compare: a soft edge four texels wide.
+float shadow_pcf(depth2d<float> map, sampler s, float2 uv, float depth, float texel_uv) {
+    float sum = 0.0;
+    for (int y = -1; y <= 1; ++y) {
+        for (int x = -1; x <= 1; ++x) {
+            sum += map.sample_compare(s, uv + float2(x, y) * texel_uv, depth);
+        }
+    }
+    return sum / 9.0;
+}
+
+// Shadow: from the first cascade whose map holds this point. The lookup
+// point is pushed off the surface along the normal, more where the light
+// grazes it, and the depth nudged towards the light — the two biases that
+// keep a lit surface from shadowing itself.
+float shadow_at(float3 world_position, float3 geometric_n, float3 l, constant ShadowUniforms& shadows,
+                depth2d<float> shadow_map0, depth2d<float> shadow_map1, depth2d<float> shadow_map2,
+                depth2d<float> shadow_map3, sampler shadow_sampler, thread int& cascade) {
+    float shadow = 1.0;
+    cascade = -1;
+    if (shadows.settings.y <= 0.0) {
+        return shadow;
+    }
+    float grazing = 1.0 - saturate(dot(geometric_n, l));
+    for (int c = 0; c < int(shadows.settings.x); ++c) {
+        float4 param = shadows.cascade_param[c];
+        float3 lookup = world_position + geometric_n * (param.x * shadows.settings.z * grazing);
+        float4 lc = shadows.cascade_matrix[c] * float4(lookup, 1.0);
+        float2 uv = float2(lc.x * 0.5 + 0.5, 0.5 - lc.y * 0.5);
+        float border = param.z * 2.0; // the taps must stay inside the map
+        bool inside = uv.x > border && uv.x < 1.0 - border && uv.y > border && uv.y < 1.0 - border;
+        if (inside && lc.z > 0.0 && lc.z < 1.0) {
+            float depth = lc.z + param.x * shadows.settings.w * param.y;
+            if (c == 0) {
+                shadow = shadow_pcf(shadow_map0, shadow_sampler, uv, depth, param.z);
+            } else if (c == 1) {
+                shadow = shadow_pcf(shadow_map1, shadow_sampler, uv, depth, param.z);
+            } else if (c == 2) {
+                shadow = shadow_pcf(shadow_map2, shadow_sampler, uv, depth, param.z);
+            } else {
+                shadow = shadow_pcf(shadow_map3, shadow_sampler, uv, depth, param.z);
+            }
+            cascade = c;
+            break;
+        }
+    }
+    return 1.0 - (1.0 - shadow) * shadows.settings.y;
+}
+
+// The cluster cell a pixel is in: the tile under the window position, the
+// slice at its view depth.
+uint cluster_cell(float2 window_position, float view_depth, constant ClusterUniforms& clusters) {
+    float depth = max(view_depth, clusters.depth.z);
+    uint slice = uint(clamp(floor(log(depth) * clusters.depth.x + clusters.depth.y), 0.0,
+                            clusters.grid.z - 1.0));
+    uint tx = min(uint(window_position.x / clusters.screen.x * clusters.grid.x), uint(clusters.grid.x) - 1);
+    uint ty = min(uint(window_position.y / clusters.screen.y * clusters.grid.y), uint(clusters.grid.y) - 1);
+    return (slice * uint(clusters.grid.y) + ty) * uint(clusters.grid.x) + tx;
+}
+
+float3 shade(Surface s, float3 world_position, float2 window_position, float view_depth,
+             constant FrameUniforms& frame, constant ShadowUniforms& shadows,
+             constant ClusterUniforms& clusters, const device PointLight* lights,
+             const device ClusterLights* cells, depth2d<float> shadow_map0, depth2d<float> shadow_map1,
+             depth2d<float> shadow_map2, depth2d<float> shadow_map3, sampler shadow_sampler) {
+    float3 v = normalize(frame.camera_position.xyz - world_position);
+    float3 l = normalize(frame.light_direction.xyz);
+    float n_dot_l = saturate(dot(s.n, l));
+    float3 radiance = frame.light_color.rgb * frame.light_direction.w;
+    float ambient = frame.light_color.w;
+    int cascade = -1;
+    float shadow = shadow_at(world_position, s.geometric_n, l, shadows, shadow_map0, shadow_map1, shadow_map2,
+                             shadow_map3, shadow_sampler, cascade);
+    uint cell = cluster_cell(window_position, view_depth, clusters);
+    uint cell_lights = cells[cell].count;
+
+    int mode = int(frame.params.x);
+    int debug_view = int(frame.params.y);
+    float3 color;
+    if (debug_view == 1) {
+        color = s.n * 0.5 + 0.5;
+    } else if (debug_view == 2) {
+        color = float3(s.metallic, s.roughness, 0.0);
+    } else if (debug_view == 3) {
+        color = float3(s.occlusion);
+    } else if (debug_view == 4) {
+        color = s.geometric_n * 0.5 + 0.5;
+    } else if (debug_view == 5) {
+        color = s.t * 0.5 + 0.5;
+    } else if (debug_view == 7) {
+        // How many lights the pixel's cell holds: black, blue, green, yellow, red for 0, 4, 8, 12, 16+.
+        float heat = min(float(cell_lights) / 16.0, 1.0) * 4.0;
+        float3 stops[5] = {float3(0.0), float3(0.0, 0.2, 1.0), float3(0.0, 1.0, 0.2), float3(1.0, 1.0, 0.0),
+                           float3(1.0, 0.1, 0.0)};
+        int stop = int(heat);
+        color = mix(stops[stop], stops[min(stop + 1, 4)], heat - float(stop));
+    } else if (mode == 0) {
+        color = s.albedo;
+    } else {
+        // The sun, shadowed; then the cell's point lights, each an inverse
+        // square windowed to nothing at its radius (Karis, 2013); then a
+        // uniform grey environment standing in for image-based lighting.
+        float3 sun_brdf = surface_brdf(mode, s.n, v, l, s.albedo, s.metallic, s.roughness);
+        float3 sun = sun_brdf * radiance * n_dot_l * shadow;
+        float3 local = float3(0.0);
+        for (uint k = 0; k < cell_lights; ++k) {
+            PointLight light = lights[cells[cell].indices[k]];
+            float3 to_light = light.position_radius.xyz - world_position;
+            float d2 = dot(to_light, to_light);
+            float r = light.position_radius.w;
+            if (d2 >= r * r) {
+                continue;
+            }
+            float3 ll = to_light * rsqrt(d2);
+            float ratio = d2 / (r * r);
+            float window = saturate(1.0 - ratio * ratio);
+            float attenuation = window * window / (d2 + 0.01);
+            float3 brdf = surface_brdf(mode, s.n, v, ll, s.albedo, s.metallic, s.roughness);
+            local += brdf * light.color.rgb * attenuation * saturate(dot(s.n, ll));
+        }
+        float3 f0 = mix(float3(0.04), s.albedo, s.metallic);
+        float3 indirect = mode == 1 ? s.albedo * ambient * s.occlusion
+                                    : (s.albedo * (1.0 - s.metallic) + f0 * 0.5) * ambient * s.occlusion;
+        color = sun + local + indirect + s.emissive;
+    }
+    if (debug_view == 6) {
+        // Which cascade shadowed the pixel: red, green, blue, yellow; grey for none.
+        float3 tints[5] = {float3(1.0, 0.2, 0.2), float3(0.2, 1.0, 0.2), float3(0.2, 0.4, 1.0),
+                           float3(1.0, 1.0, 0.2), float3(0.5)};
+        color = mix(color, tints[cascade < 0 ? 4 : cascade], 0.4);
+    }
+    return color;
+}
+)";
+
+// Forward: the material and the lighting in one fragment, linear light out
+// into an HDR target; the tonemap pass makes it a picture.
+constexpr const char* kMslForwardFragment = R"(
 fragment float4 fs_main(VSOut in [[stage_in]],
                         texture2d<float> base_color_map [[texture(0)]],
                         texture2d<float> metallic_roughness_map [[texture(1)]],
@@ -655,128 +868,150 @@ fragment float4 fs_main(VSOut in [[stage_in]],
                         constant ClusterUniforms& clusters [[buffer(3)]],
                         const device PointLight* lights [[buffer(4)]],
                         const device ClusterLights* cells [[buffer(5)]]) {
-    float4 base = base_color_map.sample(map_sampler, in.uv) * m.base_color_factor;
-    float4 mr = metallic_roughness_map.sample(map_sampler, in.uv);
-    float metallic = mr.b * m.factors.x;                        // glTF: metallic in B
-    float roughness = clamp(mr.g * m.factors.y, 0.045, 1.0);    // roughness in G; 0 would make GGX blow up
-    float occlusion = mix(1.0, occlusion_map.sample(map_sampler, in.uv).r, m.factors.z);
-    float3 emissive = emissive_map.sample(map_sampler, in.uv).rgb * m.emissive_factor.rgb;
+    Surface s = sample_surface(in, base_color_map, metallic_roughness_map, occlusion_map, emissive_map,
+                               normal_map, map_sampler, m);
+    float view_depth = dot(in.world_position - frame.camera_position.xyz, frame.camera_forward.xyz);
+    float3 color = shade(s, in.world_position, in.position.xy, view_depth, frame, shadows, clusters, lights,
+                         cells, shadow_map0, shadow_map1, shadow_map2, shadow_map3, shadow_sampler);
+    return float4(color, s.alpha);
+}
+)";
 
-    // Tangent frame: re-orthogonalize the interpolated tangent against the
-    // interpolated normal, then the bitangent follows from the handedness.
-    float3 geometric_n = normalize(in.world_normal);
-    float3 t = in.world_tangent.xyz;
-    t = normalize(t - geometric_n * dot(geometric_n, t));
-    float3 b = cross(geometric_n, t) * (in.world_tangent.w < 0.0 ? -1.0 : 1.0);
-    float3 nm = normal_map.sample(map_sampler, in.uv).xyz * 2.0 - 1.0; // tangent space, +z straight up
-    nm.xy *= m.factors.w;
-    float3 n = normalize(t * nm.x + b * nm.y + geometric_n * nm.z);
+// Deferred, first half: the material into the G-buffer — emissive straight
+// into the HDR target, albedo and metallic, the shading normal and
+// roughness, the view depth and occlusion — 20 bytes a pixel that, in the
+// fused pass, never leave the tile.
+constexpr const char* kMslGBufferFragment = R"(
+struct GBufferOut {
+    float4 hdr [[color(0)]];
+    float4 albedo [[color(1)]];
+    float4 normal [[color(2)]];
+    float2 depth [[color(3)]];
+};
 
-    float3 v = normalize(frame.camera_position.xyz - in.world_position);
-    float3 l = normalize(frame.light_direction.xyz);
-    float n_dot_l = saturate(dot(n, l));
-    float3 radiance = frame.light_color.rgb * frame.light_direction.w;
-    float ambient = frame.light_color.w;
+fragment GBufferOut fs_main(VSOut in [[stage_in]],
+                            texture2d<float> base_color_map [[texture(0)]],
+                            texture2d<float> metallic_roughness_map [[texture(1)]],
+                            texture2d<float> occlusion_map [[texture(2)]],
+                            texture2d<float> emissive_map [[texture(3)]],
+                            texture2d<float> normal_map [[texture(4)]],
+                            sampler map_sampler [[sampler(0)]],
+                            constant FrameUniforms& frame [[buffer(0)]],
+                            constant MaterialUniforms& m [[buffer(1)]]) {
+    Surface s = sample_surface(in, base_color_map, metallic_roughness_map, occlusion_map, emissive_map,
+                               normal_map, map_sampler, m);
+    float view_depth = dot(in.world_position - frame.camera_position.xyz, frame.camera_forward.xyz);
+    GBufferOut out;
+    out.hdr = float4(s.emissive, 1.0);
+    out.albedo = float4(s.albedo, s.metallic);
+    out.normal = float4(s.n, s.roughness);
+    out.depth = float2(view_depth, s.occlusion);
+    return out;
+}
+)";
 
-    // Shadow: from the first cascade whose map holds this point. The lookup
-    // point is pushed off the surface along the normal, more where the light
-    // grazes it, and the depth nudged towards the light — the two biases
-    // that keep a lit surface from shadowing itself.
-    float shadow = 1.0;
-    int cascade = -1;
-    if (shadows.settings.y > 0.0) {
-        float grazing = 1.0 - saturate(dot(geometric_n, l));
-        for (int c = 0; c < int(shadows.settings.x); ++c) {
-            float4 param = shadows.cascade_param[c];
-            float3 lookup = in.world_position + geometric_n * (param.x * shadows.settings.z * grazing);
-            float4 lc = shadows.cascade_matrix[c] * float4(lookup, 1.0);
-            float2 uv = float2(lc.x * 0.5 + 0.5, 0.5 - lc.y * 0.5);
-            float border = param.z * 2.0; // the taps must stay inside the map
-            bool inside = uv.x > border && uv.x < 1.0 - border && uv.y > border && uv.y < 1.0 - border;
-            if (inside && lc.z > 0.0 && lc.z < 1.0) {
-                float depth = lc.z + param.x * shadows.settings.w * param.y;
-                if (c == 0) {
-                    shadow = shadow_pcf(shadow_map0, shadow_sampler, uv, depth, param.z);
-                } else if (c == 1) {
-                    shadow = shadow_pcf(shadow_map1, shadow_sampler, uv, depth, param.z);
-                } else if (c == 2) {
-                    shadow = shadow_pcf(shadow_map2, shadow_sampler, uv, depth, param.z);
-                } else {
-                    shadow = shadow_pcf(shadow_map3, shadow_sampler, uv, depth, param.z);
-                }
-                cascade = c;
-                break;
-            }
-        }
-        shadow = 1.0 - (1.0 - shadow) * shadows.settings.y;
+// Deferred, second half: a pixel put back into the world from its view
+// depth and lit. Shared by the fused and the split lighting pass; only
+// where the G-buffer comes from differs.
+constexpr const char* kMslDeferredLighting = R"(
+struct VSOut {
+    float4 position [[position]];
+    float2 uv;
+};
+
+vertex VSOut vs_main(uint vid [[vertex_id]]) {
+    float2 corner = float2((vid << 1) & 2, vid & 2);
+    VSOut out;
+    out.position = float4(corner * 2.0 - 1.0, 0.0, 1.0);
+    out.uv = float2(corner.x, 1.0 - corner.y);
+    return out;
+}
+
+float4 light_pixel(float4 hdr, float4 albedo, float4 normal, float2 depth, float2 window_position,
+                   constant FrameUniforms& frame, constant ShadowUniforms& shadows,
+                   constant ClusterUniforms& clusters, constant DeferredUniforms& deferred,
+                   const device PointLight* lights, const device ClusterLights* cells,
+                   depth2d<float> shadow_map0, depth2d<float> shadow_map1, depth2d<float> shadow_map2,
+                   depth2d<float> shadow_map3, sampler shadow_sampler) {
+    float view_depth = depth.x;
+    if (view_depth <= 0.0) {
+        return hdr; // the sky: nothing was drawn here
     }
+    // Back into the world: the pixel's ray at its depth, in view space, then out.
+    float2 ndc = float2(window_position.x / deferred.params.z * 2.0 - 1.0,
+                        1.0 - window_position.y / deferred.params.w * 2.0);
+    float3 view = float3(ndc.x * deferred.params.x * view_depth, ndc.y * deferred.params.y * view_depth,
+                         -view_depth);
+    float3 world_position = (deferred.inverse_view * float4(view, 1.0)).xyz;
+    Surface s;
+    s.albedo = albedo.rgb;
+    s.metallic = albedo.a;
+    s.n = normalize(normal.xyz);
+    s.geometric_n = s.n;
+    s.t = float3(0.0);
+    s.roughness = normal.a;
+    s.occlusion = depth.y;
+    s.emissive = float3(0.0); // already in the HDR target
+    s.alpha = 1.0;
+    float3 color = shade(s, world_position, window_position, view_depth, frame, shadows, clusters, lights,
+                         cells, shadow_map0, shadow_map1, shadow_map2, shadow_map3, shadow_sampler);
+    return float4(hdr.rgb + color, 1.0);
+}
+)";
 
-    // The point lights that reach this pixel: those listed for its cell —
-    // the tile under the pixel, the slice at its depth.
-    float view_depth = max(dot(in.world_position - frame.camera_position.xyz, frame.camera_forward.xyz),
-                           clusters.depth.z);
-    uint slice = uint(clamp(floor(log(view_depth) * clusters.depth.x + clusters.depth.y), 0.0,
-                            clusters.grid.z - 1.0));
-    uint tx = min(uint(in.position.x / clusters.screen.x * clusters.grid.x), uint(clusters.grid.x) - 1);
-    uint ty = min(uint(in.position.y / clusters.screen.y * clusters.grid.y), uint(clusters.grid.y) - 1);
-    uint cell = (slice * uint(clusters.grid.y) + ty) * uint(clusters.grid.x) + tx;
-    uint cell_lights = cells[cell].count;
+// Fused: the G-buffer read straight from the tile through [[color(n)]]
+// inputs, in the same render pass that drew it. The attachments it reads
+// are never stored, never sampled, never in memory at all.
+constexpr const char* kMslFusedLightingFragment = R"(
+struct GBufferIn {
+    float4 hdr [[color(0)]];
+    float4 albedo [[color(1)]];
+    float4 normal [[color(2)]];
+    float2 depth [[color(3)]];
+};
 
-    int mode = int(frame.params.x);
-    int debug_view = int(frame.params.y);
-    float3 color;
-    if (debug_view == 1) {
-        color = n * 0.5 + 0.5;
-    } else if (debug_view == 2) {
-        color = float3(metallic, roughness, 0.0);
-    } else if (debug_view == 3) {
-        color = float3(occlusion);
-    } else if (debug_view == 4) {
-        color = geometric_n * 0.5 + 0.5;
-    } else if (debug_view == 5) {
-        color = t * 0.5 + 0.5;
-    } else if (debug_view == 7) {
-        // How many lights the pixel's cell holds: black, blue, green, yellow, red for 0, 4, 8, 12, 16+.
-        float heat = min(float(cell_lights) / 16.0, 1.0) * 4.0;
-        float3 stops[5] = {float3(0.0), float3(0.0, 0.2, 1.0), float3(0.0, 1.0, 0.2), float3(1.0, 1.0, 0.0),
-                           float3(1.0, 0.1, 0.0)};
-        int stop = int(heat);
-        color = mix(stops[stop], stops[min(stop + 1, 4)], heat - float(stop));
-    } else if (mode == 0) {
-        color = base.rgb;
-    } else {
-        // The sun, shadowed; then the cell's point lights, each an inverse
-        // square windowed to nothing at its radius (Karis, 2013); then a
-        // uniform grey environment standing in for image-based lighting.
-        float3 sun = surface_brdf(mode, n, v, l, base.rgb, metallic, roughness) * radiance * n_dot_l * shadow;
-        float3 local = float3(0.0);
-        for (uint k = 0; k < cell_lights; ++k) {
-            PointLight light = lights[cells[cell].indices[k]];
-            float3 to_light = light.position_radius.xyz - in.world_position;
-            float d2 = dot(to_light, to_light);
-            float r = light.position_radius.w;
-            if (d2 >= r * r) {
-                continue;
-            }
-            float3 ll = to_light * rsqrt(d2);
-            float ratio = d2 / (r * r);
-            float window = saturate(1.0 - ratio * ratio);
-            float attenuation = window * window / (d2 + 0.01);
-            float3 brdf = surface_brdf(mode, n, v, ll, base.rgb, metallic, roughness);
-            local += brdf * light.color.rgb * attenuation * saturate(dot(n, ll));
-        }
-        float3 f0 = mix(float3(0.04), base.rgb, metallic);
-        float3 indirect = mode == 1 ? base.rgb * ambient * occlusion
-                                    : (base.rgb * (1.0 - metallic) + f0 * 0.5) * ambient * occlusion;
-        color = sun + local + indirect + emissive;
-    }
-    if (debug_view == 6) {
-        // Which cascade shadowed the pixel: red, green, blue, yellow; grey for none.
-        float3 tints[5] = {float3(1.0, 0.2, 0.2), float3(0.2, 1.0, 0.2), float3(0.2, 0.4, 1.0),
-                           float3(1.0, 1.0, 0.2), float3(0.5)};
-        color = mix(color, tints[cascade < 0 ? 4 : cascade], 0.4);
-    }
-    return float4(color, base.a);
+fragment float4 fs_main(VSOut in [[stage_in]], GBufferIn g,
+                        depth2d<float> shadow_map0 [[texture(0)]],
+                        depth2d<float> shadow_map1 [[texture(1)]],
+                        depth2d<float> shadow_map2 [[texture(2)]],
+                        depth2d<float> shadow_map3 [[texture(3)]],
+                        sampler shadow_sampler [[sampler(0)]],
+                        constant FrameUniforms& frame [[buffer(0)]],
+                        constant ShadowUniforms& shadows [[buffer(1)]],
+                        constant ClusterUniforms& clusters [[buffer(2)]],
+                        constant DeferredUniforms& deferred [[buffer(3)]],
+                        const device PointLight* lights [[buffer(4)]],
+                        const device ClusterLights* cells [[buffer(5)]]) {
+    return light_pixel(g.hdr, g.albedo, g.normal, g.depth, in.position.xy, frame, shadows, clusters, deferred,
+                       lights, cells, shadow_map0, shadow_map1, shadow_map2, shadow_map3, shadow_sampler);
+}
+)";
+
+// Split: the G-buffer stored by one pass and sampled by the next — what
+// every deferred renderer does on a GPU with no tile memory, and what the
+// fused pass is measured against.
+constexpr const char* kMslSplitLightingFragment = R"(
+fragment float4 fs_main(VSOut in [[stage_in]],
+                        depth2d<float> shadow_map0 [[texture(0)]],
+                        depth2d<float> shadow_map1 [[texture(1)]],
+                        depth2d<float> shadow_map2 [[texture(2)]],
+                        depth2d<float> shadow_map3 [[texture(3)]],
+                        texture2d<float> g_hdr [[texture(4)]],
+                        texture2d<float> g_albedo [[texture(5)]],
+                        texture2d<float> g_normal [[texture(6)]],
+                        texture2d<float> g_depth [[texture(7)]],
+                        sampler shadow_sampler [[sampler(0)]],
+                        sampler point_sampler [[sampler(4)]],
+                        constant FrameUniforms& frame [[buffer(0)]],
+                        constant ShadowUniforms& shadows [[buffer(1)]],
+                        constant ClusterUniforms& clusters [[buffer(2)]],
+                        constant DeferredUniforms& deferred [[buffer(3)]],
+                        const device PointLight* lights [[buffer(4)]],
+                        const device ClusterLights* cells [[buffer(5)]]) {
+    return light_pixel(g_hdr.sample(point_sampler, in.uv), g_albedo.sample(point_sampler, in.uv),
+                       g_normal.sample(point_sampler, in.uv), g_depth.sample(point_sampler, in.uv).xy,
+                       in.position.xy, frame, shadows, clusters, deferred, lights, cells, shadow_map0,
+                       shadow_map1, shadow_map2, shadow_map3, shadow_sampler);
 }
 )";
 
@@ -827,7 +1062,7 @@ fragment float4 fs_main(VSOut in [[stage_in]]) {
 }
 )";
 
-// Mirrors `struct Uniforms` in kMeshMsl: two column-major float4x4, 128 bytes.
+// Mirrors `struct Uniforms` in kMslMeshVertex: two column-major float4x4, 128 bytes.
 struct MeshUniforms {
     Mat4 mvp;
     Mat4 model;
@@ -858,6 +1093,13 @@ struct ShadowUniforms {
 };
 static_assert(sizeof(ShadowUniforms) == 336, "matches the MSL ShadowUniforms struct");
 
+struct DeferredUniforms {
+    Mat4 inverse_view;
+    Vec4 params;
+};
+static_assert(sizeof(DeferredUniforms) == 80, "matches the MSL DeferredUniforms struct");
+
+
 // What the keys toggle. Printed whenever it changes.
 struct Shading {
     int model = 2;      // 0 unlit, 1 Blinn-Phong, 2 Cook-Torrance
@@ -868,6 +1110,7 @@ struct Shading {
     render::AntiAliasing anti_aliasing = render::AntiAliasing::Taa;
     bool shadows = true;
     bool point_lights = true;
+    ShadingPath path = ShadingPath::Forward;
     float light_azimuth = radians(35.0f);   // around +y, from +z
     float light_elevation = radians(50.0f); // above the horizon
     float light_intensity = 3.0f;           // linear radiance; >1 is what tonemapping is for
@@ -894,11 +1137,12 @@ struct Shading {
         float azimuth = std::fmod(degrees(light_azimuth), 360.0f);
         if (azimuth < 0.0f) azimuth += 360.0f;
         TY_LOG_INFO("shading",
-                    "%s | view %s | tonemap %s | bloom %s | aa %s | shadows %s | point lights %s | "
+                    "%s, %s | view %s | tonemap %s | bloom %s | aa %s | shadows %s | point lights %s | "
                     "sun az %.0f el %.0f",
-                    kModels[model], kViews[debug_view], kTonemaps[static_cast<int>(tonemap)],
-                    bloom ? "on" : "off", kAntiAliasing[static_cast<int>(anti_aliasing)],
-                    shadows ? "on" : "off", point_lights ? "on" : "off", static_cast<double>(azimuth),
+                    kShadingPathNames[static_cast<int>(path)], kModels[model], kViews[debug_view],
+                    kTonemaps[static_cast<int>(tonemap)], bloom ? "on" : "off",
+                    kAntiAliasing[static_cast<int>(anti_aliasing)], shadows ? "on" : "off",
+                    point_lights ? "on" : "off", static_cast<double>(azimuth),
                     static_cast<double>(degrees(light_elevation)));
     }
 
@@ -909,6 +1153,8 @@ struct Shading {
         const render::Tonemap old_tonemap = tonemap;
         const render::AntiAliasing old_aa = anti_aliasing;
         const bool old_bloom = bloom, old_shadows = shadows, old_lights = point_lights;
+        const ShadingPath old_path = path;
+        if (input.key_pressed(Key::Y)) path = static_cast<ShadingPath>((static_cast<int>(path) + 1) % 3);
         if (input.key_pressed(Key::Digit1)) model = 0;
         if (input.key_pressed(Key::Digit2)) model = 1;
         if (input.key_pressed(Key::Digit3)) model = 2;
@@ -937,7 +1183,7 @@ struct Shading {
         if (input.key_down(Key::Down)) { light_elevation = std::max(light_elevation - turn, radians(-10.0f)); moved = true; }
         const bool changed = model != old_model || debug_view != old_view || tonemap != old_tonemap ||
                              bloom != old_bloom || anti_aliasing != old_aa || shadows != old_shadows ||
-                             point_lights != old_lights;
+                             point_lights != old_lights || path != old_path;
         if (changed) print();
         return changed || moved;
     }
@@ -1023,6 +1269,12 @@ struct FlyCamera {
 // The frame's passes draw the scene into this format; the tonemap pass
 // brings it down to the swapchain's.
 constexpr rhi::TextureFormat kHdrFormat = rhi::TextureFormat::Rgba16Float;
+// The G-buffer: albedo and metallic; the shading normal and roughness;
+// the view depth and occlusion. Twenty bytes a pixel beside HDR and depth —
+// on a tile-based GPU, twenty bytes that need never exist in memory.
+constexpr rhi::TextureFormat kGBufferAlbedoFormat = rhi::TextureFormat::Rgba8Unorm;
+constexpr rhi::TextureFormat kGBufferNormalFormat = rhi::TextureFormat::Rgba16Float;
+constexpr rhi::TextureFormat kGBufferDepthFormat = rhi::TextureFormat::Rg32Float;
 constexpr rhi::ClearColor kSkyColor{.r = 0.09f, .g = 0.10f, .b = 0.12f};
 
 // The sun's shadow: four cascades out to 60 m, the lookup pushed two texels
@@ -1047,7 +1299,11 @@ struct Renderer {
     std::unique_ptr<render::PostStack> post;   // bloom, TAA, tonemap, FXAA: HDR to the screen
     rhi::PipelineHandle mesh_pipeline;
     rhi::PipelineHandle triangle_pipeline;
-    rhi::PipelineHandle shadow_pipeline; // depth only
+    rhi::PipelineHandle shadow_pipeline;         // depth only
+    rhi::PipelineHandle gbuffer_pipeline;        // the material into four attachments
+    rhi::PipelineHandle lighting_fused_pipeline; // reads them from the tile, in the same pass
+    rhi::PipelineHandle lighting_split_pipeline; // samples them, in the next pass
+    rhi::SamplerHandle gbuffer_sampler;          // for the split path: one texel per pixel
     render::FallbackTextures fallbacks;
     rhi::SamplerHandle sampler;        // materials: anisotropic, repeating
     rhi::SamplerHandle shadow_sampler; // the shadow maps: compared, bilinear, clamped
@@ -1065,6 +1321,10 @@ struct Renderer {
           mesh_pipeline(std::exchange(other.mesh_pipeline, {})),
           triangle_pipeline(std::exchange(other.triangle_pipeline, {})),
           shadow_pipeline(std::exchange(other.shadow_pipeline, {})),
+          gbuffer_pipeline(std::exchange(other.gbuffer_pipeline, {})),
+          lighting_fused_pipeline(std::exchange(other.lighting_fused_pipeline, {})),
+          lighting_split_pipeline(std::exchange(other.lighting_split_pipeline, {})),
+          gbuffer_sampler(std::exchange(other.gbuffer_sampler, {})),
           fallbacks(std::exchange(other.fallbacks, render::FallbackTextures{})),
           sampler(std::exchange(other.sampler, {})), shadow_sampler(std::exchange(other.shadow_sampler, {})),
           shadow_fallback(std::exchange(other.shadow_fallback, {})),
@@ -1097,7 +1357,13 @@ struct Renderer {
             device->destroy_graphics_pipeline(mesh_pipeline);
             device->destroy_graphics_pipeline(triangle_pipeline);
             device->destroy_graphics_pipeline(shadow_pipeline);
+            device->destroy_graphics_pipeline(gbuffer_pipeline);
+            device->destroy_graphics_pipeline(lighting_fused_pipeline);
+            device->destroy_graphics_pipeline(lighting_split_pipeline);
+            device->destroy_sampler(gbuffer_sampler);
             mesh_pipeline = triangle_pipeline = shadow_pipeline = {};
+            gbuffer_pipeline = lighting_fused_pipeline = lighting_split_pipeline = {};
+            gbuffer_sampler = {};
             sampler = shadow_sampler = {};
             shadow_fallback = {};
             cluster_kernel = {};
@@ -1167,7 +1433,18 @@ Renderer create_renderer(platform::Window& window, const render::ModelData* mode
         return r;
     }
 
-    // The scene pass draws into HDR with depth; the post stack takes it from there.
+    // The scene's shaders, assembled from the shared pieces (see kMslCommon).
+    const std::string forward_msl = std::string(kMslCommon) + kMslMeshVertex + kMslSurface + kMslLighting +
+                                    kMslForwardFragment;
+    const std::string gbuffer_msl =
+        std::string(kMslCommon) + kMslMeshVertex + kMslSurface + kMslGBufferFragment;
+    const std::string fused_msl = std::string(kMslCommon) + kMslLighting + kMslDeferredLighting +
+                                  kMslFusedLightingFragment;
+    const std::string split_msl = std::string(kMslCommon) + kMslLighting + kMslDeferredLighting +
+                                  kMslSplitLightingFragment;
+
+    // Forward: the scene pass draws into HDR with depth; the post stack
+    // takes it from there.
     rhi::GraphicsPipelineDesc mesh_desc;
     mesh_desc.vertex_layout = render::vertex_layout();
     mesh_desc.cull = rhi::CullMode::Back;
@@ -1175,8 +1452,38 @@ Renderer create_renderer(platform::Window& window, const render::ModelData* mode
     mesh_desc.color_formats[0] = kHdrFormat;
     mesh_desc.color_target_count = 1;
     mesh_desc.depth_format = r.device->preferred_depth_format();
-    r.mesh_pipeline =
-        make_pipeline(*r.device, kMeshMsl, mesh_desc, 1, 4, kShadowTextureSlot + render::kMaxCascades, 2);
+    r.mesh_pipeline = make_pipeline(*r.device, forward_msl.c_str(), mesh_desc, 1, 4,
+                                    kShadowTextureSlot + render::kMaxCascades, 2);
+
+    // Deferred: the G-buffer pass writes HDR (emissive), albedo, normal and
+    // depth; the fused lighting draw reads the last three from the tile and
+    // writes only HDR; the split one samples them from memory instead.
+    rhi::GraphicsPipelineDesc gbuffer_desc = mesh_desc;
+    gbuffer_desc.color_formats[1] = kGBufferAlbedoFormat;
+    gbuffer_desc.color_formats[2] = kGBufferNormalFormat;
+    gbuffer_desc.color_formats[3] = kGBufferDepthFormat;
+    gbuffer_desc.color_target_count = 4;
+    r.gbuffer_pipeline = make_pipeline(*r.device, gbuffer_msl.c_str(), gbuffer_desc, 1, 2, 5, 0);
+
+    rhi::GraphicsPipelineDesc fused_desc;
+    for (std::uint32_t i = 0; i < 4; ++i) {
+        fused_desc.color_formats[i] = gbuffer_desc.color_formats[i];
+        fused_desc.color_write[i] = i == 0;
+    }
+    fused_desc.color_target_count = 4;
+    fused_desc.depth_format = r.device->preferred_depth_format();
+    r.lighting_fused_pipeline =
+        make_pipeline(*r.device, fused_msl.c_str(), fused_desc, 0, 4, render::kMaxCascades, 2);
+
+    rhi::GraphicsPipelineDesc split_desc;
+    split_desc.color_formats[0] = kHdrFormat;
+    split_desc.color_target_count = 1;
+    r.lighting_split_pipeline =
+        make_pipeline(*r.device, split_msl.c_str(), split_desc, 0, 4, render::kMaxCascades + 4, 2);
+    r.gbuffer_sampler = r.device->create_sampler({.min_filter = rhi::Filter::Nearest,
+                                                  .mag_filter = rhi::Filter::Nearest,
+                                                  .address_u = rhi::AddressMode::ClampToEdge,
+                                                  .address_v = rhi::AddressMode::ClampToEdge});
 
     rhi::GraphicsPipelineDesc triangle_desc;
     triangle_desc.color_formats[0] = kHdrFormat; // same pass, so the same targets, even with the test off
@@ -1462,73 +1769,165 @@ void draw_frame(Renderer& renderer, rhi::Frame& frame, scene::World& world, cons
     shadow_uniforms.settings = {static_cast<float>(cascades.count), shadows ? 1.0f : 0.0f,
                                 kShadowNormalOffsetTexels, kShadowBiasTexels};
 
-    graph.add_pass(
-        "scene",
-        [&](render::PassBuilder& b) {
-            for (std::uint32_t i = 0; i < cascades.count; ++i) {
-                b.read(shadow_maps[i]);
-            }
-            if (renderer.clusters) {
-                b.read_buffer(light_list);
-                b.read_buffer(cluster_table);
-            }
-            hdr = b.write_color(hdr, rhi::LoadOp::Clear, kSkyColor);
-            depth = b.write_depth(depth, rhi::LoadOp::Clear, 0.0f);
-        },
-        [&](rhi::RenderPass& pass, const render::PassResources& resources) {
-            if (!have_scene) {
-                if (renderer.triangle_pipeline) {
-                    pass.bind_pipeline(renderer.triangle_pipeline);
-                    pass.draw(3);
+    const FrameUniforms frame_uniforms{{fly.camera.position, 1.0f},
+                                       {fly.camera.forward(), 0.0f},
+                                       {light, shading.light_intensity},
+                                       {1.0f, 0.97f, 0.92f, shading.ambient},
+                                       {static_cast<float>(shading.model),
+                                        static_cast<float>(shading.debug_view), 0.0f, 0.0f}};
+    const auto screen_width = static_cast<float>(frame.width());
+    const auto screen_height = static_cast<float>(frame.height());
+    const DeferredUniforms deferred_uniforms{inverse(fly.camera.view()),
+                                            {tan_half_y * aspect, tan_half_y, screen_width, screen_height}};
+
+    // What every lighting variant needs bound: the shadow maps (every slot
+    // gets a depth texture, since the shaders declare four: the cascades,
+    // then the last one again, or the 1x1 stand-in when shadows are off),
+    // the light and cell buffers, and the uniforms — at the slots the
+    // forward shader uses (materials first) or the deferred ones.
+    const auto bind_lighting = [&](rhi::RenderPass& pass, const render::PassResources& resources,
+                                   std::uint32_t shadow_slot, std::uint32_t shadow_uniform_slot) {
+        pass.push_fragment_uniforms(0, &frame_uniforms, sizeof(frame_uniforms));
+        pass.push_fragment_uniforms(shadow_uniform_slot, &shadow_uniforms, sizeof(shadow_uniforms));
+        pass.push_fragment_uniforms(shadow_uniform_slot + 1, &cluster_uniforms, sizeof(cluster_uniforms));
+        if (renderer.clusters) {
+            pass.bind_fragment_storage_buffer(0, resources.buffer(light_list));
+            pass.bind_fragment_storage_buffer(1, resources.buffer(cluster_table));
+        }
+        if (renderer.shadow_sampler && renderer.shadow_fallback) {
+            for (std::uint32_t i = 0; i < render::kMaxCascades; ++i) {
+                rhi::TextureHandle map = renderer.shadow_fallback;
+                if (cascades.count > 0) {
+                    map = resources.texture(shadow_maps[std::min(i, cascades.count - 1)]);
                 }
-                return;
+                pass.bind_fragment_texture(shadow_slot + i, map, renderer.shadow_sampler);
             }
-            pass.bind_pipeline(renderer.mesh_pipeline);
-            const FrameUniforms frame_uniforms{{fly.camera.position, 1.0f},
-                                               {fly.camera.forward(), 0.0f},
-                                               {light, shading.light_intensity},
-                                               {1.0f, 0.97f, 0.92f, shading.ambient},
-                                               {static_cast<float>(shading.model),
-                                                static_cast<float>(shading.debug_view), 0.0f, 0.0f}};
-            pass.push_fragment_uniforms(0, &frame_uniforms, sizeof(frame_uniforms));
-            pass.push_fragment_uniforms(2, &shadow_uniforms, sizeof(shadow_uniforms));
-            pass.push_fragment_uniforms(3, &cluster_uniforms, sizeof(cluster_uniforms));
-            if (renderer.clusters) {
-                pass.bind_fragment_storage_buffer(0, resources.buffer(light_list));
-                pass.bind_fragment_storage_buffer(1, resources.buffer(cluster_table));
+        }
+    };
+    // Every mesh through a material pipeline: the forward one, or the G-buffer one.
+    const auto draw_materials = [&](rhi::RenderPass& pass) {
+        each_drawable(world, renderer, pass, [&](const render::Model& model, const Mat4& world_matrix) {
+            const MeshUniforms uniforms{view_projection * world_matrix, world_matrix};
+            pass.push_vertex_uniforms(0, &uniforms, sizeof(uniforms));
+            for (const render::Submesh& sub : model.mesh.submeshes) {
+                const render::Material& material = model.materials[sub.material];
+                const MaterialUniforms material_uniforms{
+                    material.base_color_factor,
+                    {material.metallic_factor, material.roughness_factor, material.occlusion_strength,
+                     material.normal_scale},
+                    {material.emissive_factor, 0.0f}};
+                pass.bind_fragment_texture(0, material.base_color, renderer.sampler);
+                pass.bind_fragment_texture(1, material.metallic_roughness, renderer.sampler);
+                pass.bind_fragment_texture(2, material.occlusion, renderer.sampler);
+                pass.bind_fragment_texture(3, material.emissive, renderer.sampler);
+                pass.bind_fragment_texture(4, material.normal, renderer.sampler);
+                pass.push_fragment_uniforms(1, &material_uniforms, sizeof(material_uniforms));
+                pass.draw_indexed(sub.index_count, sub.first_index);
             }
-            // Every shadow slot gets a depth texture, since the shader declares
-            // four: the cascades, then the last one again, or the 1x1 stand-in
-            // when shadows are off (the shader never reads it then).
-            if (renderer.shadow_sampler && renderer.shadow_fallback) {
-                for (std::uint32_t i = 0; i < render::kMaxCascades; ++i) {
-                    rhi::TextureHandle map = renderer.shadow_fallback;
-                    if (cascades.count > 0) {
-                        map = resources.texture(shadow_maps[std::min(i, cascades.count - 1)]);
-                    }
-                    pass.bind_fragment_texture(kShadowTextureSlot + i, map, renderer.shadow_sampler);
-                }
-            }
-            each_drawable(world, renderer, pass, [&](const render::Model& model, const Mat4& world_matrix) {
-                const MeshUniforms uniforms{view_projection * world_matrix, world_matrix};
-                pass.push_vertex_uniforms(0, &uniforms, sizeof(uniforms));
-                for (const render::Submesh& sub : model.mesh.submeshes) {
-                    const render::Material& material = model.materials[sub.material];
-                    const MaterialUniforms material_uniforms{
-                        material.base_color_factor,
-                        {material.metallic_factor, material.roughness_factor, material.occlusion_strength,
-                         material.normal_scale},
-                        {material.emissive_factor, 0.0f}};
-                    pass.bind_fragment_texture(0, material.base_color, renderer.sampler);
-                    pass.bind_fragment_texture(1, material.metallic_roughness, renderer.sampler);
-                    pass.bind_fragment_texture(2, material.occlusion, renderer.sampler);
-                    pass.bind_fragment_texture(3, material.emissive, renderer.sampler);
-                    pass.bind_fragment_texture(4, material.normal, renderer.sampler);
-                    pass.push_fragment_uniforms(1, &material_uniforms, sizeof(material_uniforms));
-                    pass.draw_indexed(sub.index_count, sub.first_index);
-                }
-            });
         });
+    };
+    const auto read_lighting_inputs = [&](render::PassBuilder& b) {
+        for (std::uint32_t i = 0; i < cascades.count; ++i) {
+            b.read(shadow_maps[i]);
+        }
+        if (renderer.clusters) {
+            b.read_buffer(light_list);
+            b.read_buffer(cluster_table);
+        }
+    };
+
+    const bool deferred_ready = renderer.gbuffer_pipeline && renderer.lighting_fused_pipeline &&
+                                renderer.lighting_split_pipeline && renderer.gbuffer_sampler;
+    const ShadingPath path = have_scene && deferred_ready ? shading.path : ShadingPath::Forward;
+    if (path == ShadingPath::Forward) {
+        graph.add_pass(
+            "scene",
+            [&](render::PassBuilder& b) {
+                read_lighting_inputs(b);
+                hdr = b.write_color(hdr, rhi::LoadOp::Clear, kSkyColor);
+                depth = b.write_depth(depth, rhi::LoadOp::Clear, 0.0f);
+            },
+            [&](rhi::RenderPass& pass, const render::PassResources& resources) {
+                if (!have_scene) {
+                    if (renderer.triangle_pipeline) {
+                        pass.bind_pipeline(renderer.triangle_pipeline);
+                        pass.draw(3);
+                    }
+                    return;
+                }
+                pass.bind_pipeline(renderer.mesh_pipeline);
+                bind_lighting(pass, resources, kShadowTextureSlot, 2);
+                draw_materials(pass);
+            });
+    } else {
+        // The G-buffer: three attachments beside HDR and depth. In the fused
+        // pass nothing reads them afterwards, so the graph stores none of
+        // them and, on the native backend, makes them memoryless — the
+        // lighting draw reads them from the tile. In the split path the next
+        // pass samples them, so they are stored and read back.
+        const bool fused = path == ShadingPath::Fused;
+        const std::uint32_t w = screen.width, h = screen.height;
+        render::GraphTexture g_albedo = graph.create("g albedo", {kGBufferAlbedoFormat, w, h});
+        render::GraphTexture g_normal = graph.create("g normal", {kGBufferNormalFormat, w, h});
+        render::GraphTexture g_depth = graph.create("g depth", {kGBufferDepthFormat, w, h});
+        const auto write_gbuffer = [&](render::PassBuilder& b, render::GraphTexture& target) {
+            target = b.write_color(target, rhi::LoadOp::Clear, kSkyColor);
+            g_albedo = b.write_color(g_albedo, rhi::LoadOp::DontCare);
+            g_normal = b.write_color(g_normal, rhi::LoadOp::DontCare);
+            // A view depth of 0 marks the sky, so the lighting leaves it alone.
+            g_depth = b.write_color(g_depth, rhi::LoadOp::Clear, {0.0f, 0.0f, 0.0f, 0.0f});
+            depth = b.write_depth(depth, rhi::LoadOp::Clear, 0.0f);
+        };
+        if (fused) {
+            graph.add_pass(
+                "gbuffer+lighting",
+                [&](render::PassBuilder& b) {
+                    read_lighting_inputs(b);
+                    write_gbuffer(b, hdr);
+                },
+                [&](rhi::RenderPass& pass, const render::PassResources& resources) {
+                    pass.bind_pipeline(renderer.gbuffer_pipeline);
+                    pass.push_fragment_uniforms(0, &frame_uniforms, sizeof(frame_uniforms));
+                    draw_materials(pass);
+                    // Then, in the same pass, the lighting over the whole
+                    // screen, reading what the draws above left in the tile.
+                    pass.bind_pipeline(renderer.lighting_fused_pipeline);
+                    bind_lighting(pass, resources, 0, 1);
+                    pass.push_fragment_uniforms(3, &deferred_uniforms, sizeof(deferred_uniforms));
+                    pass.draw(3);
+                });
+        } else {
+            render::GraphTexture emissive = graph.create("g emissive", screen);
+            graph.add_pass(
+                "gbuffer", [&](render::PassBuilder& b) { write_gbuffer(b, emissive); },
+                [&](rhi::RenderPass& pass, const render::PassResources&) {
+                    pass.bind_pipeline(renderer.gbuffer_pipeline);
+                    pass.push_fragment_uniforms(0, &frame_uniforms, sizeof(frame_uniforms));
+                    draw_materials(pass);
+                });
+            graph.add_pass(
+                "lighting",
+                [&](render::PassBuilder& b) {
+                    read_lighting_inputs(b);
+                    b.read(emissive);
+                    b.read(g_albedo);
+                    b.read(g_normal);
+                    b.read(g_depth);
+                    hdr = b.write_color(hdr, rhi::LoadOp::DontCare);
+                },
+                [&](rhi::RenderPass& pass, const render::PassResources& resources) {
+                    pass.bind_pipeline(renderer.lighting_split_pipeline);
+                    bind_lighting(pass, resources, 0, 1);
+                    pass.push_fragment_uniforms(3, &deferred_uniforms, sizeof(deferred_uniforms));
+                    const render::GraphTexture inputs[4] = {emissive, g_albedo, g_normal, g_depth};
+                    for (std::uint32_t i = 0; i < 4; ++i) {
+                        pass.bind_fragment_texture(render::kMaxCascades + i, resources.texture(inputs[i]),
+                                                   renderer.gbuffer_sampler);
+                    }
+                    pass.draw(3);
+                });
+        }
+    }
     post.add_passes(graph, hdr, depth, swapchain,
                     {.width = frame.width(),
                      .height = frame.height(),
@@ -1550,14 +1949,22 @@ void draw_frame(Renderer& renderer, rhi::Frame& frame, scene::World& world, cons
 }
 
 // What the graph made of the frame, once it has settled.
-void report_graph(const render::FrameGraph& graph) {
+void report_graph(const Renderer& renderer) {
+    const render::FrameGraph& graph = *renderer.graph;
     const render::FrameGraph::Stats& stats = graph.stats();
-    TY_LOG_INFO("graph", "%u passes (%u culled); %u transients in %u textures, %.1f MB of %.1f MB asked; "
-                         "%u attachments stored, %u discarded; %u could live in tile memory",
+    TY_LOG_INFO("graph",
+                "%u passes (%u culled); %u transients in %u textures, %.1f MB in memory, %.1f MB memoryless, "
+                "%.1f MB asked; %u attachments stored, %u discarded; %u never leave the tile",
                 stats.passes, stats.culled, stats.transients_used, stats.physical_textures,
                 static_cast<double>(stats.bytes_allocated) / 1048576.0,
+                static_cast<double>(stats.bytes_memoryless) / 1048576.0,
                 static_cast<double>(stats.bytes_requested) / 1048576.0, stats.attachments_stored,
                 stats.attachments_discarded, stats.memoryless);
+    const rhi::Device::GpuStats gpu = renderer.device->gpu_stats();
+    if (gpu.frame_ms > 0.0) {
+        TY_LOG_INFO("gpu", "%.2f ms a frame on the GPU, %.1f MB allocated by the device", gpu.frame_ms,
+                    static_cast<double>(gpu.allocated_bytes) / 1048576.0);
+    }
     char text[4096];
     graph.describe(text, sizeof text);
     for (char* line = text; *line != '\0';) {
@@ -1695,6 +2102,7 @@ int main(int argc, char** argv) {
     }
 
     Shading shading;
+    shading.path = options.shading;
     FlyCamera fly;
     if (has_model) {
         // Frame where the pile lands, with the falling column in view above it.
@@ -1829,7 +2237,7 @@ int main(int argc, char** argv) {
                     draw_frame(renderer, *frame, world, fly, shading, static_cast<float>(game_time));
                     const std::uint32_t culled = renderer.graph->stats().culled;
                     if (frame_count == 60 || (frame_count > 60 && culled != last_culled)) {
-                        report_graph(*renderer.graph);
+                        report_graph(renderer);
                         last_culled = culled;
                     }
                 }
@@ -1866,8 +2274,10 @@ int main(int argc, char** argv) {
         ++frame_count;
         ++frames_since_report;
         if (now - last_report >= 5.0) {
-            TY_LOG_INFO("sandbox", "%.0f frames/s",
-                        static_cast<double>(frames_since_report) / (now - last_report));
+            const rhi::Device::GpuStats gpu =
+                renderer.device != nullptr ? renderer.device->gpu_stats() : rhi::Device::GpuStats{};
+            TY_LOG_INFO("sandbox", "%.0f frames/s, GPU %.2f ms a frame",
+                        static_cast<double>(frames_since_report) / (now - last_report), gpu.frame_ms);
             last_report = now;
             frames_since_report = 0;
         }

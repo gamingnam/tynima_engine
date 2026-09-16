@@ -19,6 +19,7 @@
 #import <Metal/Metal.h>
 #import <QuartzCore/CAMetalLayer.h>
 #include <SDL3/SDL.h>
+#include <atomic>
 #include <cstring>
 #include <dispatch/dispatch.h>
 #include <initializer_list>
@@ -118,6 +119,8 @@ MTLPixelFormat to_metal(TextureFormat format) noexcept {
         return MTLPixelFormatBGRA8Unorm_sRGB;
     case TextureFormat::Rgba16Float:
         return MTLPixelFormatRGBA16Float;
+    case TextureFormat::Rg32Float:
+        return MTLPixelFormatRG32Float;
     case TextureFormat::Depth32Float:
         return MTLPixelFormatDepth32Float;
     case TextureFormat::Depth24Stencil8:
@@ -239,6 +242,7 @@ public:
     ShaderFormat shader_format() const noexcept override { return ShaderFormat::Msl; }
     TextureFormat preferred_depth_format() const noexcept override { return TextureFormat::Depth32Float; }
     bool supports_texture(TextureFormat format, TextureUsage usage) const noexcept override;
+    bool supports_memoryless() const noexcept override { return true; }
     bool swapchain_is_linear() const noexcept override { return swapchain_linear_; }
     TextureFormat swapchain_format() const noexcept override { return swapchain_format_; }
 
@@ -266,10 +270,12 @@ public:
     bool upload_texture(TextureHandle texture, const void* pixels, std::uint32_t size,
                         std::uint32_t mip_level) noexcept override;
     bool generate_mipmaps(TextureHandle texture) noexcept override;
+    bool download_texture(TextureHandle texture, void* out, std::uint32_t size) noexcept override;
     void destroy_texture(TextureHandle texture) noexcept override;
     SamplerHandle create_sampler(const SamplerDesc& desc) noexcept override;
     void destroy_sampler(SamplerHandle sampler) noexcept override;
     ResourceCounts resource_counts() const noexcept override;
+    GpuStats gpu_stats() const noexcept override;
     std::optional<Frame> begin_frame() noexcept override;
 
 protected:
@@ -339,6 +345,7 @@ private:
     MTLSize compute_threads_{1, 1, 1};
     id<MTLBuffer> compute_writes_[kMaxComputeWrites] = {};
     std::uint32_t compute_write_count_ = 0;
+    std::atomic<double> gpu_frame_ms_{0.0}; // written by the completion handler, on its own thread
 };
 
 struct MetalDevice::Pools {
@@ -470,6 +477,12 @@ bool MetalDevice::valid(SamplerHandle handle) const noexcept {
     return pools_->samplers.get(handle) != nullptr;
 }
 
+Device::GpuStats MetalDevice::gpu_stats() const noexcept {
+    TY_EXTERNAL_ALLOCATIONS();
+    return {gpu_frame_ms_.load(std::memory_order_relaxed),
+            static_cast<std::uint64_t>(device_.currentAllocatedSize)};
+}
+
 Device::ResourceCounts MetalDevice::resource_counts() const noexcept {
     return {pools_->shaders.size(), pools_->pipelines.size(), pools_->compute_pipelines.size(),
             pools_->buffers.size(), pools_->textures.size(),  pools_->samplers.size()};
@@ -581,6 +594,8 @@ PipelineHandle MetalDevice::create_graphics_pipeline(const GraphicsPipelineDesc&
         }
         for (std::uint32_t i = 0; i < desc.color_target_count; ++i) {
             pipeline.colorAttachments[i].pixelFormat = to_metal(desc.color_formats[i]);
+            pipeline.colorAttachments[i].writeMask =
+                desc.color_write[i] ? MTLColorWriteMaskAll : MTLColorWriteMaskNone;
         }
         if (desc.depth_format.has_value()) {
             pipeline.depthAttachmentPixelFormat = to_metal(*desc.depth_format);
@@ -820,7 +835,15 @@ TextureHandle MetalDevice::create_texture(const TextureDesc& desc) noexcept {
                                                               height:desc.height
                                                            mipmapped:levels > 1];
         texture.mipmapLevelCount = levels;
-        texture.storageMode = MTLStorageModePrivate;
+        // Memoryless: tile memory only, for a pass; nothing in DRAM, ever.
+        // Only ever an attachment, so it cannot be sampled or have levels.
+        const bool memoryless = desc.memoryless && levels == 1 && !has_usage(usage, TextureUsage::Sampled);
+        if (desc.memoryless && !memoryless) {
+            SDL_SetError(
+                "rhi::Device::create_texture: a memoryless texture is a single-level render target only");
+            return {};
+        }
+        texture.storageMode = memoryless ? MTLStorageModeMemoryless : MTLStorageModePrivate;
         MTLTextureUsage metal_usage = 0;
         if (has_usage(usage, TextureUsage::Sampled)) {
             metal_usage |= MTLTextureUsageShaderRead;
@@ -911,6 +934,44 @@ bool MetalDevice::generate_mipmaps(TextureHandle texture) noexcept {
     return run_blit_and_wait(^(id<MTLBlitCommandEncoder> blit) {
       [blit generateMipmapsForTexture:target];
     });
+}
+
+bool MetalDevice::download_texture(TextureHandle texture, void* out, std::uint32_t size) noexcept {
+    TY_PROFILE_SCOPE_NAMED("rhi::download_texture");
+    TY_EXTERNAL_ALLOCATIONS();
+    const Texture* object = pools_->textures.get(texture);
+    if (object == nullptr || object->borrowed) {
+        SDL_SetError("rhi::Device::download_texture: null, destroyed or borrowed texture handle");
+        return false;
+    }
+    const std::uint32_t row = object->extent.width * bytes_per_pixel(object->format);
+    const std::uint32_t expected = row * object->extent.height;
+    if (is_depth_format(object->format) || expected == 0 || size != expected) {
+        SDL_SetError("rhi::Device::download_texture: a color texture of %u bytes, got %u", expected, size);
+        return false;
+    }
+    id<MTLBuffer> destination = staging(nullptr, size);
+    if (destination == nil) {
+        SDL_SetError("rhi::Device::download_texture: staging memory refused");
+        return false;
+    }
+    id<MTLTexture> source = bridge<id<MTLTexture>>(object->texture);
+    const Extent2D extent = object->extent;
+    if (!run_blit_and_wait(^(id<MTLBlitCommandEncoder> blit) {
+          [blit copyFromTexture:source
+                           sourceSlice:0
+                           sourceLevel:0
+                          sourceOrigin:MTLOriginMake(0, 0, 0)
+                            sourceSize:MTLSizeMake(extent.width, extent.height, 1)
+                              toBuffer:destination
+                     destinationOffset:0
+                destinationBytesPerRow:row
+              destinationBytesPerImage:size];
+        })) {
+        return false;
+    }
+    std::memcpy(out, destination.contents, size);
+    return true;
 }
 
 void MetalDevice::destroy_texture(TextureHandle texture) noexcept {
@@ -1049,7 +1110,11 @@ void MetalDevice::frame_submit(void* frame_pointer, TextureHandle swapchain) noe
         [command_buffer presentDrawable:bridge<id<CAMetalDrawable>>(drawable)];
     }
     dispatch_semaphore_t in_flight = in_flight_;
-    [command_buffer addCompletedHandler:^(id<MTLCommandBuffer>) {
+    std::atomic<double>* frame_ms = &gpu_frame_ms_;
+    [command_buffer addCompletedHandler:^(id<MTLCommandBuffer> completed) {
+      // How long the GPU spent on the frame, for gpu_stats(); the fused
+      // and the split scene are compared on this.
+      frame_ms->store((completed.GPUEndTime - completed.GPUStartTime) * 1000.0, std::memory_order_relaxed);
       dispatch_semaphore_signal(in_flight);
     }];
     [command_buffer commit];

@@ -64,8 +64,9 @@ them off; `G` toggles bloom, `T` cycles the tonemapper (off, ACES, AgX) and
 `H` the anti-aliasing (off, FXAA, TAA); the arrow keys move the sun. `--model path.glb` loads
 something else. `--headless --frames N` runs the same loop with no window and
 no GPU (the model still loads) with a scripted player at the keyboard, which
-is what the `sandbox_headless` CTest does on CI. `--rhi metal` draws through
-the engine's native Metal backend instead of SDL GPU. `--record run.tyrec` writes
+is what the `sandbox_headless` CTest does on CI. `--rhi sdl` draws through SDL GPU
+instead of the native Metal backend; `--shading fused|split|forward` picks
+how the scene is lit (see The tile, below). `--record run.tyrec` writes
 every frame's input and frame time, and the physics world's hash at the end,
 to a text log; `--replay run.tyrec` plays it back in place of the clock and
 the keyboard and exits 3 if the run does not end on the same hash — see
@@ -300,9 +301,44 @@ first at `[[buffer(n)]]`, storage buffers after, the vertex buffer at
 `[[buffer(14)]]`), so every shader the engine has runs on either unchanged,
 and every GPU test in `rhi` and `render` runs on both — the same calls, the
 same expectations, the way the physics tests hold the engine's solver to
-Jolt. `tynima-sandbox --rhi metal` draws the whole frame through the native
-backend; SDL GPU stays the default until the next task gives Metal something
-SDL cannot do: attachments that never leave tile memory.
+Jolt. On a Mac the sandbox draws through the native backend; `--rhi sdl`
+asks for SDL GPU instead.
+
+### The tile
+
+The thesis, in code. `--shading fused` lights the scene the deferred way in
+a single render pass: every mesh writes its material into a G-buffer —
+albedo and metallic (RGBA8), the shading normal and roughness (RGBA16F),
+the view depth and occlusion (RG32F), with emissive straight into the HDR
+target — and then a full-screen draw in the *same* pass reads those three
+attachments back through MSL's `[[color(n)]]` inputs, straight from the
+tile, and writes the lit result into HDR. The frame graph sees three
+transients that are written and never read afterwards, so it stores none of
+them, and on the native backend it creates them memoryless
+(`TextureDesc::memoryless`, `MTLStorageModeMemoryless`): twenty bytes a
+pixel that never exist in DRAM at all. `--shading split` is the same
+G-buffer stored by one pass and sampled by the next — what a deferred
+renderer must do on a GPU without tile memory — and `--shading forward` is
+the path the sandbox had before. `Y` cycles the three at run time; the
+picture is the same.
+
+What to measure. The sandbox logs at frame 60 how much of the graph's
+memory is in DRAM and how much is memoryless, and every five seconds the
+GPU time per frame (`Device::gpu_stats()`, from the command buffer's
+timestamps on Metal). Fused against split is the G-buffer's round trip —
+about 20 bytes a pixel written and read back, 150 MB a frame at 2560×1440 —
+and it shows in the GPU time. For the bandwidth itself, Xcode's GPU
+profiler (a Metal capture of one frame) lists the memory traffic of each
+pass: the fused pass's G-buffer attachments show no store and no load,
+which is the whole point.
+
+The RHI grew what the fusion needs: `TextureDesc::memoryless`, a
+per-attachment write mask in `GraphicsPipelineDesc` (the lighting draw
+declares which attachments it only reads), `Rg32Float`,
+`Device::gpu_stats()`, and `Device::download_texture()` so a test can read
+a rendered image back — which one does, on both backends: an attachment
+written by one draw and read by the next through the tile, memoryless
+where the backend allows, comes out with the expected pixels.
 
 Buffers go through the graph as imported resources with the same versioned
 handles: a compute pass (`add_compute_pass`) writes them, any pass reads
