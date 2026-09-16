@@ -21,7 +21,8 @@
 // and climb, Shift runs; R drops the pile again; L (the game module)
 // launches it; F follows the character; C shows the shadow cascades, X
 // toggles shadows, K shows the lights per cluster, P toggles the point
-// lights; Escape quits.
+// lights, G bloom; T cycles the tonemapper, H the anti-aliasing; Escape
+// quits.
 #include <tynima/assets/gltf.h>
 #include <tynima/core/arena.h>
 #include <tynima/core/assert.h>
@@ -44,6 +45,7 @@
 #include <tynima/render/frame_graph.h>
 #include <tynima/render/mesh.h>
 #include <tynima/render/model.h>
+#include <tynima/render/post.h>
 #include <tynima/render/shadows.h>
 #include <tynima/rhi/device.h>
 #include <tynima/scene/components.h>
@@ -785,51 +787,6 @@ vertex float4 vs_main(VertexIn in [[stage_in]], constant Uniforms& u [[buffer(0)
 fragment void fs_main() {}
 )";
 
-// The post pass: one triangle over the screen, the HDR image sampled once
-// per pixel, ACES to bring it into range, and the sRGB encode when the
-// swapchain does not do it in hardware.
-constexpr const char* kTonemapMsl = R"(
-#include <metal_stdlib>
-using namespace metal;
-
-struct VSOut {
-    float4 position [[position]];
-    float2 uv;
-};
-
-// Three vertices that cover the screen: (-1,-1), (3,-1), (-1,3) in clip
-// space; the parts past the edges are clipped away.
-vertex VSOut vs_main(uint vid [[vertex_id]]) {
-    float2 corner = float2((vid << 1) & 2, vid & 2);
-    VSOut out;
-    out.position = float4(corner * 2.0 - 1.0, 0.0, 1.0);
-    out.uv = float2(corner.x, 1.0 - corner.y); // texture rows run top to bottom
-    return out;
-}
-
-struct PostUniforms {
-    float4 params; // x: tonemap, y: encode sRGB
-};
-
-// Narkowicz's ACES fit.
-float3 tonemap_aces(float3 x) {
-    const float a = 2.51, b = 0.03, c = 2.43, d = 0.59, e = 0.14;
-    return saturate((x * (a * x + b)) / (x * (c * x + d) + e));
-}
-
-fragment float4 fs_main(VSOut in [[stage_in]], texture2d<float> hdr [[texture(0)]], sampler s [[sampler(0)]],
-                        constant PostUniforms& post [[buffer(0)]]) {
-    float3 color = hdr.sample(s, in.uv).rgb;
-    if (post.params.x > 0.5) {
-        color = tonemap_aces(color);
-    }
-    if (post.params.y > 0.5) {
-        color = pow(max(color, 0.0), float3(1.0 / 2.2));
-    }
-    return float4(color, 1.0);
-}
-)";
-
 // Phase 0's triangle, kept as the fallback when there is nothing to load.
 constexpr const char* kTriangleMsl = R"(
 #include <metal_stdlib>
@@ -879,11 +836,6 @@ struct MaterialUniforms {
 };
 static_assert(sizeof(MaterialUniforms) == 48, "matches the MSL MaterialUniforms struct");
 
-struct PostUniforms {
-    Vec4 params;
-};
-static_assert(sizeof(PostUniforms) == 16, "matches the MSL PostUniforms struct");
-
 struct ShadowUniforms {
     Mat4 cascade_matrix[render::kMaxCascades];
     Vec4 cascade_param[render::kMaxCascades];
@@ -896,7 +848,9 @@ struct Shading {
     int model = 2;      // 0 unlit, 1 Blinn-Phong, 2 Cook-Torrance
     int debug_view = 0; // 0 lit, 1 shading normals, 2 metallic/roughness, 3 occlusion, 4 vertex normals,
                         // 5 tangents, 6 lit with the shadow cascades tinted, 7 lights per cluster
-    bool tonemap = true;
+    render::Tonemap tonemap = render::Tonemap::Aces;
+    bool bloom = true;
+    render::AntiAliasing anti_aliasing = render::AntiAliasing::Taa;
     bool shadows = true;
     bool point_lights = true;
     float light_azimuth = radians(35.0f);   // around +y, from +z
@@ -920,12 +874,16 @@ struct Shading {
                                                  "occlusion", "vertex normals",
                                                  "tangents",  "shadow cascades",
                                                  "lights per cluster"};
+        static constexpr const char* kTonemaps[] = {"off", "aces", "agx"};
+        static constexpr const char* kAntiAliasing[] = {"off", "fxaa", "taa"};
         float azimuth = std::fmod(degrees(light_azimuth), 360.0f);
         if (azimuth < 0.0f) azimuth += 360.0f;
         TY_LOG_INFO("shading",
-                    "%s | view %s | tonemap %s | shadows %s | point lights %s | sun az %.0f el %.0f",
-                    kModels[model], kViews[debug_view], tonemap ? "aces" : "off", shadows ? "on" : "off",
-                    point_lights ? "on" : "off", static_cast<double>(azimuth),
+                    "%s | view %s | tonemap %s | bloom %s | aa %s | shadows %s | point lights %s | "
+                    "sun az %.0f el %.0f",
+                    kModels[model], kViews[debug_view], kTonemaps[static_cast<int>(tonemap)],
+                    bloom ? "on" : "off", kAntiAliasing[static_cast<int>(anti_aliasing)],
+                    shadows ? "on" : "off", point_lights ? "on" : "off", static_cast<double>(azimuth),
                     static_cast<double>(degrees(light_elevation)));
     }
 
@@ -933,7 +891,9 @@ struct Shading {
     bool update(const platform::Input& input, float dt) {
         using platform::Key;
         const int old_model = model, old_view = debug_view;
-        const bool old_tonemap = tonemap, old_shadows = shadows, old_lights = point_lights;
+        const render::Tonemap old_tonemap = tonemap;
+        const render::AntiAliasing old_aa = anti_aliasing;
+        const bool old_bloom = bloom, old_shadows = shadows, old_lights = point_lights;
         if (input.key_pressed(Key::Digit1)) model = 0;
         if (input.key_pressed(Key::Digit2)) model = 1;
         if (input.key_pressed(Key::Digit3)) model = 2;
@@ -945,7 +905,13 @@ struct Shading {
         if (input.key_pressed(Key::C)) debug_view = debug_view == 6 ? 0 : 6;
         if (input.key_pressed(Key::K)) debug_view = debug_view == 7 ? 0 : 7;
         if (input.key_pressed(Key::Digit0)) debug_view = 0;
-        if (input.key_pressed(Key::T)) tonemap = !tonemap;
+        if (input.key_pressed(Key::T)) {
+            tonemap = static_cast<render::Tonemap>((static_cast<int>(tonemap) + 1) % 3);
+        }
+        if (input.key_pressed(Key::G)) bloom = !bloom;
+        if (input.key_pressed(Key::H)) {
+            anti_aliasing = static_cast<render::AntiAliasing>((static_cast<int>(anti_aliasing) + 1) % 3);
+        }
         if (input.key_pressed(Key::X)) shadows = !shadows;
         if (input.key_pressed(Key::P)) point_lights = !point_lights;
         const float turn = radians(60.0f) * dt;
@@ -955,7 +921,8 @@ struct Shading {
         if (input.key_down(Key::Up)) { light_elevation = std::min(light_elevation + turn, radians(89.0f)); moved = true; }
         if (input.key_down(Key::Down)) { light_elevation = std::max(light_elevation - turn, radians(-10.0f)); moved = true; }
         const bool changed = model != old_model || debug_view != old_view || tonemap != old_tonemap ||
-                             shadows != old_shadows || point_lights != old_lights;
+                             bloom != old_bloom || anti_aliasing != old_aa || shadows != old_shadows ||
+                             point_lights != old_lights;
         if (changed) print();
         return changed || moved;
     }
@@ -1062,13 +1029,12 @@ constexpr render::ClusterGridSettings kClusterSettings{.tiles_x = 16, .tiles_y =
 struct Renderer {
     std::unique_ptr<rhi::Device> device;
     std::unique_ptr<render::FrameGraph> graph; // owns the frame's transient textures
+    std::unique_ptr<render::PostStack> post;   // bloom, TAA, tonemap, FXAA: HDR to the screen
     rhi::PipelineHandle mesh_pipeline;
     rhi::PipelineHandle triangle_pipeline;
-    rhi::PipelineHandle tonemap_pipeline;
     rhi::PipelineHandle shadow_pipeline; // depth only
     render::FallbackTextures fallbacks;
     rhi::SamplerHandle sampler;        // materials: anisotropic, repeating
-    rhi::SamplerHandle post_sampler;   // the HDR image: one texel per pixel, clamped
     rhi::SamplerHandle shadow_sampler; // the shadow maps: compared, bilinear, clamped
     rhi::TextureHandle shadow_fallback; // a 1x1 depth texture for the shadow slots when there are no maps
     rhi::ComputePipelineHandle cluster_kernel; // lists the lights per cell
@@ -1080,14 +1046,12 @@ struct Renderer {
 
     Renderer() = default;
     Renderer(Renderer&& other) noexcept
-        : device(std::move(other.device)), graph(std::move(other.graph)),
+        : device(std::move(other.device)), graph(std::move(other.graph)), post(std::move(other.post)),
           mesh_pipeline(std::exchange(other.mesh_pipeline, {})),
           triangle_pipeline(std::exchange(other.triangle_pipeline, {})),
-          tonemap_pipeline(std::exchange(other.tonemap_pipeline, {})),
           shadow_pipeline(std::exchange(other.shadow_pipeline, {})),
           fallbacks(std::exchange(other.fallbacks, render::FallbackTextures{})),
-          sampler(std::exchange(other.sampler, {})), post_sampler(std::exchange(other.post_sampler, {})),
-          shadow_sampler(std::exchange(other.shadow_sampler, {})),
+          sampler(std::exchange(other.sampler, {})), shadow_sampler(std::exchange(other.shadow_sampler, {})),
           shadow_fallback(std::exchange(other.shadow_fallback, {})),
           cluster_kernel(std::exchange(other.cluster_kernel, {})),
           light_buffer(std::exchange(other.light_buffer, {})),
@@ -1104,11 +1068,11 @@ struct Renderer {
     void destroy() noexcept {
         if (device != nullptr) {
             graph.reset(); // returns its textures first
+            post.reset();  // and its history
             for (render::Model& model : models) {
                 render::destroy_model(*device, model);
             }
             device->destroy_sampler(sampler);
-            device->destroy_sampler(post_sampler);
             device->destroy_sampler(shadow_sampler);
             device->destroy_texture(shadow_fallback);
             device->destroy_compute_pipeline(cluster_kernel);
@@ -1117,10 +1081,9 @@ struct Renderer {
             render::destroy_fallback_textures(*device, fallbacks);
             device->destroy_graphics_pipeline(mesh_pipeline);
             device->destroy_graphics_pipeline(triangle_pipeline);
-            device->destroy_graphics_pipeline(tonemap_pipeline);
             device->destroy_graphics_pipeline(shadow_pipeline);
-            mesh_pipeline = triangle_pipeline = tonemap_pipeline = shadow_pipeline = {};
-            sampler = post_sampler = shadow_sampler = {};
+            mesh_pipeline = triangle_pipeline = shadow_pipeline = {};
+            sampler = shadow_sampler = {};
             shadow_fallback = {};
             cluster_kernel = {};
             light_buffer = cluster_buffer = {};
@@ -1182,13 +1145,13 @@ Renderer create_renderer(platform::Window& window, const render::ModelData* mode
     TY_LOG_INFO("swap", "%s", r.device->swapchain_is_linear() ? "sRGB-encoded by the display hardware"
                                                              : "plain SDR; the shader encodes sRGB itself");
     r.graph = std::make_unique<render::FrameGraph>(r.device.get());
+    r.post = std::make_unique<render::PostStack>(); // declares its passes even before it can draw them
     if (r.device->shader_format() != rhi::ShaderFormat::Msl) {
         TY_LOG_WARN("gpu", "the sandbox only carries MSL until SDL_shadercross lands; drawing nothing");
         return r;
     }
 
-    // The scene pass draws into HDR with depth; the tonemap pass draws into
-    // the swapchain with neither.
+    // The scene pass draws into HDR with depth; the post stack takes it from there.
     rhi::GraphicsPipelineDesc mesh_desc;
     mesh_desc.vertex_layout = render::vertex_layout();
     mesh_desc.cull = rhi::CullMode::Back;
@@ -1205,10 +1168,10 @@ Renderer create_renderer(platform::Window& window, const render::ModelData* mode
     triangle_desc.depth_format = r.device->preferred_depth_format();
     r.triangle_pipeline = make_pipeline(*r.device, kTriangleMsl, triangle_desc, 0, 0, 0);
 
-    rhi::GraphicsPipelineDesc tonemap_desc;
-    tonemap_desc.color_formats[0] = r.device->swapchain_format();
-    tonemap_desc.color_target_count = 1;
-    r.tonemap_pipeline = make_pipeline(*r.device, kTonemapMsl, tonemap_desc, 0, 1, 1);
+    // HDR to the screen: bloom, TAA, tonemap, FXAA.
+    if (!r.post->create(*r.device, kHdrFormat, r.device->swapchain_format())) {
+        TY_LOG_ERROR("gpu", "post stack failed: %s", platform::last_error());
+    }
 
     // Shadows need the depth format to be sampled as well as drawn into.
     const rhi::TextureFormat depth_format = r.device->preferred_depth_format();
@@ -1253,11 +1216,7 @@ Renderer create_renderer(platform::Window& window, const render::ModelData* mode
     }
 
     r.sampler = r.device->create_sampler({.max_anisotropy = 8.0f});
-    r.post_sampler = r.device->create_sampler({.min_filter = rhi::Filter::Nearest,
-                                               .mag_filter = rhi::Filter::Nearest,
-                                               .address_u = rhi::AddressMode::ClampToEdge,
-                                               .address_v = rhi::AddressMode::ClampToEdge});
-    if (!render::create_fallback_textures(*r.device, r.fallbacks) || !r.sampler || !r.post_sampler) {
+    if (!render::create_fallback_textures(*r.device, r.fallbacks) || !r.sampler) {
         TY_LOG_ERROR("gpu", "fallback textures or sampler failed: %s", platform::last_error());
         return r;
     }
@@ -1407,7 +1366,15 @@ void draw_frame(Renderer& renderer, rhi::Frame& frame, scene::World& world, cons
         graph.create("depth", {.format = depth_format, .width = screen.width, .height = screen.height});
 
     const float aspect = static_cast<float>(frame.width()) / static_cast<float>(frame.height());
-    const Mat4 view_projection = fly.camera.view_projection(aspect);
+    // The post stack's settings follow the keys; a data view goes to the
+    // screen as it is, untonemapped and without bloom.
+    render::PostStack& post = *renderer.post;
+    post.settings.tonemap = shading.view_is_lit() ? shading.tonemap : render::Tonemap::None;
+    post.settings.bloom = shading.view_is_lit() && shading.bloom;
+    post.settings.anti_aliasing = shading.anti_aliasing;
+    // TAA draws the scene a fraction of a pixel off each frame.
+    const Vec2 jitter = post.jitter(frame.width(), frame.height());
+    const Mat4 view_projection = fly.camera.view_projection(aspect, jitter);
     const Vec3 light = shading.light_direction();
     // The scene shader reads the cluster table whether or not any light is
     // on, so without the cluster resources there is no scene to draw.
@@ -1546,31 +1513,12 @@ void draw_frame(Renderer& renderer, rhi::Frame& frame, scene::World& world, cons
                 }
             });
         });
-    // Debug views are data, not light: they go to the screen as they are.
-    const PostUniforms post{{shading.tonemap && shading.view_is_lit() ? 1.0f : 0.0f,
-                             renderer.device->swapchain_is_linear() ? 0.0f : 1.0f, 0.0f, 0.0f}};
-    graph.add_pass(
-        "tonemap",
-        [&](render::PassBuilder& b) {
-            b.read(hdr);
-            // The triangle covers every pixel, so nothing needs loading — unless
-            // there is no pipeline to draw it (no shaders for this backend yet),
-            // when a clear is all the frame has.
-            if (renderer.tonemap_pipeline) {
-                swapchain = b.write_color(swapchain, rhi::LoadOp::DontCare);
-            } else {
-                swapchain = b.write_color(swapchain, rhi::LoadOp::Clear, kSkyColor);
-            }
-        },
-        [&](rhi::RenderPass& pass, const render::PassResources& resources) {
-            if (!renderer.tonemap_pipeline) {
-                return;
-            }
-            pass.bind_pipeline(renderer.tonemap_pipeline);
-            pass.bind_fragment_texture(0, resources.texture(hdr), renderer.post_sampler);
-            pass.push_fragment_uniforms(0, &post, sizeof post);
-            pass.draw(3);
-        });
+    post.add_passes(graph, hdr, depth, swapchain,
+                    {.width = frame.width(),
+                     .height = frame.height(),
+                     .encode_srgb = !renderer.device->swapchain_is_linear(),
+                     .view_projection = fly.camera.view_projection(aspect),
+                     .view_projection_jittered = view_projection});
     if (graph.compile()) {
         // The lights go up before any pass runs: a copy on the frame's
         // timeline, no wait.
@@ -1594,7 +1542,7 @@ void report_graph(const render::FrameGraph& graph) {
                 static_cast<double>(stats.bytes_allocated) / 1048576.0,
                 static_cast<double>(stats.bytes_requested) / 1048576.0, stats.attachments_stored,
                 stats.attachments_discarded, stats.memoryless);
-    char text[2048];
+    char text[4096];
     graph.describe(text, sizeof text);
     for (char* line = text; *line != '\0';) {
         char* end = std::strchr(line, '\n');
@@ -1701,7 +1649,8 @@ int main(int argc, char** argv) {
     TY_LOG_INFO("controls", "F follows the character: then WASD walk it, Space jumps, Shift runs");
     TY_LOG_INFO("controls", "1/2/3 unlit / Blinn-Phong / Cook-Torrance, N/M/O/V/B debug views, C shows the "
                             "shadow cascades, K the lights per cluster; X toggles shadows, P the point "
-                            "lights, T tonemap; arrows move the sun");
+                            "lights, G bloom; T cycles the tonemapper, H the anti-aliasing; arrows move "
+                            "the sun");
 
     Renderer renderer = options.headless ? Renderer{} : create_renderer(*window, has_model ? &model_data : nullptr);
     bool reported_swapchain = false;

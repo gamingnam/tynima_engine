@@ -21,10 +21,18 @@ struct Camera {
     [[nodiscard]] math::Mat4 view() const noexcept {
         return math::rotation(math::conjugate(rotation)) * math::translation(-position);
     }
-    [[nodiscard]] math::Mat4 projection(float aspect) const noexcept {
-        return math::perspective_infinite_reverse_z(fov_y, aspect, near);
+    // `jitter` shifts the image by that much in clip space (NDC units: two
+    // across the frame) — temporal anti-aliasing's sub-pixel offset.
+    [[nodiscard]] math::Mat4 projection(float aspect, math::Vec2 jitter = {}) const noexcept {
+        math::Mat4 p = math::perspective_infinite_reverse_z(fov_y, aspect, near);
+        // clip.w is -z, so clip.xy += jitter * clip.w is a -jitter on the z column.
+        p(0, 2) -= jitter.x;
+        p(1, 2) -= jitter.y;
+        return p;
     }
-    [[nodiscard]] math::Mat4 view_projection(float aspect) const noexcept { return projection(aspect) * view(); }
+    [[nodiscard]] math::Mat4 view_projection(float aspect, math::Vec2 jitter = {}) const noexcept {
+        return projection(aspect, jitter) * view();
+    }
 
     // Faces `target`, keeping the horizon level with `up`.
     void look_at(const math::Vec3& target, const math::Vec3& up = math::Vec3::unit_y()) noexcept;

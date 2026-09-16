@@ -50,8 +50,8 @@ The sandbox loads a glTF model (a CC0 Khronos sample, downloaded into
 `build/<preset>/assets/` at configure time) with its base color texture,
 draws it with a reverse-Z depth buffer through SDL3 GPU with its Metal shaders
 compiled at runtime — sRGB textures sampled through sRGB formats, lighting in
-linear into a 16-bit float target, tonemapped onto an sRGB-encoded swapchain
-in a second pass — and lets you fly around it: hold the right mouse button to look, W/A/S/D to move, Q/E
+linear into a 16-bit float target, bloomed, anti-aliased and tonemapped onto
+an sRGB-encoded swapchain by the post stack — and lets you fly around it: hold the right mouse button to look, W/A/S/D to move, Q/E
 to descend and climb, Shift to run, Escape to quit. `F` puts the camera
 behind the character instead: then W/A/S/D walk it, Space jumps, Shift
 runs, and it can shove bottles about, push the gate open and swing the
@@ -60,7 +60,8 @@ unlit, Blinn-Phong and Cook-Torrance shading; `N`/`M`/`O`/`V`/`B` show the
 mapped normals, metallic/roughness, occlusion, vertex normals and tangents;
 `C` tints the picture by shadow cascade and `X` turns shadows off; `K`
 shows how many point lights each cluster holds and `P` turns the hundred of
-them off; `T` toggles tonemapping; the arrow keys move the sun. `--model path.glb` loads
+them off; `G` toggles bloom, `T` cycles the tonemapper (off, ACES, AgX) and
+`H` the anti-aliasing (off, FXAA, TAA); the arrow keys move the sun. `--model path.glb` loads
 something else. `--headless --frames N` runs the same loop with no window and
 no GPU (the model still loads) with a scripted player at the keyboard, which
 is what the `sandbox_headless` CTest does on CI. `--record run.tyrec` writes
@@ -325,6 +326,27 @@ arithmetic the shaders use — slice from depth, cell box from tile and slice
 light inside the grid to be listed by its own cell and every listed light to
 actually reach its cell, and where a GPU exists they run the kernel and
 compare its table with the CPU's cell for cell.
+
+### Post
+
+`render::PostStack` ([`post.h`](engine/render/include/tynima/render/post.h))
+takes the lit HDR image to the screen, every step a pass in the graph and
+every step optional: **bloom** — the bright parts (a soft-kneed threshold)
+downsampled through Jimenez's 13-tap filter to a fifth of a fifth of the
+size and brought back up through a 3×3 tent, each level adding its own —
+then **TAA** — the scene drawn a Halton-sequence fraction of a pixel off
+each frame and blended nine-to-one with the last frame fetched from where
+each pixel's surface was then (reprojected through the depth buffer),
+clamped to the neighbourhood's colour range in YCoCg so a moved object
+leaves no trail, weighted by inverse luminance so a bright speck does not
+flicker in; the resolved image is written straight into the history texture
+the next frame reads — then **tonemapping**, ACES (Narkowicz's fit) or AgX
+(Sobotka's, in Wrensch's compact form), leaving linear light for the sRGB
+encode — then **FXAA**, Lottes's filter in its compact form, when TAA is
+not on. The stack declares its passes with or without a device, which is
+how the tests check the chain's shape: five downsamples and four upsamples
+at 720p, the tonemap reading the top of the chain, FXAA reading an LDR
+intermediate, the depth buffer staying on-tile until TAA asks for it.
 
 ## Logging and asserts
 
