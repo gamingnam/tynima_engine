@@ -834,7 +834,9 @@ fragment float4 fs_main(VSOut in [[stage_in]]) { return in.color; }
                 pass->bind_index_buffer(index_buffer, rhi::IndexType::Uint16);
                 pass->set_scissor(0, 0, 4, 4);
                 pass->draw_indexed(6);
-                pass->set_scissor(100, 100, 100, 100); // past the target: clipped to nothing
+                pass->set_scissor(100, 100, 100, 100); // past the target: this draws nothing at all
+                pass->draw_indexed(6);
+                pass->set_scissor(6, 0, 100, 100); // reaching past it: clipped to the last two columns
                 pass->draw_indexed(6);
                 pass->end();
             }
@@ -842,12 +844,13 @@ fragment float4 fs_main(VSOut in [[stage_in]]) { return in.color; }
 
             std::uint8_t pixels[8 * 4 * 4];
             REQUIRE_MESSAGE(device->download_texture(target, pixels, sizeof pixels), platform::last_error());
-            // Left half: red blended with half-transparent white = (1, 0.5, 0.5, 1); right half: red.
+            // Columns 0-3 and 6-7: red blended with half-transparent white =
+            // (1, 0.5, 0.5, 1); columns 4 and 5: red, untouched.
             int wrong = 0;
             for (int y = 0; y < 4; ++y) {
                 for (int x = 0; x < 8; ++x) {
                     const std::uint8_t* p = pixels + (y * 8 + x) * 4;
-                    const int g = x < 4 ? 128 : 0;
+                    const int g = x < 4 || x >= 6 ? 128 : 0;
                     wrong += std::abs(int{p[0]} - 255) <= 1 && std::abs(int{p[1]} - g) <= 1 &&
                                      std::abs(int{p[2]} - g) <= 1 && std::abs(int{p[3]} - 255) <= 1
                                  ? 0
@@ -855,8 +858,9 @@ fragment float4 fs_main(VSOut in [[stage_in]]) { return in.color; }
                 }
             }
             MESSAGE("pixel (0,0): ", int{pixels[0]}, " ", int{pixels[1]}, " ", int{pixels[2]}, " ",
-                    int{pixels[3]}, "; pixel (7,0): ", int{pixels[28]}, " ", int{pixels[29]}, " ",
-                    int{pixels[30]}, " ", int{pixels[31]});
+                    int{pixels[3]}, "; pixel (5,0): ", int{pixels[20]}, " ", int{pixels[21]}, " ",
+                    int{pixels[22]}, " ", int{pixels[23]}, "; pixel (7,3): ", int{pixels[124]}, " ",
+                    int{pixels[125]}, " ", int{pixels[126]}, " ", int{pixels[127]});
             CHECK(wrong == 0);
 
             device->destroy_texture(target);

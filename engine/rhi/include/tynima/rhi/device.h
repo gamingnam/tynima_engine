@@ -319,8 +319,9 @@ public:
     void push_fragment_uniforms(std::uint32_t slot, const void* data, std::uint32_t size) noexcept;
 
     // Limits the next draws to a rectangle of the attachments, in pixels
-    // from the top left; clipped to the attachments' size. A pass starts
-    // with the whole attachment.
+    // from the top left, clipped to the attachments' size; one that clips
+    // to nothing makes the draws until the next scissor draw nothing. A
+    // pass starts with the whole attachment.
     void set_scissor(std::uint32_t x, std::uint32_t y, std::uint32_t width, std::uint32_t height) noexcept;
 
     void draw(std::uint32_t vertex_count, std::uint32_t instance_count = 1) noexcept;

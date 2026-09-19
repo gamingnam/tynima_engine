@@ -452,14 +452,19 @@ void Runtime::render_frame() {
             target = graph.import("viewport", viewport_,
                                   {.format = device_->swapchain_format(), .width = width, .height = height});
         }
-        post_.add_passes(graph, hdr, depth, target,
-                         {.width = width,
-                          .height = height,
-                          .encode_srgb = !device_->swapchain_is_linear(),
-                          .view_projection = camera.view_projection(aspect),
-                          .view_projection_jittered = camera.view_projection(aspect, scene_frame.jitter)});
+        // The post stack's last pass produces the picture: the UI reads or
+        // loads that version, which is what puts the UI pass after it.
+        target = post_.add_passes(graph, hdr, depth, target,
+                                  {.width = width,
+                                   .height = height,
+                                   .encode_srgb = !device_->swapchain_is_linear(),
+                                   .view_projection = camera.view_projection(aspect),
+                                   .view_projection_jittered = camera.view_projection(aspect, scene_frame.jitter)});
         post_.settings.tonemap = tonemap;
         post_.settings.bloom = bloom;
+        if (!to_viewport) {
+            swapchain = target;
+        }
         // The UI over the top: over the picture, or over a cleared window
         // when the picture went to the viewport texture (which the UI shows).
         if (to_viewport || (ui_.can_draw() && ui_.has_draw_data())) {

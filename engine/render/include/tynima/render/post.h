@@ -67,9 +67,11 @@ public:
 
     // Adds this frame's passes to `graph`: from `hdr` (with `depth` beside
     // it, for TAA's reprojection) to `swapchain`. Call once per frame, after
-    // the scene pass is declared; then compile and execute as usual.
-    void add_passes(FrameGraph& graph, GraphTexture hdr, GraphTexture depth, GraphTexture swapchain,
-                    const PostFrame& frame) noexcept;
+    // the scene pass is declared; then compile and execute as usual. Returns
+    // the version of `swapchain` the last pass wrote: what a pass drawing
+    // over the picture (a UI) must read or load, so that it runs after.
+    GraphTexture add_passes(FrameGraph& graph, GraphTexture hdr, GraphTexture depth, GraphTexture swapchain,
+                            const PostFrame& frame) noexcept;
 
     [[nodiscard]] bool ready() const noexcept { return device_ != nullptr; }
 

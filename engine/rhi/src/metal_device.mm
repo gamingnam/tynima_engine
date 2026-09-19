@@ -340,7 +340,8 @@ private:
     // the index buffer for the next indexed draw. One pass at a time.
     MTLPrimitiveType primitive_ = MTLPrimitiveTypeTriangle;
     std::uint32_t fragment_uniforms_ = 0;
-    Extent2D pass_extent_{}; // the attachments' size, which a scissor rectangle is clipped to
+    Extent2D pass_extent_{};      // the attachments' size, which a scissor rectangle is clipped to
+    bool scissor_empty_ = false; // the scissor clipped to nothing: draws are skipped
     id<MTLBuffer> index_buffer_ = nil;
     MTLIndexType index_type_ = MTLIndexTypeUInt32;
     std::uint32_t index_offset_ = 0;
@@ -1279,6 +1280,7 @@ std::optional<RenderPass> MetalDevice::frame_begin_pass(void* frame_pointer,
     [encoder setFrontFacingWinding:MTLWindingCounterClockwise];
     index_buffer_ = nil;
     pass_extent_ = extent;
+    scissor_empty_ = false;
     return make_render_pass(this, frame_pointer, retain(encoder), labelled);
 }
 
@@ -1362,24 +1364,30 @@ void MetalDevice::pass_push_fragment_uniforms(void*, void* pass, std::uint32_t s
 void MetalDevice::pass_set_scissor(void* pass, std::uint32_t x, std::uint32_t y, std::uint32_t width,
                                    std::uint32_t height) noexcept {
     TY_EXTERNAL_ALLOCATIONS();
-    // Metal refuses a rectangle that reaches past the attachments; clip it,
-    // and an empty one becomes a single pixel that no draw will touch.
+    // Metal refuses a rectangle that reaches past the attachments, so it is
+    // clipped; one that is left empty cannot be expressed at all, so the
+    // draws are skipped instead until the next scissor.
     const std::uint32_t x0 = std::min(x, pass_extent_.width);
     const std::uint32_t y0 = std::min(y, pass_extent_.height);
     const std::uint32_t x1 = std::min(x0 + width, pass_extent_.width);
     const std::uint32_t y1 = std::min(y0 + height, pass_extent_.height);
+    scissor_empty_ = x1 <= x0 || y1 <= y0;
+    if (scissor_empty_) {
+        return;
+    }
     MTLScissorRect rect{};
     rect.x = x0;
     rect.y = y0;
-    rect.width = std::max(x1 - x0, 1u);
-    rect.height = std::max(y1 - y0, 1u);
-    if (rect.x + rect.width > pass_extent_.width) rect.x = pass_extent_.width - rect.width;
-    if (rect.y + rect.height > pass_extent_.height) rect.y = pass_extent_.height - rect.height;
+    rect.width = x1 - x0;
+    rect.height = y1 - y0;
     [bridge<id<MTLRenderCommandEncoder>>(pass) setScissorRect:rect];
 }
 
 void MetalDevice::pass_draw(void* pass, std::uint32_t vertex_count, std::uint32_t instance_count) noexcept {
     TY_EXTERNAL_ALLOCATIONS();
+    if (scissor_empty_) {
+        return;
+    }
     [bridge<id<MTLRenderCommandEncoder>>(pass) drawPrimitives:primitive_
                                                   vertexStart:0
                                                   vertexCount:vertex_count
@@ -1390,7 +1398,7 @@ void MetalDevice::pass_draw_indexed(void* pass, std::uint32_t index_count, std::
                                     std::int32_t vertex_offset, std::uint32_t instance_count) noexcept {
     TY_EXTERNAL_ALLOCATIONS();
     TY_ASSERT(index_buffer_ != nil, "draw_indexed: no index buffer bound");
-    if (index_buffer_ == nil) {
+    if (index_buffer_ == nil || scissor_empty_) {
         return;
     }
     const std::uint32_t index_size = index_type_ == MTLIndexTypeUInt16 ? 2 : 4;

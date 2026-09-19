@@ -425,8 +425,8 @@ bool PostStack::ensure_history(std::uint32_t width, std::uint32_t height) noexce
 // no device compiles them all the same, which is how the tests see the
 // shape); without them the callbacks draw nothing and the swapchain is
 // cleared rather than left to chance.
-void PostStack::add_passes(FrameGraph& graph, GraphTexture hdr, GraphTexture depth, GraphTexture swapchain,
-                           const PostFrame& frame) noexcept {
+GraphTexture PostStack::add_passes(FrameGraph& graph, GraphTexture hdr, GraphTexture depth,
+                                   GraphTexture swapchain, const PostFrame& frame) noexcept {
     const TextureInfo screen{.format = hdr_format_, .width = frame.width, .height = frame.height};
     const rhi::ClearColor black{};
     const rhi::LoadOp present_load = ready() ? rhi::LoadOp::DontCare : rhi::LoadOp::Clear;
@@ -601,6 +601,7 @@ void PostStack::add_passes(FrameGraph& graph, GraphTexture hdr, GraphTexture dep
             });
     }
     ++frame_index_;
+    return swapchain;
 }
 
 } // namespace tynima::render

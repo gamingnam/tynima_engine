@@ -350,7 +350,8 @@ private:
     bool want_linear_swapchain_;
     bool swapchain_linear_ = false;
     TextureFormat swapchain_format_ = TextureFormat::Bgra8Unorm;
-    Extent2D pass_extent_{}; // the current pass's attachment size, which a scissor is clipped to
+    Extent2D pass_extent_{};     // the current pass's attachment size, which a scissor is clipped to
+    bool scissor_empty_ = false; // the scissor clipped to nothing: draws are skipped
 };
 
 // One pool per resource type. Handles index into these; the device's public
@@ -442,28 +443,39 @@ void SdlDevice::pass_push_fragment_uniforms(void* command_buffer, void*, std::ui
 void SdlDevice::pass_set_scissor(void* pass, std::uint32_t x, std::uint32_t y, std::uint32_t width,
                                  std::uint32_t height) noexcept {
     TY_EXTERNAL_ALLOCATIONS();
-    // Clipped to the attachments, as the GPU APIs underneath require; an
-    // empty rectangle becomes one pixel that no draw will touch.
+    // Clipped to the attachments, as the GPU APIs underneath require; a
+    // rectangle left empty cannot be expressed, so the draws are skipped
+    // instead until the next scissor.
     const std::uint32_t x0 = std::min(x, pass_extent_.width);
     const std::uint32_t y0 = std::min(y, pass_extent_.height);
     const std::uint32_t x1 = std::min(x0 + width, pass_extent_.width);
     const std::uint32_t y1 = std::min(y0 + height, pass_extent_.height);
+    scissor_empty_ = x1 <= x0 || y1 <= y0;
+    if (scissor_empty_) {
+        return;
+    }
     SDL_Rect rect{};
-    rect.w = static_cast<int>(std::max(x1 - x0, 1u));
-    rect.h = static_cast<int>(std::max(y1 - y0, 1u));
-    rect.x = static_cast<int>(std::min(x0, pass_extent_.width - static_cast<std::uint32_t>(rect.w)));
-    rect.y = static_cast<int>(std::min(y0, pass_extent_.height - static_cast<std::uint32_t>(rect.h)));
+    rect.x = static_cast<int>(x0);
+    rect.y = static_cast<int>(y0);
+    rect.w = static_cast<int>(x1 - x0);
+    rect.h = static_cast<int>(y1 - y0);
     SDL_SetGPUScissor(rp(pass), &rect);
 }
 
 void SdlDevice::pass_draw(void* pass, std::uint32_t vertex_count, std::uint32_t instance_count) noexcept {
     TY_EXTERNAL_ALLOCATIONS();
+    if (scissor_empty_) {
+        return;
+    }
     SDL_DrawGPUPrimitives(rp(pass), vertex_count, instance_count, 0, 0);
 }
 
 void SdlDevice::pass_draw_indexed(void* pass, std::uint32_t index_count, std::uint32_t first_index,
                                   std::int32_t vertex_offset, std::uint32_t instance_count) noexcept {
     TY_EXTERNAL_ALLOCATIONS();
+    if (scissor_empty_) {
+        return;
+    }
     SDL_DrawGPUIndexedPrimitives(rp(pass), index_count, instance_count, first_index, vertex_offset, 0);
 }
 
@@ -601,6 +613,7 @@ std::optional<RenderPass> SdlDevice::frame_begin_pass(void* command_buffer,
         return std::nullopt;
     }
     pass_extent_ = extent;
+    scissor_empty_ = false;
     return make_render_pass(this, command_buffer, pass, labelled);
 }
 

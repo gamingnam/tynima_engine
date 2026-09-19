@@ -53,7 +53,7 @@ Declared declare(FrameGraph& graph, PostStack& stack, std::uint32_t width, std::
                           .encode_srgb = false,
                           .view_projection = camera.view_projection(16.0f / 9.0f),
                           .view_projection_jittered = camera.view_projection(16.0f / 9.0f)};
-    stack.add_passes(graph, d.hdr, d.depth, d.swapchain, frame);
+    d.swapchain = stack.add_passes(graph, d.hdr, d.depth, d.swapchain, frame);
     return d;
 }
 
@@ -132,15 +132,29 @@ TEST_CASE("the stack declares bloom, tonemap and FXAA passes in order, and TAA o
         CHECK(graph.pass_count() == 2);
         CHECK(described(graph).find("tonemap: reads hdr; writes swapchain") != std::string::npos);
     }
-    SUBCASE("FXAA after the tonemap") {
+    SUBCASE("a pass over the picture, reading the version the stack returns, runs after it") {
+        // The editor's frame: the stack draws into a viewport texture, and
+        // the UI pass shows it on the window — so it must read the version
+        // the stack wrote, and run after the pass that wrote it.
         stack.settings.anti_aliasing = AntiAliasing::Fxaa;
         stack.settings.bloom = false;
-        (void)declare(graph, stack, 1280, 720);
+        const Declared d = declare(graph, stack, 1280, 720);
+        CHECK(d.swapchain.version == graph.texture(d.swapchain.index).versions);
+        CHECK(d.swapchain.version == 1); // the tonemap wrote the LDR image; FXAA wrote the picture once
+        const GraphTexture viewport = d.swapchain;
+        GraphTexture window =
+            graph.import("window", rhi::TextureHandle{8, 1}, {rhi::TextureFormat::Bgra8Srgb, 1600, 960});
+        graph.add_pass(
+            "ui",
+            [&](PassBuilder& b) {
+                b.read(viewport);
+                window = b.write_color(window, rhi::LoadOp::Clear);
+            },
+            nothing);
         REQUIRE_MESSAGE(graph.compile(), graph.error());
         const std::string text = described(graph);
-        CHECK(text.find("tonemap: reads hdr; writes ldr (dontcare, store)\n") != std::string::npos);
-        CHECK(text.find("fxaa: reads ldr; writes swapchain (clear, store)\n") != std::string::npos);
-        CHECK(text.find("tonemap:") < text.find("fxaa:"));
+        CHECK(text.find("fxaa:") < text.find("ui:"));
+        CHECK(text.find("ui: reads swapchain; writes window (clear, store)") != std::string::npos);
     }
     SUBCASE("TAA asked for, no device: the frame still presents") {
         stack.settings.anti_aliasing = AntiAliasing::Taa;
