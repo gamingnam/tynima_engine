@@ -7,6 +7,7 @@
 
 #include <cmath>
 #include <cstdint>
+#include <string>
 #include <vector>
 
 using namespace tynima;
@@ -299,4 +300,30 @@ TEST_CASE("update_bodies moves entities with their physics bodies") {
     CHECK(approx_equal(world.get<Transform>(stale)->position, Vec3{1, 1, 1}));
     CHECK(approx_equal(world.get<Transform>(bodiless)->position, Vec3{2, 2, 2}));
     CHECK(world.alive(stale));
+}
+
+TEST_CASE("an entity lists its components, ascending, and a Name is plain data that fits") {
+    World world(64);
+    const scene::ComponentId transform = world.component_id<scene::Transform>();
+    const scene::ComponentId name = world.component_id<scene::Name>();
+    const scene::ComponentId renderer = world.component_id<scene::MeshRenderer>();
+    const Entity e = world.create(scene::MeshRenderer{.model = 3}, scene::Name("crate"), scene::Transform{});
+    scene::ComponentId ids[scene::kMaxComponentTypes];
+    REQUIRE(world.entity_components(e, ids, scene::kMaxComponentTypes) == 3);
+    CHECK(ids[0] == transform); // registered first, so the lowest id
+    CHECK(ids[1] == name);
+    CHECK(ids[2] == renderer);
+    // A small buffer gets the first ones and the whole count.
+    scene::ComponentId two[2];
+    CHECK(world.entity_components(e, two, 2) == 3);
+    CHECK(two[1] == name);
+    CHECK(world.entity_components(Entity{}, ids, scene::kMaxComponentTypes) == 0);
+    CHECK(world.entity_components(world.create(), ids, scene::kMaxComponentTypes) == 0);
+
+    const scene::Name* n = world.get<scene::Name>(e);
+    REQUIRE(n != nullptr);
+    CHECK(std::string(n->text) == "crate");
+    scene::Name longer("a name that is far too long for the component's fixed storage");
+    CHECK(std::string(longer.text).size() == scene::Name::kCapacity - 1);
+    CHECK(std::string(scene::Name(nullptr).text).empty());
 }

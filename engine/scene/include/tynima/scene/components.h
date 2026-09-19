@@ -11,6 +11,25 @@
 // hot-reloaded game module includes this without linking the engine.
 namespace tynima::scene {
 
+// What an entity is called, for people: the hierarchy panel, a scene file.
+// Fixed storage, so it is plain data like every component; longer names
+// are cut. Never required — an entity without one is "entity N".
+struct Name {
+    static constexpr const char* kName = "Name";
+    static constexpr std::uint32_t kCapacity = 32; // bytes, including the terminator
+    char text[kCapacity] = {};
+
+    Name() = default;
+    explicit Name(const char* value) noexcept { set(value); }
+    void set(const char* value) noexcept {
+        std::uint32_t i = 0;
+        for (; value != nullptr && value[i] != '\0' && i < kCapacity - 1; ++i) {
+            text[i] = value[i];
+        }
+        text[i] = '\0';
+    }
+};
+
 // Where an entity is, relative to its Parent (or the world when it has none).
 struct Transform {
     static constexpr const char* kName = "Transform";

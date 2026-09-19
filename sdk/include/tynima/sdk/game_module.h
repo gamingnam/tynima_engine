@@ -9,14 +9,21 @@
 #include <cstdint>
 #include <string>
 
+namespace tynima::sdk {
+class Runtime;
+}
+
 // What the engine hands a game module: filled in by the host each frame,
 // read by the C API functions in api.cpp. The module only ever sees the
-// opaque pointer. Log lines go to the engine's logger under "game".
+// opaque pointer. Log lines go to the engine's logger under "game". A
+// Runtime fills one in for the host functions of tynima.h too, and points
+// it back at itself.
 struct tynima_engine {
     tynima::scene::World* world = nullptr;
     const tynima::platform::Input* input = nullptr;
     tynima::physics::PhysicsWorld* physics = nullptr; // optional
     double time_seconds = 0.0;
+    tynima::sdk::Runtime* runtime = nullptr; // optional: the host functions need one
 };
 
 namespace tynima::sdk {

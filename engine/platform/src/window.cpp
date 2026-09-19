@@ -75,6 +75,15 @@ void Window::set_relative_mouse_mode(bool enabled) noexcept {
     SDL_SetWindowRelativeMouseMode(handle_, enabled);
 }
 
+void Window::set_text_input(bool enabled) noexcept {
+    TY_EXTERNAL_ALLOCATIONS();
+    if (enabled) {
+        SDL_StartTextInput(handle_);
+    } else {
+        SDL_StopTextInput(handle_);
+    }
+}
+
 void* Window::native_handle() const noexcept {
     return handle_;
 }

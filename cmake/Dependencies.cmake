@@ -89,6 +89,29 @@ FetchContent_Declare(jolt
   EXCLUDE_FROM_ALL SYSTEM)
 FetchContent_MakeAvailable(jolt)
 
+# Dear ImGui, the docking branch: every panel of the editor, and any debug
+# overlay a game wants. Only the library itself is built; the platform and
+# renderer sides are the engine's own (engine/ui), on top of platform/ and
+# rhi/, so ImGui never sees SDL or Metal and draws through the same RHI as
+# the scene. Only ui/ and the editor may include its headers.
+FetchContent_Declare(imgui
+  URL      https://github.com/ocornut/imgui/archive/refs/tags/v1.92.9b-docking.tar.gz
+  URL_HASH SHA256=90ded916bd57db2e0e171b6b098940a47c6f5042725dcdc67fb19940ca8bfdcc
+  EXCLUDE_FROM_ALL SYSTEM)
+FetchContent_MakeAvailable(imgui)
+add_library(imgui STATIC
+  ${imgui_SOURCE_DIR}/imgui.cpp
+  ${imgui_SOURCE_DIR}/imgui_demo.cpp
+  ${imgui_SOURCE_DIR}/imgui_draw.cpp
+  ${imgui_SOURCE_DIR}/imgui_tables.cpp
+  ${imgui_SOURCE_DIR}/imgui_widgets.cpp)
+target_include_directories(imgui SYSTEM PUBLIC ${imgui_SOURCE_DIR})
+target_compile_features(imgui PUBLIC cxx_std_20)
+# No pre-1.92 API, so the texture protocol the engine implements is the only one.
+target_compile_definitions(imgui PUBLIC IMGUI_DISABLE_OBSOLETE_FUNCTIONS)
+set_target_properties(imgui PROPERTIES FOLDER "third_party")
+add_library(imgui::imgui ALIAS imgui)
+
 if(TYNIMA_PROFILE)
   # The client must match the profiler GUI's version: 0.13.1 is what
   # `brew install tracy` ships. Bump both together.

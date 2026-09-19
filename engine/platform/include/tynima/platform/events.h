@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <vector>
 
@@ -13,7 +14,10 @@ enum class EventType : std::uint8_t {
     WindowResized,    // width/height and pixel_width/pixel_height are filled in
     WindowFocusGained,
     WindowFocusLost,
+    TextInput,        // text typed, once Window::set_text_input(true): `text` is filled in
 };
+
+inline constexpr std::size_t kMaxEventText = 32; // one TextInput event's UTF-8 bytes, plus the terminator
 
 struct Event {
     EventType type;
@@ -22,6 +26,7 @@ struct Event {
     int height = 0;
     int pixel_width = 0;         // WindowResized: pixels
     int pixel_height = 0;
+    char text[kMaxEventText] = {}; // TextInput: UTF-8, NUL-terminated; longer input arrives as several events
 };
 
 // Drains the OS event queue once: starts a new input frame on `input`, applies

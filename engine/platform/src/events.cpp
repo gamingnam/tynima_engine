@@ -6,6 +6,8 @@
 
 #include "sdl.h"
 
+#include <cstring>
+
 namespace tynima::platform {
 
 namespace {
@@ -86,6 +88,32 @@ void pump_events(Input& input, std::vector<Event>& events) {
         case SDL_EVENT_MOUSE_WHEEL:
             Input::Writer::wheel(input, e.wheel.x, e.wheel.y);
             break;
+        case SDL_EVENT_TEXT_INPUT: {
+            // SDL frees the text on the next poll, so it is copied out, cut
+            // into events of kMaxEventText - 1 bytes at UTF-8 boundaries.
+            const char* text = e.text.text != nullptr ? e.text.text : "";
+            while (*text != '\0') {
+                Event event{};
+                event.type = EventType::TextInput;
+                event.window_id = e.text.windowID;
+                std::size_t n = 0;
+                while (text[n] != '\0' && n < kMaxEventText - 1) {
+                    ++n;
+                }
+                // Never split a code point: back up to the start of the one the cut landed in.
+                while (n > 0 && text[n] != '\0' && (static_cast<unsigned char>(text[n]) & 0xC0) == 0x80) {
+                    --n;
+                }
+                if (n == 0) {
+                    break; // a code point longer than the buffer: impossible for UTF-8, but never spin
+                }
+                std::memcpy(event.text, text, n);
+                event.text[n] = '\0';
+                events.push_back(event);
+                text += n;
+            }
+            break;
+        }
         default:
             break;
         }

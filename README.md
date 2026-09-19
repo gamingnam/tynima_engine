@@ -15,13 +15,14 @@ past that declaration.
 
 | Module            | Depends on                           | Responsibility                                              |
 | ----------------- | ------------------------------------ | ----------------------------------------------------------- |
-| `editor/`         | `sdk`                                | ImGui tools — a client of the SDK, no special privileges    |
-| `sdk/`            | everything below                     | `tynima.h` C ABI; later the CLI, templates, codegen         |
+| `editor/`         | `sdk` (and Dear ImGui's headers)     | The editor — a client of the SDK, no special privileges     |
+| `sdk/`            | everything below                     | `tynima.h` C ABI and the runtime behind its host half       |
 | `engine/script/`  | `core scene assets`                  | Lua / C# bindings generated from reflection                 |
 | `engine/assets/`  | `core platform render scene`         | Runtime loading of cooked blobs, GPU upload, hot reload     |
 | `engine/scene/`   | `core render physics`                | Archetype ECS, transforms, the systems that drive the rest  |
 | `engine/physics/` | `core`                               | Rigid bodies behind `PhysicsWorld`: Jolt now, ours next     |
-| `engine/render/`  | `core platform rhi`                  | Frame graph, passes, materials, culling                     |
+| `engine/ui/`      | `core platform rhi`                  | Dear ImGui, fed by `platform` and drawn through `rhi`       |
+| `engine/render/`  | `core platform rhi`                  | Frame graph, the scene renderer, materials, the post stack  |
 | `engine/rhi/`     | `core platform`                      | Render hardware interface — SDL3 GPU and native Metal       |
 | `engine/platform/`| `core`                               | Window, input, filesystem, time, threads (wraps SDL3)       |
 | `engine/core/`    | —                                    | Allocators, containers, math, jobs, logging, reflection     |
@@ -30,7 +31,8 @@ past that declaration.
 
 Transitive dependencies don't count: if a file includes `tynima/rhi/...`, its
 module must declare `rhi`. Nothing may depend on an app, and `editor` may depend
-on `sdk` alone.
+on `sdk` alone. Third-party headers have one home each: SDL3 in `platform`
+and `rhi`, Jolt in `physics`, Dear ImGui in `ui` and the editor.
 
 ## Build
 
@@ -44,6 +46,7 @@ cmake --preset macos-debug
 cmake --build --preset macos-debug
 ctest --preset macos-debug
 ./build/macos-debug/apps/sandbox/tynima-sandbox
+./build/macos-debug/editor/tynima-editor --model build/macos-debug/assets/WaterBottle.glb
 ```
 
 The sandbox loads a glTF model (a CC0 Khronos sample, downloaded into
@@ -88,6 +91,87 @@ and `ctest --preset windows-debug`.
 Options (`-D` at configure time): `TYNIMA_BUILD_TESTS`, `TYNIMA_BUILD_EDITOR`,
 `TYNIMA_BUILD_APPS`, `TYNIMA_FETCH_SDL3`, `TYNIMA_WARNINGS_AS_ERRORS` (on in CI).
 
+## The editor
+
+`tynima-editor` is the first tool, and the rule it lives by is the one the
+roadmap set for it: it is a client of the SDK with no special privileges.
+It includes [`tynima.h`](sdk/include/tynima.h) and Dear ImGui's headers and
+nothing else — `tools/check_layering.py` fails the build otherwise — so
+anything the editor can do, a game's runtime can do through the same header.
+When the editor needed something the header lacked, the header grew: that is
+how the SDK gets complete.
+
+Four panels, docked (the layout is kept in `tynima-editor.ini`; View > Reset
+layout restores it):
+
+- **Hierarchy** — every entity, under its `Parent`, by its `Name` or as
+  "entity N". Click to select.
+- **Inspector** — the selected entity's components, as the world lists them.
+  The built-in ones are editable: `Transform` as position, yaw/pitch/roll and
+  scale (an entity with a `RigidBody` teleports its body along, since the body
+  drives the transform every frame), `Name`, `MeshRenderer`; `LocalToWorld`,
+  `Parent` and `RigidBody` are shown. A component the editor has no editor for
+  shows its size — Phase 5's reflection task is what makes it populate itself.
+- **Viewport** — the scene, drawn by the engine into a texture the panel
+  shows at its own size (`tynima_ui_scene_texture`); the window behind is
+  cleared. Hold the right mouse button over it to look, W/A/S/D and Q/E to
+  fly, Shift to hurry, the wheel to change the pace.
+- **Console** — the engine's log, the last 2048 events, filtered by level and
+  text; a second combo sets what the engine logs at all.
+- **Stats** — frames per second, CPU and GPU time, entities and bodies, the
+  frame graph's passes and what never left the tile, and the frame's heap
+  allocations from engine code (the rule says zero, and the editor's panels
+  are not the engine's).
+
+The Render menu picks the shading path (forward, fused deferred, split
+deferred), model, debug view, shadows, point lights, bloom, tonemapper and
+anti-aliasing — the same choices the sandbox's keys make.
+`--game path.so` loads a game module, hot-reloaded as in the sandbox;
+`--headless --frames N` draws the panels without a display, which is what the
+`editor_headless` CTest does.
+
+### The host half of tynima.h
+
+Up to Phase 4 the C API was what a game module receives: a table for the
+world, the keys, time and logging. Version 4 adds what a *host* needs — the
+program that runs the engine, be it a game's runtime or the editor:
+`tynima_engine_create()` brings up the platform, the window, the GPU, the
+world, the physics, the game module and the UI; `tynima_engine_begin_frame()`
+pumps events and settles the clock and the input; `tynima_engine_end_frame()`
+runs the module, steps the simulation at 60 Hz, renders and presents. Between
+the two, the host draws its Dear ImGui panels (the engine owns the context)
+and reads or changes the world through the same table a module gets, which
+grew component queries (`find_component`, `component_info`,
+`entity_components`), the mouse, and body poses. Models load with
+`tynima_load_model`; the camera and the render settings have getters and
+setters; the log ring and the statistics feed the console and stats panels.
+The built-in components are declared as C structs (`tynima_transform`, ...)
+whose layouts the engine checks against its own when it is built, and a few
+inline vector and quaternion helpers keep a C host from needing a math library.
+
+Behind the C functions is `sdk::Runtime` ([`sdk/include/tynima/sdk/runtime.h`](sdk/include/tynima/sdk/runtime.h)),
+the same object the sandbox drives directly: everything `apps/sandbox`'s
+`main()` did by hand through Phase 4 — the window, the device, the frame
+graph, the scene renderer and post stack, the game module, the fixed-step
+physics, the frame arena and the heap rule, replay and record — now lives
+there, and the sandbox is a client of it that keeps its own scene, its keys
+and its reports. The golden replays under `apps/sandbox/replays/` still end on
+the same hashes, so the move changed nothing about the simulation.
+
+### The UI
+
+`engine/ui` hosts Dear ImGui (the docking branch, pinned by tarball like the
+rest). ImGui's own platform and renderer backends are not used: the layer
+feeds ImGui from `platform`'s input snapshot and events (keys, mouse, wheel,
+typed text — which needed `TextInput` events, text-input mode, OS cursors and
+the clipboard added to `platform`), and draws its lists through `rhi`, which
+grew per-target blend modes, a scissor rectangle and a packed-colour vertex
+format for it. It is a 1.92-style backend: ImGui asks for textures (its font
+atlas, growing as glyphs are used) and the layer creates, updates and frees
+them through the device. The UI is one more pass in the frame graph, over the
+picture — or over a cleared window when the picture went to the editor's
+viewport texture, which ImGui then shows like any image.
+
 ## Game modules and hot reload
 
 Game code is a shared library the engine loads at run time
@@ -108,7 +192,8 @@ cmake --build --preset macos-debug --target tynima_sandbox_game
 
 The sandbox notices the new file, unloads the old code, loads the new, and
 the next L uses the new numbers — same world, same pile, same camera, no
-restart.
+restart. The runtime does the noticing (`sdk::Runtime` polls the module's
+file every frame), so the editor's `--game` gets the same reload.
 
 ## Physics
 
@@ -266,11 +351,16 @@ Barriers: on SDL GPU the pass order is the synchronisation (the backend
 tracks hazards within a command buffer), and the graph's edges are what a
 backend with explicit barriers would emit them from.
 
-The sandbox draws through it: a `scene` pass into an `Rgba16Float` transient
-with a depth transient beside it, and a `tonemap` pass that samples the
-result onto the swapchain (ACES, and the sRGB encode where the swapchain
-does not do it). The graph works out that depth is never stored and HDR is,
-and the sandbox logs the plan once it has settled (here at 2560×1440):
+The scene renderer (`render::SceneRenderer`,
+[`scene_renderer.h`](engine/render/include/tynima/render/scene_renderer.h) —
+a list of models at world matrices, a camera, a sun and some point lights,
+which `scene::collect_draws` gathers from the World) declares its passes
+into it, and the post stack its own: at the simplest a `scene` pass into an
+`Rgba16Float` transient with a depth transient beside it, and a `tonemap`
+pass that samples the result onto the swapchain (ACES, and the sRGB encode
+where the swapchain does not do it). The graph works out that depth is
+never stored and HDR is, and the runtime logs the plan once it has settled
+(here at 2560×1440):
 
 ```
 graph: 2 passes (0 culled); 2 transients in 2 textures, 44.2 MB of 44.2 MB asked; 2 attachments stored, 1 discarded; 1 could live in tile memory
@@ -413,7 +503,7 @@ stderr, coloured on a terminal; the profiler sink puts it on Tracy's timeline:
 ```
     0.140 INFO  model    1 materials, 4 images decoded in 0.14 s
     0.140 WARN  gltf     image 2: unsupported format [thread 3]
-    1.204 FATAL assert   engine_allocations == 0: a frame allocated ... (apps/sandbox/src/main.cpp:817)
+    1.204 FATAL assert   engine_allocations == 0: a frame allocated ... (sdk/src/runtime.cpp:342)
 ```
 
 ```cpp

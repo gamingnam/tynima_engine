@@ -748,3 +748,121 @@ fragment float4 fs_read(VSOut in [[stage_in]], ScratchIn g) { return g.scratch *
         }
     }
 }
+
+TEST_CASE("alpha blending, a scissor rectangle, and packed byte colours") {
+    // What a UI draw needs: a quad of Float2 positions and Ubyte4Norm
+    // colours, blended over what the target holds, clipped to a rectangle.
+    // The target is cleared red; a half-transparent white quad covers it
+    // all, but the scissor lets only the left half through.
+    constexpr const char* kQuadMsl = R"(
+#include <metal_stdlib>
+using namespace metal;
+struct VertexIn { float2 position [[attribute(0)]]; float4 color [[attribute(1)]]; };
+struct VSOut { float4 position [[position]]; float4 color; };
+vertex VSOut vs_main(VertexIn in [[stage_in]]) {
+    VSOut out;
+    out.position = float4(in.position, 0.0, 1.0);
+    out.color = in.color;
+    return out;
+}
+fragment float4 fs_main(VSOut in [[stage_in]]) { return in.color; }
+)";
+    struct QuadVertex {
+        float x, y;
+        std::uint8_t r, g, b, a;
+    };
+    static_assert(sizeof(QuadVertex) == 12);
+    const QuadVertex vertices[4] = {{-1.0f, -1.0f, 255, 255, 255, 128},
+                                    {1.0f, -1.0f, 255, 255, 255, 128},
+                                    {1.0f, 1.0f, 255, 255, 255, 128},
+                                    {-1.0f, 1.0f, 255, 255, 255, 128}};
+    const std::uint16_t indices[6] = {0, 1, 2, 0, 2, 3};
+    const rhi::VertexAttribute attributes[2] = {
+        {.location = 0, .format = rhi::VertexFormat::Float2, .offset = 0},
+        {.location = 1, .format = rhi::VertexFormat::Ubyte4Norm, .offset = 8}};
+
+    Session session;
+    for (const rhi::Backend backend : kBackends) {
+        SUBCASE(rhi::backend_name(backend)) {
+            auto device = make_device(backend);
+            if (device == nullptr) {
+                continue;
+            }
+            const rhi::ShaderHandle vs =
+                device->create_shader(msl_shader(rhi::ShaderStage::Vertex, "vs_main", kQuadMsl));
+            const rhi::ShaderHandle fs =
+                device->create_shader(msl_shader(rhi::ShaderStage::Fragment, "fs_main", kQuadMsl));
+            REQUIRE_MESSAGE(static_cast<bool>(vs), platform::last_error());
+            REQUIRE_MESSAGE(static_cast<bool>(fs), platform::last_error());
+            rhi::GraphicsPipelineDesc desc{.vertex_shader = vs, .fragment_shader = fs};
+            desc.vertex_layout = {
+                .stride = sizeof(QuadVertex), .attributes = attributes, .attribute_count = 2};
+            desc.color_formats[0] = rhi::TextureFormat::Rgba8Unorm;
+            desc.color_target_count = 1;
+            desc.blend[0] = rhi::BlendMode::Alpha;
+            const rhi::PipelineHandle pipeline = device->create_graphics_pipeline(desc);
+            REQUIRE_MESSAGE(static_cast<bool>(pipeline), platform::last_error());
+            device->destroy_shader(vs);
+            device->destroy_shader(fs);
+
+            const rhi::BufferHandle vertex_buffer =
+                device->create_buffer_with_data(rhi::BufferUsage::Vertex, vertices, sizeof vertices);
+            const rhi::BufferHandle index_buffer =
+                device->create_buffer_with_data(rhi::BufferUsage::Index, indices, sizeof indices);
+            const rhi::TextureHandle target =
+                device->create_texture({.format = rhi::TextureFormat::Rgba8Unorm,
+                                        .width = 8,
+                                        .height = 4,
+                                        .usage = rhi::TextureUsage::ColorTarget});
+            REQUIRE_MESSAGE(static_cast<bool>(vertex_buffer), platform::last_error());
+            REQUIRE_MESSAGE(static_cast<bool>(index_buffer), platform::last_error());
+            REQUIRE_MESSAGE(static_cast<bool>(target), platform::last_error());
+
+            auto frame = device->begin_frame();
+            REQUIRE_MESSAGE(frame.has_value(), platform::last_error());
+            rhi::RenderPassDesc pass_desc{.name = "blend"};
+            pass_desc.colors[0] = {.texture = target,
+                                   .load = rhi::LoadOp::Clear,
+                                   .store = rhi::StoreOp::Store,
+                                   .clear = {1.0f, 0.0f, 0.0f, 1.0f}};
+            pass_desc.color_count = 1;
+            {
+                auto pass = frame->begin_pass(pass_desc);
+                REQUIRE_MESSAGE(pass.has_value(), platform::last_error());
+                pass->bind_pipeline(pipeline);
+                pass->bind_vertex_buffer(vertex_buffer);
+                pass->bind_index_buffer(index_buffer, rhi::IndexType::Uint16);
+                pass->set_scissor(0, 0, 4, 4);
+                pass->draw_indexed(6);
+                pass->set_scissor(100, 100, 100, 100); // past the target: clipped to nothing
+                pass->draw_indexed(6);
+                pass->end();
+            }
+            frame->submit();
+
+            std::uint8_t pixels[8 * 4 * 4];
+            REQUIRE_MESSAGE(device->download_texture(target, pixels, sizeof pixels), platform::last_error());
+            // Left half: red blended with half-transparent white = (1, 0.5, 0.5, 1); right half: red.
+            int wrong = 0;
+            for (int y = 0; y < 4; ++y) {
+                for (int x = 0; x < 8; ++x) {
+                    const std::uint8_t* p = pixels + (y * 8 + x) * 4;
+                    const int g = x < 4 ? 128 : 0;
+                    wrong += std::abs(int{p[0]} - 255) <= 1 && std::abs(int{p[1]} - g) <= 1 &&
+                                     std::abs(int{p[2]} - g) <= 1 && std::abs(int{p[3]} - 255) <= 1
+                                 ? 0
+                                 : 1;
+                }
+            }
+            MESSAGE("pixel (0,0): ", int{pixels[0]}, " ", int{pixels[1]}, " ", int{pixels[2]}, " ",
+                    int{pixels[3]}, "; pixel (7,0): ", int{pixels[28]}, " ", int{pixels[29]}, " ",
+                    int{pixels[30]}, " ", int{pixels[31]});
+            CHECK(wrong == 0);
+
+            device->destroy_texture(target);
+            device->destroy_buffer(vertex_buffer);
+            device->destroy_buffer(index_buffer);
+            device->destroy_graphics_pipeline(pipeline);
+        }
+    }
+}

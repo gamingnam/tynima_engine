@@ -79,6 +79,9 @@ public:
     }
     [[nodiscard]] std::uint32_t component_type_count() const noexcept { return component_count_; }
     [[nodiscard]] const ComponentInfo& component_info(ComponentId id) const noexcept { return infos_[id]; }
+    // The id registered under `name`, or kNoComponent: a question, never a registration.
+    static constexpr ComponentId kNoComponent = 0xFFFFFFFFu;
+    [[nodiscard]] ComponentId find_component(const char* name) const noexcept;
 
     // ---- entities ----
 
@@ -155,6 +158,12 @@ public:
             });
         });
     }
+
+    // The component ids an entity has, ascending, into `out` (at most `max`
+    // of them); returns how many it has in all, 0 for a dead entity. An
+    // inspector's question: the World's, so a tool never guesses layouts.
+    [[nodiscard]] std::uint32_t entity_components(Entity entity, ComponentId* out,
+                                                  std::uint32_t max) const noexcept;
 
     // ---- type-erased entry points, for the C API ----
     // The templates above are thin wrappers over these.

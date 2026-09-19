@@ -19,6 +19,7 @@
 #import <Metal/Metal.h>
 #import <QuartzCore/CAMetalLayer.h>
 #include <SDL3/SDL.h>
+#include <algorithm>
 #include <atomic>
 #include <cstring>
 #include <dispatch/dispatch.h>
@@ -139,6 +140,8 @@ MTLVertexFormat to_metal(VertexFormat format) noexcept {
         return MTLVertexFormatFloat3;
     case VertexFormat::Float4:
         return MTLVertexFormatFloat4;
+    case VertexFormat::Ubyte4Norm:
+        return MTLVertexFormatUChar4Normalized;
     }
     return MTLVertexFormatFloat3;
 }
@@ -297,6 +300,8 @@ protected:
                                    std::uint32_t size) noexcept override;
     void pass_push_fragment_uniforms(void* frame, void* pass, std::uint32_t slot, const void* data,
                                      std::uint32_t size) noexcept override;
+    void pass_set_scissor(void* pass, std::uint32_t x, std::uint32_t y, std::uint32_t width,
+                          std::uint32_t height) noexcept override;
     void pass_draw(void* pass, std::uint32_t vertex_count, std::uint32_t instance_count) noexcept override;
     void pass_draw_indexed(void* pass, std::uint32_t index_count, std::uint32_t first_index,
                            std::int32_t vertex_offset, std::uint32_t instance_count) noexcept override;
@@ -335,6 +340,7 @@ private:
     // the index buffer for the next indexed draw. One pass at a time.
     MTLPrimitiveType primitive_ = MTLPrimitiveTypeTriangle;
     std::uint32_t fragment_uniforms_ = 0;
+    Extent2D pass_extent_{}; // the attachments' size, which a scissor rectangle is clipped to
     id<MTLBuffer> index_buffer_ = nil;
     MTLIndexType index_type_ = MTLIndexTypeUInt32;
     std::uint32_t index_offset_ = 0;
@@ -593,9 +599,23 @@ PipelineHandle MetalDevice::create_graphics_pipeline(const GraphicsPipelineDesc&
             pipeline.vertexDescriptor = vertices;
         }
         for (std::uint32_t i = 0; i < desc.color_target_count; ++i) {
-            pipeline.colorAttachments[i].pixelFormat = to_metal(desc.color_formats[i]);
-            pipeline.colorAttachments[i].writeMask =
-                desc.color_write[i] ? MTLColorWriteMaskAll : MTLColorWriteMaskNone;
+            MTLRenderPipelineColorAttachmentDescriptor* attachment = pipeline.colorAttachments[i];
+            attachment.pixelFormat = to_metal(desc.color_formats[i]);
+            attachment.writeMask = desc.color_write[i] ? MTLColorWriteMaskAll : MTLColorWriteMaskNone;
+            if (desc.blend[i] != BlendMode::Off) {
+                attachment.blendingEnabled = YES;
+                attachment.rgbBlendOperation = MTLBlendOperationAdd;
+                attachment.alphaBlendOperation = MTLBlendOperationAdd;
+                attachment.sourceRGBBlendFactor =
+                    desc.blend[i] == BlendMode::Alpha ? MTLBlendFactorSourceAlpha : MTLBlendFactorOne;
+                attachment.destinationRGBBlendFactor = desc.blend[i] == BlendMode::Additive
+                                                           ? MTLBlendFactorOne
+                                                           : MTLBlendFactorOneMinusSourceAlpha;
+                attachment.sourceAlphaBlendFactor = MTLBlendFactorOne;
+                attachment.destinationAlphaBlendFactor = desc.blend[i] == BlendMode::Additive
+                                                             ? MTLBlendFactorOne
+                                                             : MTLBlendFactorOneMinusSourceAlpha;
+            }
         }
         if (desc.depth_format.has_value()) {
             pipeline.depthAttachmentPixelFormat = to_metal(*desc.depth_format);
@@ -1258,6 +1278,7 @@ std::optional<RenderPass> MetalDevice::frame_begin_pass(void* frame_pointer,
     }
     [encoder setFrontFacingWinding:MTLWindingCounterClockwise];
     index_buffer_ = nil;
+    pass_extent_ = extent;
     return make_render_pass(this, frame_pointer, retain(encoder), labelled);
 }
 
@@ -1336,6 +1357,25 @@ void MetalDevice::pass_push_fragment_uniforms(void*, void* pass, std::uint32_t s
     TY_EXTERNAL_ALLOCATIONS();
     TY_ASSERT(size <= kMaxPushBytes, "push_fragment_uniforms: more than 4 KB; use a buffer");
     [bridge<id<MTLRenderCommandEncoder>>(pass) setFragmentBytes:data length:size atIndex:slot];
+}
+
+void MetalDevice::pass_set_scissor(void* pass, std::uint32_t x, std::uint32_t y, std::uint32_t width,
+                                   std::uint32_t height) noexcept {
+    TY_EXTERNAL_ALLOCATIONS();
+    // Metal refuses a rectangle that reaches past the attachments; clip it,
+    // and an empty one becomes a single pixel that no draw will touch.
+    const std::uint32_t x0 = std::min(x, pass_extent_.width);
+    const std::uint32_t y0 = std::min(y, pass_extent_.height);
+    const std::uint32_t x1 = std::min(x0 + width, pass_extent_.width);
+    const std::uint32_t y1 = std::min(y0 + height, pass_extent_.height);
+    MTLScissorRect rect{};
+    rect.x = x0;
+    rect.y = y0;
+    rect.width = std::max(x1 - x0, 1u);
+    rect.height = std::max(y1 - y0, 1u);
+    if (rect.x + rect.width > pass_extent_.width) rect.x = pass_extent_.width - rect.width;
+    if (rect.y + rect.height > pass_extent_.height) rect.y = pass_extent_.height - rect.height;
+    [bridge<id<MTLRenderCommandEncoder>>(pass) setScissorRect:rect];
 }
 
 void MetalDevice::pass_draw(void* pass, std::uint32_t vertex_count, std::uint32_t instance_count) noexcept {

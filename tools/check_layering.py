@@ -19,7 +19,8 @@ checks every C/C++ source under the module against four rules:
      of the public API with no special privileges.
   4. Every source file must live inside a declared module.
   5. Third-party headers with a designated home stay there: SDL3, Tracy,
-     cgltf, stb and Jolt may be included only by the modules listed in THIRD_PARTY below.
+     cgltf, stb, Jolt and Dear ImGui may be included only by the modules
+     listed in THIRD_PARTY below.
 
 Usage:
     python3 tools/check_layering.py            # check, exit 1 on violations
@@ -37,7 +38,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 # Bottom layer first. A module may only depend on modules earlier in this list.
-LAYERS = ["core", "platform", "rhi", "render", "physics", "scene", "assets", "script", "sdk", "editor"]
+LAYERS = ["core", "platform", "rhi", "render", "ui", "physics", "scene", "assets", "script", "sdk", "editor"]
 
 # Directories that contain modules or apps (relative to the repo root).
 SCAN_ROOTS = ["engine", "sdk", "editor", "apps"]
@@ -52,6 +53,7 @@ THIRD_PARTY = {
     "cgltf.h": {"assets"},
     "stb_": {"assets"},
     "Jolt/": {"physics"},
+    "imgui": {"ui", "editor"},
 }
 
 DECLARATION_RE = re.compile(r"tynima_add_(module|app|game_module)\s*\(\s*NAME\s+(\w+)(.*?)\)", re.S)

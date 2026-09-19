@@ -1,7 +1,9 @@
 // Engine developer's playground. A pile of glTF models dropped on a floor
 // by the physics world, as entities in the scene World, lit with
 // Cook-Torrance, a reverse-Z depth buffer, an sRGB swapchain, and a fly
-// camera. Falls back to Phase 0's triangle when there is no model.
+// camera — all of it run by the SDK's Runtime, which the sandbox drives the
+// way the editor and a game's runtime do, reaching into the engine only
+// for its own scene and the keys that show it off.
 //
 //   tynima-sandbox [--headless] [--frames N] [--model path.glb] [--physics tynima|jolt]
 //                  [--rhi sdl|metal] [--shading forward|fused|split]
@@ -28,20 +30,13 @@
 // and climb, Shift runs; R drops the pile again; L (the game module)
 // launches it; F follows the character; C shows the shadow cascades, X
 // toggles shadows, K shows the lights per cluster, P toggles the point
-// lights, G bloom; T cycles the tonemapper, H the anti-aliasing; Escape
-// quits.
+// lights, G bloom; T cycles the tonemapper, H the anti-aliasing, Y the
+// shading path; Escape quits.
 #include <tynima/assets/gltf.h>
-#include <tynima/core/arena.h>
-#include <tynima/core/assert.h>
-#include <tynima/core/jobs.h>
 #include <tynima/core/log.h>
-#include <tynima/core/memory.h>
 #include <tynima/core/profile.h>
-#include <tynima/core/version.h>
 #include <tynima/physics/character.h>
-#include <tynima/physics/fixed_step.h>
 #include <tynima/physics/physics.h>
-#include <tynima/platform/events.h>
 #include <tynima/platform/input.h>
 #include <tynima/platform/input_log.h>
 #include <tynima/platform/platform.h>
@@ -49,25 +44,21 @@
 #include <tynima/platform/window.h>
 #include <tynima/render/camera.h>
 #include <tynima/render/clusters.h>
-#include <tynima/render/frame_graph.h>
 #include <tynima/render/mesh.h>
 #include <tynima/render/model.h>
 #include <tynima/render/post.h>
-#include <tynima/render/shadows.h>
+#include <tynima/render/scene_renderer.h>
 #include <tynima/rhi/device.h>
 #include <tynima/scene/components.h>
-#include <tynima/scene/systems.h>
 #include <tynima/scene/world.h>
-#include <tynima/sdk/game_module.h>
+#include <tynima/sdk/runtime.h>
 
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <memory>
 #include <string>
-#include <utility>
 #include <vector>
 
 namespace platform = tynima::platform;
@@ -76,16 +67,16 @@ namespace render = tynima::render;
 namespace assets = tynima::assets;
 namespace scene = tynima::scene;
 namespace physics = tynima::physics;
+namespace sdk = tynima::sdk;
 using namespace tynima::math;
 
 namespace {
 
-// Model slots the MeshRenderer component indexes into.
+// The runtime's model slots, in the order the sandbox adds them.
 constexpr std::uint32_t kModelBottle = 0;
 constexpr std::uint32_t kModelFloor = 1;
 constexpr std::uint32_t kModelCharacter = 2; // the capsule the controller walks around in
 constexpr std::uint32_t kModelGate = 3;      // a slab on a hinge
-constexpr std::uint32_t kModelCount = 4;
 
 constexpr float kFloorHalfWidth = 6.0f;
 constexpr float kFloorHalfThickness = 0.25f;
@@ -154,9 +145,11 @@ Pile populate_pile(scene::World& world, physics::PhysicsWorld& physics, const re
                 body.restitution = 0.1f;
                 const physics::BodyHandle handle = physics.create_body(body);
                 const scene::Transform pose{.position = position, .rotation = rotation};
-                const scene::Entity entity = world.create(pose, scene::LocalToWorld{},
-                                                          scene::MeshRenderer{.model = kModelBottle},
-                                                          scene::RigidBody{handle});
+                char name[scene::Name::kCapacity];
+                std::snprintf(name, sizeof name, "bottle %u", n);
+                const scene::Entity entity =
+                    world.create(scene::Name(name), pose, scene::LocalToWorld{},
+                                 scene::MeshRenderer{.model = kModelBottle}, scene::RigidBody{handle});
                 pile.entities.push_back(entity);
                 pile.rest_poses.push_back(pose);
             }
@@ -344,9 +337,9 @@ struct Rest {
 Rest populate_rest(scene::World& world, physics::PhysicsWorld& physics, physics::BodyHandle character_body,
                    const render::MeshData& bottle) {
     Rest rest;
-    rest.character_entity = world.create(scene::Transform{.position = kCharacterStart}, scene::LocalToWorld{},
-                                         scene::MeshRenderer{.model = kModelCharacter},
-                                         scene::RigidBody{character_body});
+    rest.character_entity = world.create(
+        scene::Name("character"), scene::Transform{.position = kCharacterStart}, scene::LocalToWorld{},
+        scene::MeshRenderer{.model = kModelCharacter}, scene::RigidBody{character_body});
     {
         physics::BodyDesc gate;
         gate.shape = physics::Shape::box(kGateHalf);
@@ -354,8 +347,9 @@ Rest populate_rest(scene::World& world, physics::PhysicsWorld& physics, physics:
         gate.mass = 15.0f;
         gate.friction = 0.4f;
         const physics::BodyHandle body = physics.create_body(gate);
-        (void)world.create(scene::Transform{.position = gate.position}, scene::LocalToWorld{},
-                           scene::MeshRenderer{.model = kModelGate}, scene::RigidBody{body});
+        (void)world.create(scene::Name("gate"), scene::Transform{.position = gate.position},
+                           scene::LocalToWorld{}, scene::MeshRenderer{.model = kModelGate},
+                           scene::RigidBody{body});
         physics::JointDesc hinge;
         hinge.type = physics::JointType::Hinge;
         hinge.a = body;
@@ -384,9 +378,11 @@ Rest populate_rest(scene::World& world, physics::PhysicsWorld& physics, physics:
             body.mass = 0.6f;
             body.friction = 0.5f;
             const physics::BodyHandle handle = physics.create_body(body);
-            const scene::Entity entity =
-                world.create(scene::Transform{.position = body.position}, scene::LocalToWorld{},
-                             scene::MeshRenderer{.model = kModelBottle}, scene::RigidBody{handle});
+            char name[scene::Name::kCapacity];
+            std::snprintf(name, sizeof name, "chain %d", i);
+            const scene::Entity entity = world.create(
+                scene::Name(name), scene::Transform{.position = body.position}, scene::LocalToWorld{},
+                scene::MeshRenderer{.model = kModelBottle}, scene::RigidBody{handle});
             rest.chain.push_back(entity);
             physics::JointDesc link;
             link.type = physics::JointType::Distance;
@@ -424,31 +420,17 @@ void report_rest(scene::World& world, const physics::PhysicsWorld& physics,
 #define TYNIMA_SANDBOX_GAME_MODULE ""
 #endif
 
-#ifndef NDEBUG
-constexpr bool kGpuDebug = true; // Metal validation: catches API misuse loudly
-#else
-constexpr bool kGpuDebug = false;
-#endif
-
 #ifndef TYNIMA_SANDBOX_ASSETS_DIR
 #define TYNIMA_SANDBOX_ASSETS_DIR "."
 #endif
-
-// How the scene is lit: forward, every mesh fragment lit as it is drawn;
-// fused, the material into a G-buffer and the lighting from it in the same
-// render pass, the G-buffer read from the tile and never stored; split,
-// the G-buffer stored by one pass and sampled by the next, as on a GPU
-// without tile memory — the fused path's yardstick.
-enum class ShadingPath : int { Forward, Fused, Split };
-constexpr const char* kShadingPathNames[] = {"forward", "fused deferred", "split deferred"};
 
 struct Options {
     bool headless = false;
     long max_frames = -1; // -1: run until closed
     std::string model = TYNIMA_SANDBOX_ASSETS_DIR "/WaterBottle.glb";
-    bool jolt = false;   // the reference physics instead of the engine's own
+    bool jolt = false; // the reference physics instead of the engine's own
     rhi::Backend rhi = rhi::Backend::Auto;
-    ShadingPath shading = ShadingPath::Forward;
+    render::ShadingPath shading = render::ShadingPath::Forward;
     std::string record; // write the input log here at exit
     std::string replay; // play this input log instead of live input and time
 };
@@ -487,11 +469,11 @@ Options parse_options(int argc, char** argv) {
         } else if (std::strcmp(argv[i], "--shading") == 0 && i + 1 < argc) {
             const char* which = argv[++i];
             if (std::strcmp(which, "forward") == 0) {
-                options.shading = ShadingPath::Forward;
+                options.shading = render::ShadingPath::Forward;
             } else if (std::strcmp(which, "fused") == 0) {
-                options.shading = ShadingPath::Fused;
+                options.shading = render::ShadingPath::Fused;
             } else if (std::strcmp(which, "split") == 0) {
-                options.shading = ShadingPath::Split;
+                options.shading = render::ShadingPath::Split;
             } else {
                 std::fprintf(stderr, "--shading: expected 'forward', 'fused' or 'split', got '%s'\n", which);
                 std::exit(kExitUsage);
@@ -514,677 +496,112 @@ Options parse_options(int argc, char** argv) {
     return options;
 }
 
-// ------------------------------------------------------------------ shaders
+// ------------------------------------------------------------------ shading
 
-// Lit, textured mesh with two shading models and a set of debug views.
-// Vertex uniforms at [[buffer(0)]]; attributes come from render::vertex_layout()
-// through [[stage_in]]. Fragment uniforms: frame at [[buffer(0)]], material at
-// [[buffer(1)]]; the four material maps at [[texture(0..3)]] share sampler 0.
-// Every texel is linear by the time it is sampled (sRGB formats decode in
-// hardware), lighting happens in linear, and the swapchain encodes on the way
-// out. Blinn-Phong is here for comparison; Cook-Torrance is the real thing.
-// The scene's shaders are assembled from pieces, so the forward path and
-// the deferred one light a pixel with the same code: kMslCommon (the
-// uniform structs and the BRDF), kMslMeshVertex (the vertex shader every
-// mesh pass shares), kMslSurface (a material sampled into a Surface),
-// kMslLighting (a Surface lit by the sun, its shadow and the cell's point
-// lights), and then one fragment function per path.
-constexpr const char* kMslCommon = R"(
-#include <metal_stdlib>
-using namespace metal;
-
-struct FrameUniforms {
-    float4 camera_position; // xyz
-    float4 camera_forward;  // xyz: the view direction, for a pixel's depth
-    float4 light_direction; // xyz: towards the light; w: intensity
-    float4 light_color;     // rgb; w: ambient intensity
-    float4 params;          // x: shading model, y: debug view
-};
-
-struct MaterialUniforms {
-    float4 base_color_factor;
-    float4 factors;         // x: metallic, y: roughness, z: occlusion strength, w: normal scale
-    float4 emissive_factor; // rgb
-};
-
-struct ShadowUniforms {
-    float4x4 cascade_matrix[4]; // world -> light clip, reverse-Z
-    float4 cascade_param[4];    // x: texel size (m), y: depth per metre, z: texel size in uv
-    float4 settings;            // x: cascades, y: strength (0: off), z: normal offset, w: bias (in texels)
-};
-
-// The clustered point lights: render/clusters.h, exactly.
-struct ClusterUniforms {
-    float4 grid;   // tiles_x, tiles_y, slices, light count
-    float4 depth;  // slice_scale, slice_bias, near, far
-    float4 screen; // width, height, tan_half_x, tan_half_y
-    float4x4 view;
-};
-
-// What the deferred lighting pass needs to put a pixel back in the world.
-struct DeferredUniforms {
-    float4x4 inverse_view;
-    float4 params; // x, y: tan of the half angles; z, w: the screen in pixels
-};
-
-struct PointLight {
-    float4 position_radius;
-    float4 color;
-};
-
-struct ClusterLights {
-    uint count;
-    uint indices[31];
-};
-
-// What a material amounts to at one pixel, whichever path sampled it.
-struct Surface {
-    float3 albedo;
-    float3 n;           // the shading normal, mapped
-    float3 geometric_n; // the mesh's own, for the shadow bias
-    float3 t;           // the tangent, for one debug view
-    float metallic;
-    float roughness;
-    float occlusion;
-    float3 emissive;
-    float alpha;
-};
-
-constant float kPi = 3.14159265358979;
-
-// GGX / Trowbridge-Reitz normal distribution: how many microfacets face h.
-float d_ggx(float n_dot_h, float alpha) {
-    float a2 = alpha * alpha;
-    float d = n_dot_h * n_dot_h * (a2 - 1.0) + 1.0;
-    return a2 / (kPi * d * d);
-}
-
-// Height-correlated Smith visibility (includes the 1 / (4 n.l n.v) term).
-float v_smith_ggx_correlated(float n_dot_v, float n_dot_l, float alpha) {
-    float a2 = alpha * alpha;
-    float gv = n_dot_l * sqrt(n_dot_v * n_dot_v * (1.0 - a2) + a2);
-    float gl = n_dot_v * sqrt(n_dot_l * n_dot_l * (1.0 - a2) + a2);
-    return 0.5 / max(gv + gl, 1e-5);
-}
-
-// Schlick's Fresnel: reflectance rises to 1 at grazing angles.
-float3 f_schlick(float v_dot_h, float3 f0) {
-    float f = pow(1.0 - v_dot_h, 5.0);
-    return f0 + (float3(1.0) - f0) * f;
-}
-
-// What a surface reflects of light from `l` towards `v`, per unit of
-// irradiance: the BRDF, before the cosine. Every light — the sun and each
-// point light — goes through this once.
-float3 surface_brdf(int mode, float3 n, float3 v, float3 l, float3 base, float metallic, float roughness) {
-    float3 h = normalize(l + v);
-    float n_dot_l = saturate(dot(n, l));
-    float n_dot_v = max(dot(n, v), 1e-4);
-    float n_dot_h = saturate(dot(n, h));
-    float v_dot_h = saturate(dot(v, h));
-    float alpha = roughness * roughness;
-    if (mode == 1) {
-        // Normalized Blinn-Phong. Shininess is derived from roughness so both
-        // models agree on how glossy a surface is; what differs is the shape
-        // of the highlight and the missing Fresnel and masking terms.
-        float shininess = 2.0 / (alpha * alpha) - 2.0;
-        float3 spec_color = mix(float3(0.04), base, metallic);
-        float3 diffuse = base * (1.0 - metallic) / kPi;
-        float3 specular = spec_color * pow(n_dot_h, shininess) * (shininess + 8.0) / (8.0 * kPi);
-        return diffuse + specular;
-    }
-    // Cook-Torrance with the metallic workflow: dielectrics reflect 4% at
-    // normal incidence and keep their albedo as diffuse; metals reflect
-    // their albedo as specular and have no diffuse at all.
-    float3 f0 = mix(float3(0.04), base, metallic);
-    float3 diffuse_color = base * (1.0 - metallic);
-    float3 f = f_schlick(v_dot_h, f0);
-    float d = d_ggx(n_dot_h, alpha);
-    float vis = v_smith_ggx_correlated(n_dot_v, n_dot_l, alpha);
-    return (float3(1.0) - f) * diffuse_color / kPi + d * vis * f;
-}
-)";
-
-constexpr const char* kMslMeshVertex = R"(
-struct VertexIn {
-    float3 position [[attribute(0)]];
-    float3 normal   [[attribute(1)]];
-    float2 uv       [[attribute(2)]];
-    float4 tangent  [[attribute(3)]]; // xyz along +u, w = handedness
-};
-
-struct Uniforms {
-    float4x4 mvp;
-    float4x4 model;
-};
-
-struct VSOut {
-    float4 position [[position]];
-    float3 world_position;
-    float3 world_normal;
-    float4 world_tangent;
-    float2 uv;
-};
-
-vertex VSOut vs_main(VertexIn in [[stage_in]], constant Uniforms& u [[buffer(0)]]) {
-    VSOut out;
-    float4 world = u.model * float4(in.position, 1.0);
-    out.position = u.mvp * float4(in.position, 1.0);
-    out.world_position = world.xyz;
-    out.world_normal = (u.model * float4(in.normal, 0.0)).xyz;
-    out.world_tangent = float4((u.model * float4(in.tangent.xyz, 0.0)).xyz, in.tangent.w);
-    out.uv = in.uv;
-    return out;
-}
-)";
-
-// The material at a pixel: its five maps sampled and its tangent frame
-// re-orthogonalized, into a Surface.
-constexpr const char* kMslSurface = R"(
-Surface sample_surface(VSOut in, texture2d<float> base_color_map, texture2d<float> metallic_roughness_map,
-                       texture2d<float> occlusion_map, texture2d<float> emissive_map,
-                       texture2d<float> normal_map, sampler map_sampler, constant MaterialUniforms& m) {
-    Surface s;
-    float4 base = base_color_map.sample(map_sampler, in.uv) * m.base_color_factor;
-    float4 mr = metallic_roughness_map.sample(map_sampler, in.uv);
-    s.albedo = base.rgb;
-    s.alpha = base.a;
-    s.metallic = mr.b * m.factors.x;                        // glTF: metallic in B
-    s.roughness = clamp(mr.g * m.factors.y, 0.045, 1.0);    // roughness in G; 0 would make GGX blow up
-    s.occlusion = mix(1.0, occlusion_map.sample(map_sampler, in.uv).r, m.factors.z);
-    s.emissive = emissive_map.sample(map_sampler, in.uv).rgb * m.emissive_factor.rgb;
-
-    // Tangent frame: re-orthogonalize the interpolated tangent against the
-    // interpolated normal, then the bitangent follows from the handedness.
-    s.geometric_n = normalize(in.world_normal);
-    float3 t = in.world_tangent.xyz;
-    t = normalize(t - s.geometric_n * dot(s.geometric_n, t));
-    float3 b = cross(s.geometric_n, t) * (in.world_tangent.w < 0.0 ? -1.0 : 1.0);
-    float3 nm = normal_map.sample(map_sampler, in.uv).xyz * 2.0 - 1.0; // tangent space, +z straight up
-    nm.xy *= m.factors.w;
-    s.n = normalize(t * nm.x + b * nm.y + s.geometric_n * nm.z);
-    s.t = t;
-    return s;
-}
-)";
-
-// A Surface at a world position, lit: the sun through its shadow map, the
-// point lights of the pixel's cluster cell, a uniform environment — or one
-// of the debug views instead.
-constexpr const char* kMslLighting = R"(
-// 3x3 taps of the hardware's own 2x2 compare: a soft edge four texels wide.
-float shadow_pcf(depth2d<float> map, sampler s, float2 uv, float depth, float texel_uv) {
-    float sum = 0.0;
-    for (int y = -1; y <= 1; ++y) {
-        for (int x = -1; x <= 1; ++x) {
-            sum += map.sample_compare(s, uv + float2(x, y) * texel_uv, depth);
-        }
-    }
-    return sum / 9.0;
-}
-
-// Shadow: from the first cascade whose map holds this point. The lookup
-// point is pushed off the surface along the normal, more where the light
-// grazes it, and the depth nudged towards the light — the two biases that
-// keep a lit surface from shadowing itself.
-float shadow_at(float3 world_position, float3 geometric_n, float3 l, constant ShadowUniforms& shadows,
-                depth2d<float> shadow_map0, depth2d<float> shadow_map1, depth2d<float> shadow_map2,
-                depth2d<float> shadow_map3, sampler shadow_sampler, thread int& cascade) {
-    float shadow = 1.0;
-    cascade = -1;
-    if (shadows.settings.y <= 0.0) {
-        return shadow;
-    }
-    float grazing = 1.0 - saturate(dot(geometric_n, l));
-    for (int c = 0; c < int(shadows.settings.x); ++c) {
-        float4 param = shadows.cascade_param[c];
-        float3 lookup = world_position + geometric_n * (param.x * shadows.settings.z * grazing);
-        float4 lc = shadows.cascade_matrix[c] * float4(lookup, 1.0);
-        float2 uv = float2(lc.x * 0.5 + 0.5, 0.5 - lc.y * 0.5);
-        float border = param.z * 2.0; // the taps must stay inside the map
-        bool inside = uv.x > border && uv.x < 1.0 - border && uv.y > border && uv.y < 1.0 - border;
-        if (inside && lc.z > 0.0 && lc.z < 1.0) {
-            float depth = lc.z + param.x * shadows.settings.w * param.y;
-            if (c == 0) {
-                shadow = shadow_pcf(shadow_map0, shadow_sampler, uv, depth, param.z);
-            } else if (c == 1) {
-                shadow = shadow_pcf(shadow_map1, shadow_sampler, uv, depth, param.z);
-            } else if (c == 2) {
-                shadow = shadow_pcf(shadow_map2, shadow_sampler, uv, depth, param.z);
-            } else {
-                shadow = shadow_pcf(shadow_map3, shadow_sampler, uv, depth, param.z);
-            }
-            cascade = c;
-            break;
-        }
-    }
-    return 1.0 - (1.0 - shadow) * shadows.settings.y;
-}
-
-// The cluster cell a pixel is in: the tile under the window position, the
-// slice at its view depth.
-uint cluster_cell(float2 window_position, float view_depth, constant ClusterUniforms& clusters) {
-    float depth = max(view_depth, clusters.depth.z);
-    uint slice = uint(clamp(floor(log(depth) * clusters.depth.x + clusters.depth.y), 0.0,
-                            clusters.grid.z - 1.0));
-    uint tx = min(uint(window_position.x / clusters.screen.x * clusters.grid.x), uint(clusters.grid.x) - 1);
-    uint ty = min(uint(window_position.y / clusters.screen.y * clusters.grid.y), uint(clusters.grid.y) - 1);
-    return (slice * uint(clusters.grid.y) + ty) * uint(clusters.grid.x) + tx;
-}
-
-float3 shade(Surface s, float3 world_position, float2 window_position, float view_depth,
-             constant FrameUniforms& frame, constant ShadowUniforms& shadows,
-             constant ClusterUniforms& clusters, const device PointLight* lights,
-             const device ClusterLights* cells, depth2d<float> shadow_map0, depth2d<float> shadow_map1,
-             depth2d<float> shadow_map2, depth2d<float> shadow_map3, sampler shadow_sampler) {
-    float3 v = normalize(frame.camera_position.xyz - world_position);
-    float3 l = normalize(frame.light_direction.xyz);
-    float n_dot_l = saturate(dot(s.n, l));
-    float3 radiance = frame.light_color.rgb * frame.light_direction.w;
-    float ambient = frame.light_color.w;
-    int cascade = -1;
-    float shadow = shadow_at(world_position, s.geometric_n, l, shadows, shadow_map0, shadow_map1, shadow_map2,
-                             shadow_map3, shadow_sampler, cascade);
-    uint cell = cluster_cell(window_position, view_depth, clusters);
-    uint cell_lights = cells[cell].count;
-
-    int mode = int(frame.params.x);
-    int debug_view = int(frame.params.y);
-    float3 color;
-    if (debug_view == 1) {
-        color = s.n * 0.5 + 0.5;
-    } else if (debug_view == 2) {
-        color = float3(s.metallic, s.roughness, 0.0);
-    } else if (debug_view == 3) {
-        color = float3(s.occlusion);
-    } else if (debug_view == 4) {
-        color = s.geometric_n * 0.5 + 0.5;
-    } else if (debug_view == 5) {
-        color = s.t * 0.5 + 0.5;
-    } else if (debug_view == 7) {
-        // How many lights the pixel's cell holds: black, blue, green, yellow, red for 0, 4, 8, 12, 16+.
-        float heat = min(float(cell_lights) / 16.0, 1.0) * 4.0;
-        float3 stops[5] = {float3(0.0), float3(0.0, 0.2, 1.0), float3(0.0, 1.0, 0.2), float3(1.0, 1.0, 0.0),
-                           float3(1.0, 0.1, 0.0)};
-        int stop = int(heat);
-        color = mix(stops[stop], stops[min(stop + 1, 4)], heat - float(stop));
-    } else if (mode == 0) {
-        color = s.albedo;
-    } else {
-        // The sun, shadowed; then the cell's point lights, each an inverse
-        // square windowed to nothing at its radius (Karis, 2013); then a
-        // uniform grey environment standing in for image-based lighting.
-        float3 sun_brdf = surface_brdf(mode, s.n, v, l, s.albedo, s.metallic, s.roughness);
-        float3 sun = sun_brdf * radiance * n_dot_l * shadow;
-        float3 local = float3(0.0);
-        for (uint k = 0; k < cell_lights; ++k) {
-            PointLight light = lights[cells[cell].indices[k]];
-            float3 to_light = light.position_radius.xyz - world_position;
-            float d2 = dot(to_light, to_light);
-            float r = light.position_radius.w;
-            if (d2 >= r * r) {
-                continue;
-            }
-            float3 ll = to_light * rsqrt(d2);
-            float ratio = d2 / (r * r);
-            float window = saturate(1.0 - ratio * ratio);
-            float attenuation = window * window / (d2 + 0.01);
-            float3 brdf = surface_brdf(mode, s.n, v, ll, s.albedo, s.metallic, s.roughness);
-            local += brdf * light.color.rgb * attenuation * saturate(dot(s.n, ll));
-        }
-        float3 f0 = mix(float3(0.04), s.albedo, s.metallic);
-        float3 indirect = mode == 1 ? s.albedo * ambient * s.occlusion
-                                    : (s.albedo * (1.0 - s.metallic) + f0 * 0.5) * ambient * s.occlusion;
-        color = sun + local + indirect + s.emissive;
-    }
-    if (debug_view == 6) {
-        // Which cascade shadowed the pixel: red, green, blue, yellow; grey for none.
-        float3 tints[5] = {float3(1.0, 0.2, 0.2), float3(0.2, 1.0, 0.2), float3(0.2, 0.4, 1.0),
-                           float3(1.0, 1.0, 0.2), float3(0.5)};
-        color = mix(color, tints[cascade < 0 ? 4 : cascade], 0.4);
-    }
-    return color;
-}
-)";
-
-// Forward: the material and the lighting in one fragment, linear light out
-// into an HDR target; the tonemap pass makes it a picture.
-constexpr const char* kMslForwardFragment = R"(
-fragment float4 fs_main(VSOut in [[stage_in]],
-                        texture2d<float> base_color_map [[texture(0)]],
-                        texture2d<float> metallic_roughness_map [[texture(1)]],
-                        texture2d<float> occlusion_map [[texture(2)]],
-                        texture2d<float> emissive_map [[texture(3)]],
-                        texture2d<float> normal_map [[texture(4)]],
-                        depth2d<float> shadow_map0 [[texture(5)]],
-                        depth2d<float> shadow_map1 [[texture(6)]],
-                        depth2d<float> shadow_map2 [[texture(7)]],
-                        depth2d<float> shadow_map3 [[texture(8)]],
-                        sampler map_sampler [[sampler(0)]],
-                        sampler shadow_sampler [[sampler(5)]],
-                        constant FrameUniforms& frame [[buffer(0)]],
-                        constant MaterialUniforms& m [[buffer(1)]],
-                        constant ShadowUniforms& shadows [[buffer(2)]],
-                        constant ClusterUniforms& clusters [[buffer(3)]],
-                        const device PointLight* lights [[buffer(4)]],
-                        const device ClusterLights* cells [[buffer(5)]]) {
-    Surface s = sample_surface(in, base_color_map, metallic_roughness_map, occlusion_map, emissive_map,
-                               normal_map, map_sampler, m);
-    float view_depth = dot(in.world_position - frame.camera_position.xyz, frame.camera_forward.xyz);
-    float3 color = shade(s, in.world_position, in.position.xy, view_depth, frame, shadows, clusters, lights,
-                         cells, shadow_map0, shadow_map1, shadow_map2, shadow_map3, shadow_sampler);
-    return float4(color, s.alpha);
-}
-)";
-
-// Deferred, first half: the material into the G-buffer — emissive straight
-// into the HDR target, albedo and metallic, the shading normal and
-// roughness, the view depth and occlusion — 20 bytes a pixel that, in the
-// fused pass, never leave the tile.
-constexpr const char* kMslGBufferFragment = R"(
-struct GBufferOut {
-    float4 hdr [[color(0)]];
-    float4 albedo [[color(1)]];
-    float4 normal [[color(2)]];
-    float2 depth [[color(3)]];
-};
-
-fragment GBufferOut fs_main(VSOut in [[stage_in]],
-                            texture2d<float> base_color_map [[texture(0)]],
-                            texture2d<float> metallic_roughness_map [[texture(1)]],
-                            texture2d<float> occlusion_map [[texture(2)]],
-                            texture2d<float> emissive_map [[texture(3)]],
-                            texture2d<float> normal_map [[texture(4)]],
-                            sampler map_sampler [[sampler(0)]],
-                            constant FrameUniforms& frame [[buffer(0)]],
-                            constant MaterialUniforms& m [[buffer(1)]]) {
-    Surface s = sample_surface(in, base_color_map, metallic_roughness_map, occlusion_map, emissive_map,
-                               normal_map, map_sampler, m);
-    float view_depth = dot(in.world_position - frame.camera_position.xyz, frame.camera_forward.xyz);
-    GBufferOut out;
-    out.hdr = float4(s.emissive, 1.0);
-    out.albedo = float4(s.albedo, s.metallic);
-    out.normal = float4(s.n, s.roughness);
-    out.depth = float2(view_depth, s.occlusion);
-    return out;
-}
-)";
-
-// Deferred, second half: a pixel put back into the world from its view
-// depth and lit. Shared by the fused and the split lighting pass; only
-// where the G-buffer comes from differs.
-constexpr const char* kMslDeferredLighting = R"(
-struct VSOut {
-    float4 position [[position]];
-    float2 uv;
-};
-
-vertex VSOut vs_main(uint vid [[vertex_id]]) {
-    float2 corner = float2((vid << 1) & 2, vid & 2);
-    VSOut out;
-    out.position = float4(corner * 2.0 - 1.0, 0.0, 1.0);
-    out.uv = float2(corner.x, 1.0 - corner.y);
-    return out;
-}
-
-float4 light_pixel(float4 hdr, float4 albedo, float4 normal, float2 depth, float2 window_position,
-                   constant FrameUniforms& frame, constant ShadowUniforms& shadows,
-                   constant ClusterUniforms& clusters, constant DeferredUniforms& deferred,
-                   const device PointLight* lights, const device ClusterLights* cells,
-                   depth2d<float> shadow_map0, depth2d<float> shadow_map1, depth2d<float> shadow_map2,
-                   depth2d<float> shadow_map3, sampler shadow_sampler) {
-    float view_depth = depth.x;
-    if (view_depth <= 0.0) {
-        return hdr; // the sky: nothing was drawn here
-    }
-    // Back into the world: the pixel's ray at its depth, in view space, then out.
-    float2 ndc = float2(window_position.x / deferred.params.z * 2.0 - 1.0,
-                        1.0 - window_position.y / deferred.params.w * 2.0);
-    float3 view = float3(ndc.x * deferred.params.x * view_depth, ndc.y * deferred.params.y * view_depth,
-                         -view_depth);
-    float3 world_position = (deferred.inverse_view * float4(view, 1.0)).xyz;
-    Surface s;
-    s.albedo = albedo.rgb;
-    s.metallic = albedo.a;
-    s.n = normalize(normal.xyz);
-    s.geometric_n = s.n;
-    s.t = float3(0.0);
-    s.roughness = normal.a;
-    s.occlusion = depth.y;
-    s.emissive = float3(0.0); // already in the HDR target
-    s.alpha = 1.0;
-    float3 color = shade(s, world_position, window_position, view_depth, frame, shadows, clusters, lights,
-                         cells, shadow_map0, shadow_map1, shadow_map2, shadow_map3, shadow_sampler);
-    return float4(hdr.rgb + color, 1.0);
-}
-)";
-
-// Fused: the G-buffer read straight from the tile through [[color(n)]]
-// inputs, in the same render pass that drew it. The attachments it reads
-// are never stored, never sampled, never in memory at all.
-constexpr const char* kMslFusedLightingFragment = R"(
-struct GBufferIn {
-    float4 hdr [[color(0)]];
-    float4 albedo [[color(1)]];
-    float4 normal [[color(2)]];
-    float2 depth [[color(3)]];
-};
-
-fragment float4 fs_main(VSOut in [[stage_in]], GBufferIn g,
-                        depth2d<float> shadow_map0 [[texture(0)]],
-                        depth2d<float> shadow_map1 [[texture(1)]],
-                        depth2d<float> shadow_map2 [[texture(2)]],
-                        depth2d<float> shadow_map3 [[texture(3)]],
-                        sampler shadow_sampler [[sampler(0)]],
-                        constant FrameUniforms& frame [[buffer(0)]],
-                        constant ShadowUniforms& shadows [[buffer(1)]],
-                        constant ClusterUniforms& clusters [[buffer(2)]],
-                        constant DeferredUniforms& deferred [[buffer(3)]],
-                        const device PointLight* lights [[buffer(4)]],
-                        const device ClusterLights* cells [[buffer(5)]]) {
-    return light_pixel(g.hdr, g.albedo, g.normal, g.depth, in.position.xy, frame, shadows, clusters, deferred,
-                       lights, cells, shadow_map0, shadow_map1, shadow_map2, shadow_map3, shadow_sampler);
-}
-)";
-
-// Split: the G-buffer stored by one pass and sampled by the next — what
-// every deferred renderer does on a GPU with no tile memory, and what the
-// fused pass is measured against.
-constexpr const char* kMslSplitLightingFragment = R"(
-fragment float4 fs_main(VSOut in [[stage_in]],
-                        depth2d<float> shadow_map0 [[texture(0)]],
-                        depth2d<float> shadow_map1 [[texture(1)]],
-                        depth2d<float> shadow_map2 [[texture(2)]],
-                        depth2d<float> shadow_map3 [[texture(3)]],
-                        texture2d<float> g_hdr [[texture(4)]],
-                        texture2d<float> g_albedo [[texture(5)]],
-                        texture2d<float> g_normal [[texture(6)]],
-                        texture2d<float> g_depth [[texture(7)]],
-                        sampler shadow_sampler [[sampler(0)]],
-                        sampler point_sampler [[sampler(4)]],
-                        constant FrameUniforms& frame [[buffer(0)]],
-                        constant ShadowUniforms& shadows [[buffer(1)]],
-                        constant ClusterUniforms& clusters [[buffer(2)]],
-                        constant DeferredUniforms& deferred [[buffer(3)]],
-                        const device PointLight* lights [[buffer(4)]],
-                        const device ClusterLights* cells [[buffer(5)]]) {
-    return light_pixel(g_hdr.sample(point_sampler, in.uv), g_albedo.sample(point_sampler, in.uv),
-                       g_normal.sample(point_sampler, in.uv), g_depth.sample(point_sampler, in.uv).xy,
-                       in.position.xy, frame, shadows, clusters, deferred, lights, cells, shadow_map0,
-                       shadow_map1, shadow_map2, shadow_map3, shadow_sampler);
-}
-)";
-
-// The shadow map pass: the casters' depth from the light and nothing else.
-// The pipeline has no color target, so the fragment function returns none.
-constexpr const char* kShadowMsl = R"(
-#include <metal_stdlib>
-using namespace metal;
-
-struct VertexIn {
-    float3 position [[attribute(0)]];
-};
-
-struct Uniforms {
-    float4x4 mvp;
-    float4x4 model;
-};
-
-vertex float4 vs_main(VertexIn in [[stage_in]], constant Uniforms& u [[buffer(0)]]) {
-    return u.mvp * float4(in.position, 1.0);
-}
-
-fragment void fs_main() {}
-)";
-
-// Phase 0's triangle, kept as the fallback when there is nothing to load.
-constexpr const char* kTriangleMsl = R"(
-#include <metal_stdlib>
-using namespace metal;
-
-struct VSOut {
-    float4 position [[position]];
-    float4 color;
-};
-
-constant float2 kPositions[3] = { float2(-0.6, -0.5), float2(0.6, -0.5), float2(0.0, 0.6) };
-constant float3 kColors[3]    = { float3(0.91, 0.64, 0.14), float3(0.29, 0.77, 0.87), float3(0.94, 0.94, 0.96) };
-
-vertex VSOut vs_main(uint vid [[vertex_id]]) {
-    VSOut out;
-    out.position = float4(kPositions[vid], 0.0, 1.0);
-    out.color = float4(kColors[vid], 1.0);
-    return out;
-}
-
-fragment float4 fs_main(VSOut in [[stage_in]]) {
-    return in.color;
-}
-)";
-
-// Mirrors `struct Uniforms` in kMslMeshVertex: two column-major float4x4, 128 bytes.
-struct MeshUniforms {
-    Mat4 mvp;
-    Mat4 model;
-};
-static_assert(sizeof(MeshUniforms) == 128, "matches the MSL Uniforms struct");
-
-// Mirror the MSL uniform structs: float4 members only, so C++ and Metal agree on layout.
-struct FrameUniforms {
-    Vec4 camera_position;
-    Vec4 camera_forward;
-    Vec4 light_direction;
-    Vec4 light_color;
-    Vec4 params;
-};
-static_assert(sizeof(FrameUniforms) == 80, "matches the MSL FrameUniforms struct");
-
-struct MaterialUniforms {
-    Vec4 base_color_factor;
-    Vec4 factors;
-    Vec4 emissive_factor;
-};
-static_assert(sizeof(MaterialUniforms) == 48, "matches the MSL MaterialUniforms struct");
-
-struct ShadowUniforms {
-    Mat4 cascade_matrix[render::kMaxCascades];
-    Vec4 cascade_param[render::kMaxCascades];
-    Vec4 settings;
-};
-static_assert(sizeof(ShadowUniforms) == 336, "matches the MSL ShadowUniforms struct");
-
-struct DeferredUniforms {
-    Mat4 inverse_view;
-    Vec4 params;
-};
-static_assert(sizeof(DeferredUniforms) == 80, "matches the MSL DeferredUniforms struct");
-
-
-// What the keys toggle. Printed whenever it changes.
+// What the keys toggle, on the runtime's settings. Printed whenever it changes.
 struct Shading {
-    int model = 2;      // 0 unlit, 1 Blinn-Phong, 2 Cook-Torrance
-    int debug_view = 0; // 0 lit, 1 shading normals, 2 metallic/roughness, 3 occlusion, 4 vertex normals,
-                        // 5 tangents, 6 lit with the shadow cascades tinted, 7 lights per cluster
-    render::Tonemap tonemap = render::Tonemap::Aces;
-    bool bloom = true;
-    render::AntiAliasing anti_aliasing = render::AntiAliasing::Taa;
-    bool shadows = true;
-    bool point_lights = true;
-    ShadingPath path = ShadingPath::Forward;
     float light_azimuth = radians(35.0f);   // around +y, from +z
     float light_elevation = radians(50.0f); // above the horizon
-    float light_intensity = 3.0f;           // linear radiance; >1 is what tonemapping is for
-    float ambient = 0.10f;
 
     Vec3 light_direction() const {
         return {std::cos(light_elevation) * std::sin(light_azimuth), std::sin(light_elevation),
                 std::cos(light_elevation) * std::cos(light_azimuth)};
     }
 
-    // Debug views 0 and 6 are lit images and go through the tonemapper; the
-    // rest are data and go to the screen as they are.
-    [[nodiscard]] bool view_is_lit() const { return debug_view == 0 || debug_view == 6; }
-
-    void print() const {
-        static constexpr const char* kModels[] = {"unlit", "blinn-phong", "cook-torrance"};
-        static constexpr const char* kViews[] = {"lit",       "shading normals (mapped)",
-                                                 "metallic (r) / roughness (g)",
-                                                 "occlusion", "vertex normals",
-                                                 "tangents",  "shadow cascades",
-                                                 "lights per cluster"};
+    static void print(const sdk::Runtime& runtime, float azimuth_radians, float elevation_radians) {
         static constexpr const char* kTonemaps[] = {"off", "aces", "agx"};
         static constexpr const char* kAntiAliasing[] = {"off", "fxaa", "taa"};
-        float azimuth = std::fmod(degrees(light_azimuth), 360.0f);
-        if (azimuth < 0.0f) azimuth += 360.0f;
+        const render::SceneSettings& scene = runtime.scene_settings;
+        const render::PostSettings& post = runtime.post().settings;
+        float azimuth = std::fmod(degrees(azimuth_radians), 360.0f);
+        if (azimuth < 0.0f)
+            azimuth += 360.0f;
         TY_LOG_INFO("shading",
                     "%s, %s | view %s | tonemap %s | bloom %s | aa %s | shadows %s | point lights %s | "
                     "sun az %.0f el %.0f",
-                    kShadingPathNames[static_cast<int>(path)], kModels[model], kViews[debug_view],
-                    kTonemaps[static_cast<int>(tonemap)], bloom ? "on" : "off",
-                    kAntiAliasing[static_cast<int>(anti_aliasing)], shadows ? "on" : "off",
-                    point_lights ? "on" : "off", static_cast<double>(azimuth),
-                    static_cast<double>(degrees(light_elevation)));
+                    render::shading_path_name(scene.path), render::shading_model_name(scene.model),
+                    render::debug_view_name(scene.debug_view), kTonemaps[static_cast<int>(post.tonemap)],
+                    post.bloom ? "on" : "off", kAntiAliasing[static_cast<int>(post.anti_aliasing)],
+                    scene.shadows ? "on" : "off", scene.point_lights ? "on" : "off",
+                    static_cast<double>(azimuth), static_cast<double>(degrees(elevation_radians)));
     }
 
     // Returns true when something changed.
-    bool update(const platform::Input& input, float dt) {
+    bool update(sdk::Runtime& runtime, const platform::Input& input, float dt) {
         using platform::Key;
-        const int old_model = model, old_view = debug_view;
-        const render::Tonemap old_tonemap = tonemap;
-        const render::AntiAliasing old_aa = anti_aliasing;
-        const bool old_bloom = bloom, old_shadows = shadows, old_lights = point_lights;
-        const ShadingPath old_path = path;
-        if (input.key_pressed(Key::Y)) path = static_cast<ShadingPath>((static_cast<int>(path) + 1) % 3);
-        if (input.key_pressed(Key::Digit1)) model = 0;
-        if (input.key_pressed(Key::Digit2)) model = 1;
-        if (input.key_pressed(Key::Digit3)) model = 2;
-        if (input.key_pressed(Key::N)) debug_view = debug_view == 1 ? 0 : 1;
-        if (input.key_pressed(Key::M)) debug_view = debug_view == 2 ? 0 : 2;
-        if (input.key_pressed(Key::O)) debug_view = debug_view == 3 ? 0 : 3;
-        if (input.key_pressed(Key::V)) debug_view = debug_view == 4 ? 0 : 4;
-        if (input.key_pressed(Key::B)) debug_view = debug_view == 5 ? 0 : 5;
-        if (input.key_pressed(Key::C)) debug_view = debug_view == 6 ? 0 : 6;
-        if (input.key_pressed(Key::K)) debug_view = debug_view == 7 ? 0 : 7;
-        if (input.key_pressed(Key::Digit0)) debug_view = 0;
+        using render::DebugView;
+        render::SceneSettings& scene = runtime.scene_settings;
+        render::PostSettings& post = runtime.post().settings;
+        const render::SceneSettings old_scene = scene;
+        const render::Tonemap old_tonemap = post.tonemap;
+        const render::AntiAliasing old_aa = post.anti_aliasing;
+        const bool old_bloom = post.bloom;
+        const auto toggle_view = [&](DebugView view) {
+            scene.debug_view = scene.debug_view == view ? DebugView::Lit : view;
+        };
+        if (input.key_pressed(Key::Y)) {
+            scene.path = static_cast<render::ShadingPath>((static_cast<int>(scene.path) + 1) % 3);
+        }
+        if (input.key_pressed(Key::Digit1))
+            scene.model = render::ShadingModel::Unlit;
+        if (input.key_pressed(Key::Digit2))
+            scene.model = render::ShadingModel::BlinnPhong;
+        if (input.key_pressed(Key::Digit3))
+            scene.model = render::ShadingModel::CookTorrance;
+        if (input.key_pressed(Key::N))
+            toggle_view(DebugView::Normals);
+        if (input.key_pressed(Key::M))
+            toggle_view(DebugView::MetallicRoughness);
+        if (input.key_pressed(Key::O))
+            toggle_view(DebugView::Occlusion);
+        if (input.key_pressed(Key::V))
+            toggle_view(DebugView::VertexNormals);
+        if (input.key_pressed(Key::B))
+            toggle_view(DebugView::Tangents);
+        if (input.key_pressed(Key::C))
+            toggle_view(DebugView::Cascades);
+        if (input.key_pressed(Key::K))
+            toggle_view(DebugView::Clusters);
+        if (input.key_pressed(Key::Digit0))
+            scene.debug_view = DebugView::Lit;
         if (input.key_pressed(Key::T)) {
-            tonemap = static_cast<render::Tonemap>((static_cast<int>(tonemap) + 1) % 3);
+            post.tonemap = static_cast<render::Tonemap>((static_cast<int>(post.tonemap) + 1) % 3);
         }
-        if (input.key_pressed(Key::G)) bloom = !bloom;
+        if (input.key_pressed(Key::G))
+            post.bloom = !post.bloom;
         if (input.key_pressed(Key::H)) {
-            anti_aliasing = static_cast<render::AntiAliasing>((static_cast<int>(anti_aliasing) + 1) % 3);
+            post.anti_aliasing =
+                static_cast<render::AntiAliasing>((static_cast<int>(post.anti_aliasing) + 1) % 3);
         }
-        if (input.key_pressed(Key::X)) shadows = !shadows;
-        if (input.key_pressed(Key::P)) point_lights = !point_lights;
+        if (input.key_pressed(Key::X))
+            scene.shadows = !scene.shadows;
+        if (input.key_pressed(Key::P))
+            scene.point_lights = !scene.point_lights;
         const float turn = radians(60.0f) * dt;
         bool moved = false;
-        if (input.key_down(Key::Left)) { light_azimuth -= turn; moved = true; }
-        if (input.key_down(Key::Right)) { light_azimuth += turn; moved = true; }
-        if (input.key_down(Key::Up)) { light_elevation = std::min(light_elevation + turn, radians(89.0f)); moved = true; }
-        if (input.key_down(Key::Down)) { light_elevation = std::max(light_elevation - turn, radians(-10.0f)); moved = true; }
-        const bool changed = model != old_model || debug_view != old_view || tonemap != old_tonemap ||
-                             bloom != old_bloom || anti_aliasing != old_aa || shadows != old_shadows ||
-                             point_lights != old_lights || path != old_path;
-        if (changed) print();
+        if (input.key_down(Key::Left)) {
+            light_azimuth -= turn;
+            moved = true;
+        }
+        if (input.key_down(Key::Right)) {
+            light_azimuth += turn;
+            moved = true;
+        }
+        if (input.key_down(Key::Up)) {
+            light_elevation = std::min(light_elevation + turn, radians(89.0f));
+            moved = true;
+        }
+        if (input.key_down(Key::Down)) {
+            light_elevation = std::max(light_elevation - turn, radians(-10.0f));
+            moved = true;
+        }
+        runtime.sun.direction = light_direction();
+        const bool changed = scene.model != old_scene.model || scene.debug_view != old_scene.debug_view ||
+                             post.tonemap != old_tonemap || post.bloom != old_bloom ||
+                             post.anti_aliasing != old_aa || scene.shadows != old_scene.shadows ||
+                             scene.point_lights != old_scene.point_lights || scene.path != old_scene.path;
+        if (changed)
+            print(runtime, light_azimuth, light_elevation);
         return changed || moved;
     }
 };
@@ -1222,10 +639,14 @@ struct FlyCamera {
         forward = normalize(forward);
         const Vec3 right = cross(forward, Vec3::unit_y());
         Vec3 move = Vec3::zero();
-        if (input.key_down(platform::Key::W)) move += forward;
-        if (input.key_down(platform::Key::S)) move -= forward;
-        if (input.key_down(platform::Key::D)) move += right;
-        if (input.key_down(platform::Key::A)) move -= right;
+        if (input.key_down(platform::Key::W))
+            move += forward;
+        if (input.key_down(platform::Key::S))
+            move -= forward;
+        if (input.key_down(platform::Key::D))
+            move += right;
+        if (input.key_down(platform::Key::A))
+            move -= right;
         return length_squared(move) > 0.0f ? normalize(move) : move;
     }
 
@@ -1243,7 +664,8 @@ struct FlyCamera {
             yaw -= input.mouse_dx() * kSensitivity;
             pitch = clamp(pitch - input.mouse_dy() * kSensitivity, radians(-89.0f), radians(89.0f));
         }
-        camera.rotation = Quat::from_axis_angle(Vec3::unit_y(), yaw) * Quat::from_axis_angle(Vec3::unit_x(), pitch);
+        camera.rotation =
+            Quat::from_axis_angle(Vec3::unit_y(), yaw) * Quat::from_axis_angle(Vec3::unit_x(), pitch);
         if (follow_target != nullptr) {
             // Behind and a little above the character, looking at its head.
             camera.position = *follow_target + kFollowFocus - camera.forward() * kFollowDistance;
@@ -1251,327 +673,69 @@ struct FlyCamera {
         }
 
         Vec3 move = Vec3::zero();
-        if (input.key_down(platform::Key::W)) move += camera.forward();
-        if (input.key_down(platform::Key::S)) move -= camera.forward();
-        if (input.key_down(platform::Key::D)) move += camera.right();
-        if (input.key_down(platform::Key::A)) move -= camera.right();
-        if (input.key_down(platform::Key::E)) move += Vec3::unit_y();
-        if (input.key_down(platform::Key::Q)) move -= Vec3::unit_y();
+        if (input.key_down(platform::Key::W))
+            move += camera.forward();
+        if (input.key_down(platform::Key::S))
+            move -= camera.forward();
+        if (input.key_down(platform::Key::D))
+            move += camera.right();
+        if (input.key_down(platform::Key::A))
+            move -= camera.right();
+        if (input.key_down(platform::Key::E))
+            move += Vec3::unit_y();
+        if (input.key_down(platform::Key::Q))
+            move -= Vec3::unit_y();
         if (length_squared(move) > 0.0f) {
-            const bool run = input.key_down(platform::Key::LeftShift) || input.key_down(platform::Key::RightShift);
+            const bool run =
+                input.key_down(platform::Key::LeftShift) || input.key_down(platform::Key::RightShift);
             camera.position += normalize(move) * (speed * (run ? 4.0f : 1.0f) * dt);
         }
     }
 };
 
-// ----------------------------------------------------------------- renderer
+// ------------------------------------------------------------------- lights
 
-// The frame's passes draw the scene into this format; the tonemap pass
-// brings it down to the swapchain's.
-constexpr rhi::TextureFormat kHdrFormat = rhi::TextureFormat::Rgba16Float;
-// The G-buffer: albedo and metallic; the shading normal and roughness;
-// the view depth and occlusion. Twenty bytes a pixel beside HDR and depth —
-// on a tile-based GPU, twenty bytes that need never exist in memory.
-constexpr rhi::TextureFormat kGBufferAlbedoFormat = rhi::TextureFormat::Rgba8Unorm;
-constexpr rhi::TextureFormat kGBufferNormalFormat = rhi::TextureFormat::Rgba16Float;
-constexpr rhi::TextureFormat kGBufferDepthFormat = rhi::TextureFormat::Rg32Float;
-constexpr rhi::ClearColor kSkyColor{.r = 0.09f, .g = 0.10f, .b = 0.12f};
-
-// The sun's shadow: four cascades out to 60 m, the lookup pushed two texels
-// off the surface and one texel towards the light against acne.
-constexpr render::CascadeSettings kCascades{.count = 4, .map_size = 2048, .max_distance = 60.0f};
-constexpr float kShadowNormalOffsetTexels = 2.0f;
-constexpr float kShadowBiasTexels = 1.0f;
-constexpr std::uint32_t kShadowTextureSlot = 5; // after the five material maps
-constexpr const char* kShadowPassNames[render::kMaxCascades] = {"shadow 0", "shadow 1", "shadow 2",
-                                                                 "shadow 3"};
-
-// A hundred coloured point lights circling the pile, listed per cell of a
-// 16 x 9 x 24 cluster grid by a compute pass each frame.
+// A hundred coloured point lights circling the pile, listed per cell of the
+// cluster grid by the scene renderer's compute pass each frame.
 constexpr std::uint32_t kLightCount = 100;
-constexpr std::uint32_t kMaxLights = 256;
-constexpr render::ClusterGridSettings kClusterSettings{.tiles_x = 16, .tiles_y = 9, .slices = 24,
-                                                       .max_distance = 80.0f};
 
-struct Renderer {
-    std::unique_ptr<rhi::Device> device;
-    std::unique_ptr<render::FrameGraph> graph; // owns the frame's transient textures
-    std::unique_ptr<render::PostStack> post;   // bloom, TAA, tonemap, FXAA: HDR to the screen
-    rhi::PipelineHandle mesh_pipeline;
-    rhi::PipelineHandle triangle_pipeline;
-    rhi::PipelineHandle shadow_pipeline;         // depth only
-    rhi::PipelineHandle gbuffer_pipeline;        // the material into four attachments
-    rhi::PipelineHandle lighting_fused_pipeline; // reads them from the tile, in the same pass
-    rhi::PipelineHandle lighting_split_pipeline; // samples them, in the next pass
-    rhi::SamplerHandle gbuffer_sampler;          // for the split path: one texel per pixel
-    render::FallbackTextures fallbacks;
-    rhi::SamplerHandle sampler;        // materials: anisotropic, repeating
-    rhi::SamplerHandle shadow_sampler; // the shadow maps: compared, bilinear, clamped
-    rhi::TextureHandle shadow_fallback; // a 1x1 depth texture for the shadow slots when there are no maps
-    rhi::ComputePipelineHandle cluster_kernel; // lists the lights per cell
-    rhi::BufferHandle light_buffer;            // kMaxLights PointLights, streamed in each frame
-    rhi::BufferHandle cluster_buffer;          // one ClusterLights per cell, written by the kernel
-    render::Model models[kModelCount]; // by kModel* slot
-    bool shadows = false; // the device can sample its depth format and the shadow pipeline built
-    bool clusters = false; // the kernel and both buffers exist
-
-    Renderer() = default;
-    Renderer(Renderer&& other) noexcept
-        : device(std::move(other.device)), graph(std::move(other.graph)), post(std::move(other.post)),
-          mesh_pipeline(std::exchange(other.mesh_pipeline, {})),
-          triangle_pipeline(std::exchange(other.triangle_pipeline, {})),
-          shadow_pipeline(std::exchange(other.shadow_pipeline, {})),
-          gbuffer_pipeline(std::exchange(other.gbuffer_pipeline, {})),
-          lighting_fused_pipeline(std::exchange(other.lighting_fused_pipeline, {})),
-          lighting_split_pipeline(std::exchange(other.lighting_split_pipeline, {})),
-          gbuffer_sampler(std::exchange(other.gbuffer_sampler, {})),
-          fallbacks(std::exchange(other.fallbacks, render::FallbackTextures{})),
-          sampler(std::exchange(other.sampler, {})), shadow_sampler(std::exchange(other.shadow_sampler, {})),
-          shadow_fallback(std::exchange(other.shadow_fallback, {})),
-          cluster_kernel(std::exchange(other.cluster_kernel, {})),
-          light_buffer(std::exchange(other.light_buffer, {})),
-          cluster_buffer(std::exchange(other.cluster_buffer, {})), shadows(other.shadows),
-          clusters(other.clusters) {
-        for (std::uint32_t i = 0; i < kModelCount; ++i) {
-            models[i] = std::exchange(other.models[i], render::Model{});
-        }
+// A hue as linear RGB, fully saturated.
+Vec3 hue_color(float hue) {
+    const float h = hue * 6.0f;
+    const float x = 1.0f - std::fabs(std::fmod(h, 2.0f) - 1.0f);
+    switch (static_cast<int>(h) % 6) {
+    case 0:
+        return {1.0f, x, 0.0f};
+    case 1:
+        return {x, 1.0f, 0.0f};
+    case 2:
+        return {0.0f, 1.0f, x};
+    case 3:
+        return {0.0f, x, 1.0f};
+    case 4:
+        return {x, 0.0f, 1.0f};
+    default:
+        return {1.0f, 0.0f, x};
     }
-    Renderer& operator=(Renderer&&) = delete;
-    ~Renderer() { destroy(); }
-
-    // GPU objects go before their device, and the device before the window.
-    void destroy() noexcept {
-        if (device != nullptr) {
-            graph.reset(); // returns its textures first
-            post.reset();  // and its history
-            for (render::Model& model : models) {
-                render::destroy_model(*device, model);
-            }
-            device->destroy_sampler(sampler);
-            device->destroy_sampler(shadow_sampler);
-            device->destroy_texture(shadow_fallback);
-            device->destroy_compute_pipeline(cluster_kernel);
-            device->destroy_buffer(light_buffer);
-            device->destroy_buffer(cluster_buffer);
-            render::destroy_fallback_textures(*device, fallbacks);
-            device->destroy_graphics_pipeline(mesh_pipeline);
-            device->destroy_graphics_pipeline(triangle_pipeline);
-            device->destroy_graphics_pipeline(shadow_pipeline);
-            device->destroy_graphics_pipeline(gbuffer_pipeline);
-            device->destroy_graphics_pipeline(lighting_fused_pipeline);
-            device->destroy_graphics_pipeline(lighting_split_pipeline);
-            device->destroy_sampler(gbuffer_sampler);
-            mesh_pipeline = triangle_pipeline = shadow_pipeline = {};
-            gbuffer_pipeline = lighting_fused_pipeline = lighting_split_pipeline = {};
-            gbuffer_sampler = {};
-            sampler = shadow_sampler = {};
-            shadow_fallback = {};
-            cluster_kernel = {};
-            light_buffer = cluster_buffer = {};
-            device.reset();
-        }
-    }
-};
-
-rhi::PipelineHandle make_pipeline(rhi::Device& device, const char* msl, const rhi::GraphicsPipelineDesc& base,
-                                  std::uint32_t vertex_uniforms, std::uint32_t fragment_uniforms,
-                                  std::uint32_t fragment_samplers,
-                                  std::uint32_t fragment_storage_buffers = 0) {
-    const rhi::ShaderDesc common{.format = rhi::ShaderFormat::Msl, .code = msl, .code_size = std::strlen(msl)};
-    rhi::ShaderDesc vs_desc = common;
-    vs_desc.stage = rhi::ShaderStage::Vertex;
-    vs_desc.entry_point = "vs_main";
-    vs_desc.num_uniform_buffers = vertex_uniforms;
-    rhi::ShaderDesc fs_desc = common;
-    fs_desc.stage = rhi::ShaderStage::Fragment;
-    fs_desc.entry_point = "fs_main";
-    fs_desc.num_uniform_buffers = fragment_uniforms;
-    fs_desc.num_samplers = fragment_samplers;
-    fs_desc.num_storage_buffers = fragment_storage_buffers;
-
-    const rhi::ShaderHandle vs = device.create_shader(vs_desc);
-    const rhi::ShaderHandle fs = device.create_shader(fs_desc);
-    rhi::PipelineHandle pipeline;
-    if (vs && fs) {
-        rhi::GraphicsPipelineDesc desc = base;
-        desc.vertex_shader = vs;
-        desc.fragment_shader = fs;
-        pipeline = device.create_graphics_pipeline(desc);
-    }
-    if (!pipeline) {
-        TY_LOG_ERROR("gpu", "pipeline failed: %s", platform::last_error());
-    }
-    device.destroy_shader(vs); // the pipeline holds what it needs
-    device.destroy_shader(fs);
-    return pipeline;
 }
 
-// Everything GPU-side. On failure the sandbox keeps running without drawing,
-// and says why — a missing backend is a message, not a crash.
-Renderer create_renderer(platform::Window& window, const render::ModelData* model_data,
-                         rhi::Backend backend) {
-    Renderer r;
-    r.device = rhi::Device::create({.backend = backend, .debug = kGpuDebug});
-    if (r.device == nullptr) {
-        TY_LOG_ERROR("gpu", "unavailable: %s", platform::last_error());
-        return r;
+// The point lights at time t: each on its own circle around the pile, at
+// its own height, bobbing, coloured by where it is in the hundred.
+void animate_lights(float t, render::PointLight* out, std::uint32_t count) {
+    for (std::uint32_t i = 0; i < count; ++i) {
+        const float direction = noise(i, 21) > 0.5f ? 1.0f : -1.0f;
+        const float angle = t * direction * (0.15f + 0.35f * noise(i, 20)) + noise(i, 22) * kTwoPi;
+        const float radius = 1.2f + 4.5f * noise(i, 23);
+        const float bob = std::sin(t * (0.4f + 0.8f * noise(i, 24)) + noise(i, 25) * kTwoPi);
+        const float height = 0.4f + 1.6f * (0.5f + 0.5f * bob);
+        const Vec3 position{radius * std::cos(angle), height, radius * std::sin(angle)};
+        const float reach = 1.8f + 1.4f * noise(i, 26);
+        out[i].position_radius = {position, reach};
+        out[i].color = {hue_color(static_cast<float>(i) / static_cast<float>(count)) * 4.0f, 0.0f};
     }
-    TY_LOG_INFO("gpu", "%s backend on %s, wants %s shaders, depth %s", rhi::backend_name(r.device->backend()),
-                r.device->backend_name(), rhi::shader_format_name(r.device->shader_format()),
-                rhi::texture_format_name(r.device->preferred_depth_format()));
-    if (!r.device->attach_window(window)) {
-        TY_LOG_ERROR("gpu", "cannot present to this window: %s", platform::last_error());
-        r.device.reset();
-        return r;
-    }
-    TY_LOG_INFO("swap", "%s", r.device->swapchain_is_linear() ? "sRGB-encoded by the display hardware"
-                                                             : "plain SDR; the shader encodes sRGB itself");
-    r.graph = std::make_unique<render::FrameGraph>(r.device.get());
-    r.post = std::make_unique<render::PostStack>(); // declares its passes even before it can draw them
-    if (r.device->shader_format() != rhi::ShaderFormat::Msl) {
-        TY_LOG_WARN("gpu", "the sandbox only carries MSL until SDL_shadercross lands; drawing nothing");
-        return r;
-    }
-
-    // The scene's shaders, assembled from the shared pieces (see kMslCommon).
-    const std::string forward_msl = std::string(kMslCommon) + kMslMeshVertex + kMslSurface + kMslLighting +
-                                    kMslForwardFragment;
-    const std::string gbuffer_msl =
-        std::string(kMslCommon) + kMslMeshVertex + kMslSurface + kMslGBufferFragment;
-    const std::string fused_msl = std::string(kMslCommon) + kMslLighting + kMslDeferredLighting +
-                                  kMslFusedLightingFragment;
-    const std::string split_msl = std::string(kMslCommon) + kMslLighting + kMslDeferredLighting +
-                                  kMslSplitLightingFragment;
-
-    // Forward: the scene pass draws into HDR with depth; the post stack
-    // takes it from there.
-    rhi::GraphicsPipelineDesc mesh_desc;
-    mesh_desc.vertex_layout = render::vertex_layout();
-    mesh_desc.cull = rhi::CullMode::Back;
-    mesh_desc.depth = {.test = true, .write = true, .compare = rhi::CompareOp::Greater}; // reverse-Z
-    mesh_desc.color_formats[0] = kHdrFormat;
-    mesh_desc.color_target_count = 1;
-    mesh_desc.depth_format = r.device->preferred_depth_format();
-    r.mesh_pipeline = make_pipeline(*r.device, forward_msl.c_str(), mesh_desc, 1, 4,
-                                    kShadowTextureSlot + render::kMaxCascades, 2);
-
-    // Deferred: the G-buffer pass writes HDR (emissive), albedo, normal and
-    // depth; the fused lighting draw reads the last three from the tile and
-    // writes only HDR; the split one samples them from memory instead.
-    rhi::GraphicsPipelineDesc gbuffer_desc = mesh_desc;
-    gbuffer_desc.color_formats[1] = kGBufferAlbedoFormat;
-    gbuffer_desc.color_formats[2] = kGBufferNormalFormat;
-    gbuffer_desc.color_formats[3] = kGBufferDepthFormat;
-    gbuffer_desc.color_target_count = 4;
-    r.gbuffer_pipeline = make_pipeline(*r.device, gbuffer_msl.c_str(), gbuffer_desc, 1, 2, 5, 0);
-
-    rhi::GraphicsPipelineDesc fused_desc;
-    for (std::uint32_t i = 0; i < 4; ++i) {
-        fused_desc.color_formats[i] = gbuffer_desc.color_formats[i];
-        fused_desc.color_write[i] = i == 0;
-    }
-    fused_desc.color_target_count = 4;
-    fused_desc.depth_format = r.device->preferred_depth_format();
-    r.lighting_fused_pipeline =
-        make_pipeline(*r.device, fused_msl.c_str(), fused_desc, 0, 4, render::kMaxCascades, 2);
-
-    rhi::GraphicsPipelineDesc split_desc;
-    split_desc.color_formats[0] = kHdrFormat;
-    split_desc.color_target_count = 1;
-    r.lighting_split_pipeline =
-        make_pipeline(*r.device, split_msl.c_str(), split_desc, 0, 4, render::kMaxCascades + 4, 2);
-    r.gbuffer_sampler = r.device->create_sampler({.min_filter = rhi::Filter::Nearest,
-                                                  .mag_filter = rhi::Filter::Nearest,
-                                                  .address_u = rhi::AddressMode::ClampToEdge,
-                                                  .address_v = rhi::AddressMode::ClampToEdge});
-
-    rhi::GraphicsPipelineDesc triangle_desc;
-    triangle_desc.color_formats[0] = kHdrFormat; // same pass, so the same targets, even with the test off
-    triangle_desc.color_target_count = 1;
-    triangle_desc.depth_format = r.device->preferred_depth_format();
-    r.triangle_pipeline = make_pipeline(*r.device, kTriangleMsl, triangle_desc, 0, 0, 0);
-
-    // HDR to the screen: bloom, TAA, tonemap, FXAA.
-    if (!r.post->create(*r.device, kHdrFormat, r.device->swapchain_format())) {
-        TY_LOG_ERROR("gpu", "post stack failed: %s", platform::last_error());
-    }
-
-    // Shadows need the depth format to be sampled as well as drawn into.
-    const rhi::TextureFormat depth_format = r.device->preferred_depth_format();
-    if (r.device->supports_texture(depth_format, rhi::TextureUsage::DepthStencilTarget |
-                                                     rhi::TextureUsage::Sampled)) {
-        rhi::GraphicsPipelineDesc shadow_desc;
-        shadow_desc.vertex_layout = render::vertex_layout();
-        shadow_desc.cull = rhi::CullMode::None; // thin things cast from both sides
-        shadow_desc.depth = {.test = true, .write = true, .compare = rhi::CompareOp::Greater};
-        shadow_desc.depth_format = depth_format;
-        r.shadow_pipeline = make_pipeline(*r.device, kShadowMsl, shadow_desc, 1, 0, 0);
-        r.shadow_sampler = r.device->create_sampler({.address_u = rhi::AddressMode::ClampToEdge,
-                                                     .address_v = rhi::AddressMode::ClampToEdge,
-                                                     .compare = rhi::CompareOp::GreaterEqual});
-        // The scene shader declares its shadow maps whether or not there are
-        // any this frame, so the slots always need a depth texture in them.
-        r.shadow_fallback = r.device->create_texture(
-            {.format = depth_format,
-             .width = 1,
-             .height = 1,
-             .usage = rhi::TextureUsage::DepthStencilTarget | rhi::TextureUsage::Sampled});
-        r.shadows = r.shadow_pipeline && r.shadow_sampler && r.shadow_fallback;
-    }
-    if (!r.shadows) {
-        TY_LOG_WARN("gpu", "no shadows: %s cannot be sampled here, or the shadow pipeline failed",
-                    rhi::texture_format_name(depth_format));
-    }
-
-    // The point lights: the kernel that sorts them into cells, the buffer
-    // they arrive in and the table they land in.
-    r.cluster_kernel = r.device->create_compute_pipeline(render::cluster_kernel_pipeline_desc());
-    r.light_buffer = r.device->create_buffer(
-        {.usage = rhi::BufferUsage::Storage,
-         .size = static_cast<std::uint32_t>(kMaxLights * sizeof(render::PointLight))});
-    const render::ClusterGrid grid = render::ClusterGrid::make(kClusterSettings, 0.05f);
-    r.cluster_buffer = r.device->create_buffer(
-        {.usage = rhi::BufferUsage::Storage,
-         .size = static_cast<std::uint32_t>(grid.cluster_count() * sizeof(render::ClusterLights))});
-    r.clusters = r.cluster_kernel && r.light_buffer && r.cluster_buffer;
-    if (!r.clusters) {
-        TY_LOG_ERROR("gpu", "no clustered lights: %s", platform::last_error());
-    }
-
-    r.sampler = r.device->create_sampler({.max_anisotropy = 8.0f});
-    if (!render::create_fallback_textures(*r.device, r.fallbacks) || !r.sampler) {
-        TY_LOG_ERROR("gpu", "fallback textures or sampler failed: %s", platform::last_error());
-        return r;
-    }
-    if (model_data != nullptr) {
-        const double t0 = platform::now_seconds();
-        if (!render::upload_model(*r.device, *model_data, r.fallbacks, r.models[kModelBottle])) {
-            TY_LOG_ERROR("gpu", "model upload failed: %s", platform::last_error());
-        } else {
-            std::size_t uploaded = 0;
-            for (const rhi::TextureHandle t : r.models[kModelBottle].textures) {
-                uploaded += t ? 1 : 0;
-            }
-            TY_LOG_INFO("gpu", "%zu of %zu textures uploaded with mipmaps in %.2f s", uploaded,
-                        r.models[kModelBottle].textures.size(), platform::now_seconds() - t0);
-        }
-        const render::ModelData floor = make_floor_model();
-        if (!render::upload_model(*r.device, floor, r.fallbacks, r.models[kModelFloor])) {
-            TY_LOG_ERROR("gpu", "floor upload failed: %s", platform::last_error());
-        }
-        const render::ModelData character = make_plain_model(
-            make_capsule_mesh(kCharacterRadius, kCharacterHalfHeight), Vec4{0.20f, 0.45f, 0.85f, 1.0f}, 0.6f);
-        if (!render::upload_model(*r.device, character, r.fallbacks, r.models[kModelCharacter])) {
-            TY_LOG_ERROR("gpu", "character upload failed: %s", platform::last_error());
-        }
-        const render::ModelData gate =
-            make_plain_model(make_box_mesh(kGateHalf), Vec4{0.55f, 0.36f, 0.20f, 1.0f}, 0.8f);
-        if (!render::upload_model(*r.device, gate, r.fallbacks, r.models[kModelGate])) {
-            TY_LOG_ERROR("gpu", "gate upload failed: %s", platform::last_error());
-        }
-    }
-    return r;
 }
+
+// -------------------------------------------------------------------- input
 
 void report_edges(const platform::Input& input) {
     for (std::size_t i = 0; i < platform::kKeyCount; ++i) {
@@ -1587,7 +751,7 @@ void report_edges(const platform::Input& input) {
 // to walk it along the edge of the pile, a jump on the way, and L once the
 // pile has settled to launch it through the game module. It goes in through
 // the same door as a replay, so a log recorded headless carries all of it.
-platform::InputFrame scripted_frame(long index, float dt) {
+platform::InputFrame scripted_frame(long index, float dt, void*) {
     platform::InputFrame frame;
     frame.dt = dt;
     const auto bit = [](platform::Key key) { return static_cast<std::size_t>(key); };
@@ -1616,367 +780,19 @@ platform::InputFrame scripted_frame(long index, float dt) {
     return frame;
 }
 
-// Every entity with something to draw, its GPU model and its world matrix,
-// with the mesh bound once per run of the same model.
-template <typename PerEntity>
-void each_drawable(scene::World& world, Renderer& renderer, rhi::RenderPass& pass, PerEntity&& per_entity) {
-    std::uint32_t bound_model = 0xFFFFFFFFu;
-    world.each<scene::LocalToWorld, scene::MeshRenderer>(
-        [&](scene::Entity, scene::LocalToWorld& local_to_world, scene::MeshRenderer& mr) {
-            if (!mr.visible || mr.model >= kModelCount) {
-                return;
-            }
-            const render::Model& model = renderer.models[mr.model];
-            if (model.mesh.index_count == 0) {
-                return;
-            }
-            if (bound_model != mr.model) {
-                render::bind_mesh(pass, model.mesh);
-                bound_model = mr.model;
-            }
-            per_entity(model, local_to_world.matrix);
-        });
-}
+// The character walks once per physics step, where the camera's WASD
+// pointed this frame; a jump pressed between steps is latched until one runs.
+struct CharacterStep {
+    physics::CharacterController* character = nullptr;
+    Vec3 walk = Vec3::zero();
+    bool jump_latched = false;
 
-// A hue as linear RGB, fully saturated.
-Vec3 hue_color(float hue) {
-    const float h = hue * 6.0f;
-    const float x = 1.0f - std::fabs(std::fmod(h, 2.0f) - 1.0f);
-    switch (static_cast<int>(h) % 6) {
-    case 0: return {1.0f, x, 0.0f};
-    case 1: return {x, 1.0f, 0.0f};
-    case 2: return {0.0f, 1.0f, x};
-    case 3: return {0.0f, x, 1.0f};
-    case 4: return {x, 0.0f, 1.0f};
-    default: return {1.0f, 0.0f, x};
+    static void before_step(float step, void* user) {
+        auto* self = static_cast<CharacterStep*>(user);
+        self->character->move(self->walk, self->jump_latched, step);
+        self->jump_latched = false;
     }
-}
-
-// The point lights at time t: each on its own circle around the pile, at
-// its own height, bobbing, coloured by where it is in the hundred.
-void animate_lights(float t, render::PointLight* out, std::uint32_t count) {
-    for (std::uint32_t i = 0; i < count; ++i) {
-        const float direction = noise(i, 21) > 0.5f ? 1.0f : -1.0f;
-        const float angle = t * direction * (0.15f + 0.35f * noise(i, 20)) + noise(i, 22) * kTwoPi;
-        const float radius = 1.2f + 4.5f * noise(i, 23);
-        const float bob = std::sin(t * (0.4f + 0.8f * noise(i, 24)) + noise(i, 25) * kTwoPi);
-        const float height = 0.4f + 1.6f * (0.5f + 0.5f * bob);
-        const Vec3 position{radius * std::cos(angle), height, radius * std::sin(angle)};
-        const float reach = 1.8f + 1.4f * noise(i, 26);
-        out[i].position_radius = {position, reach};
-        out[i].color = {hue_color(static_cast<float>(i) / static_cast<float>(count)) * 4.0f, 0.0f};
-    }
-}
-
-// The frame as a graph: the sun's shadow maps, one depth-only pass per
-// cascade; a compute pass sorting the point lights into the cluster grid;
-// the scene into an HDR transient with a depth transient beside it, reading
-// the shadow maps and the cluster table; then the tonemap pass reading that
-// onto the swapchain. Declared, compiled and run every frame — the graph
-// decides that the scene's depth is never stored and that the shadow maps
-// and HDR are, and would drop any pass whose result nothing consumed.
-void draw_frame(Renderer& renderer, rhi::Frame& frame, scene::World& world, const FlyCamera& fly,
-                const Shading& shading, float time) {
-    render::FrameGraph& graph = *renderer.graph;
-    const rhi::TextureFormat depth_format = renderer.device->preferred_depth_format();
-    const render::TextureInfo screen{.format = kHdrFormat, .width = frame.width(), .height = frame.height()};
-    graph.begin();
-    render::GraphTexture swapchain = graph.import(
-        "swapchain", frame.swapchain_texture(),
-        {.format = renderer.device->swapchain_format(), .width = frame.width(), .height = frame.height()});
-    render::GraphTexture hdr = graph.create("hdr", screen);
-    render::GraphTexture depth =
-        graph.create("depth", {.format = depth_format, .width = screen.width, .height = screen.height});
-
-    const float aspect = static_cast<float>(frame.width()) / static_cast<float>(frame.height());
-    // The post stack's settings follow the keys; a data view goes to the
-    // screen as it is, untonemapped and without bloom.
-    render::PostStack& post = *renderer.post;
-    post.settings.tonemap = shading.view_is_lit() ? shading.tonemap : render::Tonemap::None;
-    post.settings.bloom = shading.view_is_lit() && shading.bloom;
-    post.settings.anti_aliasing = shading.anti_aliasing;
-    // TAA draws the scene a fraction of a pixel off each frame.
-    const Vec2 jitter = post.jitter(frame.width(), frame.height());
-    const Mat4 view_projection = fly.camera.view_projection(aspect, jitter);
-    const Vec3 light = shading.light_direction();
-    // The scene shader reads the cluster table whether or not any light is
-    // on, so without the cluster resources there is no scene to draw.
-    const bool have_scene =
-        renderer.models[kModelBottle].mesh.index_count > 0 && renderer.mesh_pipeline && renderer.clusters;
-    const bool shadows = have_scene && renderer.shadows && shading.shadows;
-    const bool point_lights = have_scene && shading.point_lights;
-
-    // The point lights, moved on and streamed in; the kernel sorts them into
-    // the cells before the scene reads them. With the lights off the table
-    // still exists, empty, so the shader reads nothing from it.
-    render::PointLight lights[kLightCount];
-    const std::uint32_t light_count = point_lights ? kLightCount : 0;
-    animate_lights(time, lights, light_count);
-    const render::ClusterGrid grid = render::ClusterGrid::make(kClusterSettings, fly.camera.near);
-    const float tan_half_y = std::tan(0.5f * fly.camera.fov_y);
-    const render::ClusterUniforms cluster_uniforms =
-        render::cluster_uniforms(grid, light_count, static_cast<float>(frame.width()),
-                                 static_cast<float>(frame.height()), tan_half_y * aspect, tan_half_y,
-                                 fly.camera.view());
-    render::GraphBuffer light_list, cluster_table;
-    if (renderer.clusters) {
-        light_list = graph.import_buffer("lights", renderer.light_buffer);
-        cluster_table = graph.import_buffer("clusters", renderer.cluster_buffer);
-        graph.add_compute_pass(
-            "cluster lights",
-            [&](render::PassBuilder& b) {
-                b.read_buffer(light_list);
-                cluster_table = b.write_buffer(cluster_table);
-            },
-            [&](rhi::ComputePass& pass, const render::PassResources& resources) {
-                pass.bind_pipeline(renderer.cluster_kernel);
-                pass.bind_storage_buffer(0, resources.buffer(light_list));
-                pass.push_uniforms(0, &cluster_uniforms, sizeof cluster_uniforms);
-                pass.dispatch((grid.cluster_count() + 63) / 64);
-            });
-    }
-
-    // The cascades: fitted to this frame's view, each drawn from the light.
-    render::CascadeSet cascades;
-    render::GraphTexture shadow_maps[render::kMaxCascades];
-    if (shadows) {
-        cascades = render::fit_cascades(fly.camera, aspect, light, kCascades);
-        for (std::uint32_t i = 0; i < cascades.count; ++i) {
-            shadow_maps[i] = graph.create(kShadowPassNames[i], {.format = depth_format,
-                                                                .width = kCascades.map_size,
-                                                                .height = kCascades.map_size});
-            graph.add_pass(
-                kShadowPassNames[i],
-                [&, i](render::PassBuilder& b) { shadow_maps[i] = b.write_depth(shadow_maps[i]); },
-                [&, i](rhi::RenderPass& pass, const render::PassResources&) {
-                    pass.bind_pipeline(renderer.shadow_pipeline);
-                    const Mat4& light_view_projection = cascades.cascades[i].view_projection;
-                    each_drawable(world, renderer, pass, [&](const render::Model& model, const Mat4& world) {
-                        const MeshUniforms uniforms{light_view_projection * world, world};
-                        pass.push_vertex_uniforms(0, &uniforms, sizeof(uniforms));
-                        pass.draw_indexed(model.mesh.index_count); // every submesh at once: no materials here
-                    });
-                });
-        }
-    }
-    ShadowUniforms shadow_uniforms{};
-    for (std::uint32_t i = 0; i < cascades.count; ++i) {
-        const render::Cascade& cascade = cascades.cascades[i];
-        shadow_uniforms.cascade_matrix[i] = cascade.view_projection;
-        shadow_uniforms.cascade_param[i] = {cascade.texel_size, 1.0f / cascade.depth_range,
-                                            1.0f / static_cast<float>(kCascades.map_size), 0.0f};
-    }
-    shadow_uniforms.settings = {static_cast<float>(cascades.count), shadows ? 1.0f : 0.0f,
-                                kShadowNormalOffsetTexels, kShadowBiasTexels};
-
-    const FrameUniforms frame_uniforms{{fly.camera.position, 1.0f},
-                                       {fly.camera.forward(), 0.0f},
-                                       {light, shading.light_intensity},
-                                       {1.0f, 0.97f, 0.92f, shading.ambient},
-                                       {static_cast<float>(shading.model),
-                                        static_cast<float>(shading.debug_view), 0.0f, 0.0f}};
-    const auto screen_width = static_cast<float>(frame.width());
-    const auto screen_height = static_cast<float>(frame.height());
-    const DeferredUniforms deferred_uniforms{inverse(fly.camera.view()),
-                                            {tan_half_y * aspect, tan_half_y, screen_width, screen_height}};
-
-    // What every lighting variant needs bound: the shadow maps (every slot
-    // gets a depth texture, since the shaders declare four: the cascades,
-    // then the last one again, or the 1x1 stand-in when shadows are off),
-    // the light and cell buffers, and the uniforms — at the slots the
-    // forward shader uses (materials first) or the deferred ones.
-    const auto bind_lighting = [&](rhi::RenderPass& pass, const render::PassResources& resources,
-                                   std::uint32_t shadow_slot, std::uint32_t shadow_uniform_slot) {
-        pass.push_fragment_uniforms(0, &frame_uniforms, sizeof(frame_uniforms));
-        pass.push_fragment_uniforms(shadow_uniform_slot, &shadow_uniforms, sizeof(shadow_uniforms));
-        pass.push_fragment_uniforms(shadow_uniform_slot + 1, &cluster_uniforms, sizeof(cluster_uniforms));
-        if (renderer.clusters) {
-            pass.bind_fragment_storage_buffer(0, resources.buffer(light_list));
-            pass.bind_fragment_storage_buffer(1, resources.buffer(cluster_table));
-        }
-        if (renderer.shadow_sampler && renderer.shadow_fallback) {
-            for (std::uint32_t i = 0; i < render::kMaxCascades; ++i) {
-                rhi::TextureHandle map = renderer.shadow_fallback;
-                if (cascades.count > 0) {
-                    map = resources.texture(shadow_maps[std::min(i, cascades.count - 1)]);
-                }
-                pass.bind_fragment_texture(shadow_slot + i, map, renderer.shadow_sampler);
-            }
-        }
-    };
-    // Every mesh through a material pipeline: the forward one, or the G-buffer one.
-    const auto draw_materials = [&](rhi::RenderPass& pass) {
-        each_drawable(world, renderer, pass, [&](const render::Model& model, const Mat4& world_matrix) {
-            const MeshUniforms uniforms{view_projection * world_matrix, world_matrix};
-            pass.push_vertex_uniforms(0, &uniforms, sizeof(uniforms));
-            for (const render::Submesh& sub : model.mesh.submeshes) {
-                const render::Material& material = model.materials[sub.material];
-                const MaterialUniforms material_uniforms{
-                    material.base_color_factor,
-                    {material.metallic_factor, material.roughness_factor, material.occlusion_strength,
-                     material.normal_scale},
-                    {material.emissive_factor, 0.0f}};
-                pass.bind_fragment_texture(0, material.base_color, renderer.sampler);
-                pass.bind_fragment_texture(1, material.metallic_roughness, renderer.sampler);
-                pass.bind_fragment_texture(2, material.occlusion, renderer.sampler);
-                pass.bind_fragment_texture(3, material.emissive, renderer.sampler);
-                pass.bind_fragment_texture(4, material.normal, renderer.sampler);
-                pass.push_fragment_uniforms(1, &material_uniforms, sizeof(material_uniforms));
-                pass.draw_indexed(sub.index_count, sub.first_index);
-            }
-        });
-    };
-    const auto read_lighting_inputs = [&](render::PassBuilder& b) {
-        for (std::uint32_t i = 0; i < cascades.count; ++i) {
-            b.read(shadow_maps[i]);
-        }
-        if (renderer.clusters) {
-            b.read_buffer(light_list);
-            b.read_buffer(cluster_table);
-        }
-    };
-
-    const bool deferred_ready = renderer.gbuffer_pipeline && renderer.lighting_fused_pipeline &&
-                                renderer.lighting_split_pipeline && renderer.gbuffer_sampler;
-    const ShadingPath path = have_scene && deferred_ready ? shading.path : ShadingPath::Forward;
-    if (path == ShadingPath::Forward) {
-        graph.add_pass(
-            "scene",
-            [&](render::PassBuilder& b) {
-                read_lighting_inputs(b);
-                hdr = b.write_color(hdr, rhi::LoadOp::Clear, kSkyColor);
-                depth = b.write_depth(depth, rhi::LoadOp::Clear, 0.0f);
-            },
-            [&](rhi::RenderPass& pass, const render::PassResources& resources) {
-                if (!have_scene) {
-                    if (renderer.triangle_pipeline) {
-                        pass.bind_pipeline(renderer.triangle_pipeline);
-                        pass.draw(3);
-                    }
-                    return;
-                }
-                pass.bind_pipeline(renderer.mesh_pipeline);
-                bind_lighting(pass, resources, kShadowTextureSlot, 2);
-                draw_materials(pass);
-            });
-    } else {
-        // The G-buffer: three attachments beside HDR and depth. In the fused
-        // pass nothing reads them afterwards, so the graph stores none of
-        // them and, on the native backend, makes them memoryless — the
-        // lighting draw reads them from the tile. In the split path the next
-        // pass samples them, so they are stored and read back.
-        const bool fused = path == ShadingPath::Fused;
-        const std::uint32_t w = screen.width, h = screen.height;
-        render::GraphTexture g_albedo = graph.create("g albedo", {kGBufferAlbedoFormat, w, h});
-        render::GraphTexture g_normal = graph.create("g normal", {kGBufferNormalFormat, w, h});
-        render::GraphTexture g_depth = graph.create("g depth", {kGBufferDepthFormat, w, h});
-        const auto write_gbuffer = [&](render::PassBuilder& b, render::GraphTexture& target) {
-            target = b.write_color(target, rhi::LoadOp::Clear, kSkyColor);
-            g_albedo = b.write_color(g_albedo, rhi::LoadOp::DontCare);
-            g_normal = b.write_color(g_normal, rhi::LoadOp::DontCare);
-            // A view depth of 0 marks the sky, so the lighting leaves it alone.
-            g_depth = b.write_color(g_depth, rhi::LoadOp::Clear, {0.0f, 0.0f, 0.0f, 0.0f});
-            depth = b.write_depth(depth, rhi::LoadOp::Clear, 0.0f);
-        };
-        if (fused) {
-            graph.add_pass(
-                "gbuffer+lighting",
-                [&](render::PassBuilder& b) {
-                    read_lighting_inputs(b);
-                    write_gbuffer(b, hdr);
-                },
-                [&](rhi::RenderPass& pass, const render::PassResources& resources) {
-                    pass.bind_pipeline(renderer.gbuffer_pipeline);
-                    pass.push_fragment_uniforms(0, &frame_uniforms, sizeof(frame_uniforms));
-                    draw_materials(pass);
-                    // Then, in the same pass, the lighting over the whole
-                    // screen, reading what the draws above left in the tile.
-                    pass.bind_pipeline(renderer.lighting_fused_pipeline);
-                    bind_lighting(pass, resources, 0, 1);
-                    pass.push_fragment_uniforms(3, &deferred_uniforms, sizeof(deferred_uniforms));
-                    pass.draw(3);
-                });
-        } else {
-            render::GraphTexture emissive = graph.create("g emissive", screen);
-            graph.add_pass(
-                "gbuffer", [&](render::PassBuilder& b) { write_gbuffer(b, emissive); },
-                [&](rhi::RenderPass& pass, const render::PassResources&) {
-                    pass.bind_pipeline(renderer.gbuffer_pipeline);
-                    pass.push_fragment_uniforms(0, &frame_uniforms, sizeof(frame_uniforms));
-                    draw_materials(pass);
-                });
-            graph.add_pass(
-                "lighting",
-                [&](render::PassBuilder& b) {
-                    read_lighting_inputs(b);
-                    b.read(emissive);
-                    b.read(g_albedo);
-                    b.read(g_normal);
-                    b.read(g_depth);
-                    hdr = b.write_color(hdr, rhi::LoadOp::DontCare);
-                },
-                [&](rhi::RenderPass& pass, const render::PassResources& resources) {
-                    pass.bind_pipeline(renderer.lighting_split_pipeline);
-                    bind_lighting(pass, resources, 0, 1);
-                    pass.push_fragment_uniforms(3, &deferred_uniforms, sizeof(deferred_uniforms));
-                    const render::GraphTexture inputs[4] = {emissive, g_albedo, g_normal, g_depth};
-                    for (std::uint32_t i = 0; i < 4; ++i) {
-                        pass.bind_fragment_texture(render::kMaxCascades + i, resources.texture(inputs[i]),
-                                                   renderer.gbuffer_sampler);
-                    }
-                    pass.draw(3);
-                });
-        }
-    }
-    post.add_passes(graph, hdr, depth, swapchain,
-                    {.width = frame.width(),
-                     .height = frame.height(),
-                     .encode_srgb = !renderer.device->swapchain_is_linear(),
-                     .view_projection = fly.camera.view_projection(aspect),
-                     .view_projection_jittered = view_projection});
-    if (graph.compile()) {
-        // The lights go up before any pass runs: a copy on the frame's
-        // timeline, no wait.
-        const auto light_bytes = static_cast<std::uint32_t>(light_count * sizeof(render::PointLight));
-        if (renderer.clusters && light_count > 0 &&
-            !frame.write_buffer(renderer.light_buffer, lights, light_bytes)) {
-            TY_LOG_ERROR("gpu", "light upload failed: %s", platform::last_error());
-        }
-        graph.execute(frame);
-    } else {
-        TY_LOG_ERROR("graph", "%s", graph.error());
-    }
-}
-
-// What the graph made of the frame, once it has settled.
-void report_graph(const Renderer& renderer) {
-    const render::FrameGraph& graph = *renderer.graph;
-    const render::FrameGraph::Stats& stats = graph.stats();
-    TY_LOG_INFO("graph",
-                "%u passes (%u culled); %u transients in %u textures, %.1f MB in memory, %.1f MB memoryless, "
-                "%.1f MB asked; %u attachments stored, %u discarded; %u never leave the tile",
-                stats.passes, stats.culled, stats.transients_used, stats.physical_textures,
-                static_cast<double>(stats.bytes_allocated) / 1048576.0,
-                static_cast<double>(stats.bytes_memoryless) / 1048576.0,
-                static_cast<double>(stats.bytes_requested) / 1048576.0, stats.attachments_stored,
-                stats.attachments_discarded, stats.memoryless);
-    const rhi::Device::GpuStats gpu = renderer.device->gpu_stats();
-    if (gpu.frame_ms > 0.0) {
-        TY_LOG_INFO("gpu", "%.2f ms a frame on the GPU, %.1f MB allocated by the device", gpu.frame_ms,
-                    static_cast<double>(gpu.allocated_bytes) / 1048576.0);
-    }
-    char text[4096];
-    graph.describe(text, sizeof text);
-    for (char* line = text; *line != '\0';) {
-        char* end = std::strchr(line, '\n');
-        if (end == nullptr) {
-            break;
-        }
-        *end = '\0';
-        TY_LOG_INFO("graph", "  %s", line);
-        line = end + 1;
-    }
-}
+};
 
 } // namespace
 
@@ -1993,57 +809,39 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "--replay: %s\n", error.c_str());
             return kExitUsage;
         }
-        options.jolt = log.backend.rfind("Jolt", 0) == 0;
-        options.max_frames = static_cast<long>(log.frames.size());
-    } else if (!options.record.empty()) {
-        // Room for the whole recording up front, so that taking a frame down
-        // is not a heap allocation in that frame: --frames says how many, or
-        // ten minutes at 60 Hz (a longer recording grows past it and trips
-        // the per-frame check).
-        constexpr long kTenMinutesOfFrames = 10 * 60 * 60;
-        log.frames.reserve(static_cast<std::size_t>(options.max_frames >= 0 ? options.max_frames
-                                                                               : kTenMinutesOfFrames));
     }
 
-    TY_LOG_INFO("sandbox", "engine %s, log level %s", tynima::core::version_string(),
-                tynima::core::log_level_name(tynima::core::log_level()));
-    if (!platform::init({.headless = options.headless})) {
-        TY_LOG_ERROR("platform", "init failed: %s", platform::last_error());
+    sdk::RuntimeDesc desc;
+    desc.title = "tynima sandbox";
+    desc.headless = options.headless;
+    desc.backend = options.rhi;
+    desc.jolt = options.jolt;
+    desc.max_entities = 4096;
+    desc.max_bodies = 1024;
+    desc.game_module = TYNIMA_SANDBOX_GAME_MODULE;
+    desc.max_frames = options.max_frames;
+    desc.replay = options.replay.empty() ? nullptr : &log;
+    desc.record = !options.record.empty();
+    desc.scripted_input = scripted_frame;
+    sdk::Runtime runtime;
+    if (!runtime.create(desc)) {
         return 1;
     }
-
-    auto window = platform::Window::create({.title = "tynima sandbox", .width = 1280, .height = 720});
-    if (window == nullptr) {
-        TY_LOG_ERROR("window", "creation failed: %s", platform::last_error());
-        platform::shutdown();
-        return 1;
+    // The game module owns the systems that make the scene move. It is a
+    // shared library, and the runtime swaps it for a new build whenever one appears.
+    if (runtime.game() != nullptr && runtime.game()->loaded()) {
+        TY_LOG_INFO("game", "edit apps/sandbox/game/src/game.cpp, then: cmake --build --preset macos-debug "
+                            "--target tynima_sandbox_game");
     }
-
-    TY_LOG_INFO("window", "%dx%d points, %dx%d pixels, density %.2f%s", window->width(), window->height(),
-                window->pixel_width(), window->pixel_height(), static_cast<double>(window->pixel_density()),
-                options.headless ? " (headless)" : "");
-    TY_LOG_INFO("profile", "%s", tynima::core::profiling_compiled()
-                                     ? "tracy instrumentation compiled in; connect the Tracy GUI to 127.0.0.1"
-                                     : "off (TYNIMA_PROFILE=OFF)");
-
-    tynima::core::JobSystem jobs;
-    TY_LOG_INFO("jobs", "%u worker thread(s) + main, for %u performance cores", jobs.worker_count(),
-                tynima::core::JobSystem::performance_core_count());
-
-    // Physics steps on the same job system; bodies drive entity Transforms.
-    const physics::WorldDesc physics_desc{.max_bodies = 1024, .jobs = &jobs};
-    auto physics = options.jolt ? physics::create_jolt_world(physics_desc)
-                                : physics::create_tynima_world(physics_desc);
-    TY_LOG_INFO("physics", "%s%s", physics->backend_name(),
-                options.jolt ? " (the reference; the default is the engine's own)"
-                             : " (--physics jolt for the reference)");
+    scene::World& world = runtime.world();
+    physics::PhysicsWorld& physics = runtime.physics();
     {
         physics::BodyDesc floor;
         floor.shape = physics::Shape::box(Vec3{kFloorHalfWidth, kFloorHalfThickness, kFloorHalfWidth});
         floor.position = Vec3{0.0f, -kFloorHalfThickness, 0.0f}; // top face at y = 0
         floor.motion = physics::MotionType::Static;
         floor.friction = 0.6f;
-        (void)physics->create_body(floor);
+        (void)physics.create_body(floor);
     }
 
     // The model loads on the CPU in every mode, so the headless run covers the importer too.
@@ -2051,7 +849,7 @@ int main(int argc, char** argv) {
     std::string import_error;
     const double import_start = platform::now_seconds();
     const bool has_model =
-        assets::import_gltf_file(options.model.c_str(), model_data, import_error, {.jobs = &jobs});
+        assets::import_gltf_file(options.model.c_str(), model_data, import_error, {.jobs = &runtime.jobs()});
     const render::MeshData& mesh_data = model_data.mesh;
     if (has_model) {
         const Vec3 size = mesh_data.bounds_max - mesh_data.bounds_min;
@@ -2064,245 +862,109 @@ int main(int argc, char** argv) {
         for (const render::ImageData& image : model_data.images) {
             TY_LOG_DEBUG("model", "image %ux%u%s", image.width, image.height, image.srgb ? " sRGB" : "");
         }
+        // The runtime's model slots, in kModel* order.
+        (void)runtime.add_model(model_data);
+        (void)runtime.add_model(make_floor_model());
+        (void)runtime.add_model(make_plain_model(make_capsule_mesh(kCharacterRadius, kCharacterHalfHeight),
+                                                 Vec4{0.20f, 0.45f, 0.85f, 1.0f}, 0.6f));
+        (void)runtime.add_model(
+            make_plain_model(make_box_mesh(kGateHalf), Vec4{0.55f, 0.36f, 0.20f, 1.0f}, 0.8f));
     } else {
-        TY_LOG_WARN("model", "%s - showing the triangle instead", import_error.c_str());
+        TY_LOG_WARN("model", "%s - an empty sky, then", import_error.c_str());
     }
     TY_LOG_INFO("controls", "right-drag looks, WASD/QE fly, Shift runs, R re-drops the pile, "
                             "L launches it, Escape quits");
     TY_LOG_INFO("controls", "F follows the character: then WASD walk it, Space jumps, Shift runs");
     TY_LOG_INFO("controls", "1/2/3 unlit / Blinn-Phong / Cook-Torrance, N/M/O/V/B debug views, C shows the "
                             "shadow cascades, K the lights per cluster; X toggles shadows, P the point "
-                            "lights, G bloom; T cycles the tonemapper, H the anti-aliasing; arrows move "
-                            "the sun");
-
-    Renderer renderer = options.headless
-                            ? Renderer{}
-                            : create_renderer(*window, has_model ? &model_data : nullptr, options.rhi);
-    bool reported_swapchain = false;
+                            "lights, G bloom; T cycles the tonemapper, H the anti-aliasing, Y the shading "
+                            "path; arrows move the sun");
 
     // The scene: the floor and a pile of the model, every one a rigid body.
-    // Systems run over the World each frame; the renderer draws what the
-    // World says is there.
-    scene::World world(4096);
-    Pile pile;
     // The character stands at the edge of the pile; the gate and the chain
     // hang either side of it.
-    physics::CharacterController character(*physics, {.radius = kCharacterRadius,
-                                                      .half_height = kCharacterHalfHeight,
-                                                      .position = kCharacterStart});
+    Pile pile;
+    physics::CharacterController character(
+        physics,
+        {.radius = kCharacterRadius, .half_height = kCharacterHalfHeight, .position = kCharacterStart});
     Rest rest;
     if (has_model) {
-        (void)world.create(scene::Transform{.position = Vec3{0.0f, -kFloorHalfThickness, 0.0f}},
+        (void)world.create(scene::Name("floor"),
+                           scene::Transform{.position = Vec3{0.0f, -kFloorHalfThickness, 0.0f}},
                            scene::LocalToWorld{}, scene::MeshRenderer{.model = kModelFloor});
-        pile = populate_pile(world, *physics, mesh_data);
-        rest = populate_rest(world, *physics, character.body(), mesh_data);
+        pile = populate_pile(world, physics, mesh_data);
+        rest = populate_rest(world, physics, character.body(), mesh_data);
         TY_LOG_INFO("scene", "%u entities in %u archetype(s), %u chunk(s); %u bodies, %u joints",
-                    world.entity_count(), world.archetype_count(), world.chunk_count(), physics->body_count(),
-                    physics->joint_count());
+                    world.entity_count(), world.archetype_count(), world.chunk_count(), physics.body_count(),
+                    physics.joint_count());
     }
 
     Shading shading;
-    shading.path = options.shading;
+    runtime.scene_settings.path = options.shading;
+    runtime.sun.direction = shading.light_direction();
     FlyCamera fly;
     if (has_model) {
         // Frame where the pile lands, with the falling column in view above it.
         fly.frame(Vec3{0.0f, pile.drop_height * 0.3f, 0.0f},
                   std::max(pile.footprint * 2.2f, pile.drop_height * 0.6f));
     }
+    runtime.camera = fly.camera;
+    CharacterStep character_step{.character = &character};
+    runtime.set_before_step(CharacterStep::before_step, &character_step);
+    render::PointLight lights[kLightCount];
 
-    // Per-frame scratch memory: reset at the top of every frame, never freed
-    // piecemeal. Nothing uses it yet; the ECS and render packets will.
-    tynima::core::Arena frame_arena(4 * 1024 * 1024);
-
-    platform::Input input;
-    std::vector<platform::Event> events;
-    events.reserve(64); // a frame's worth; growing later would count as a frame allocation
-
-    // The game module owns the systems that make the scene move. It is a
-    // shared library, and it is swapped for a new build whenever one appears.
-    tynima_engine engine_context;
-    engine_context.world = &world;
-    engine_context.input = &input;
-    engine_context.physics = physics.get();
-    tynima::sdk::GameModule game(TYNIMA_SANDBOX_GAME_MODULE);
-    TY_LOG_INFO("game", "loading %s", game.path().c_str());
-    if (game.load(engine_context)) {
-        TY_LOG_INFO("game", "edit apps/sandbox/game/src/game.cpp, then: cmake --build --preset macos-debug "
-                            "--target tynima_sandbox_game");
-    } else {
-        TY_LOG_ERROR("game", "%s - the scene will not move", game.last_error());
-    }
-    // Physics runs at a fixed 60 Hz whatever the frame rate: the frame's
-    // time accumulates into whole steps, and what is drawn is blended
-    // between the last two states. Input edges that must reach a step
-    // (a jump) are latched until one runs.
-    physics::FixedStepper stepper;
-    bool jump_latched = false;
-    long frame_count = 0;
-    double game_time = 0.0; // the game module's clock: frame times summed, so a replay reads the same
-    double last_time = platform::now_seconds();
-    double last_report = last_time;
-    long frames_since_report = 0;
-    bool running = true;
-    std::uint32_t last_culled = 0;
-
-    while (running) {
-        frame_arena.reset();
-        const tynima::core::HeapAllocationScope heap_scope;
-        {
-            TY_PROFILE_SCOPE_NAMED("events");
-            platform::pump_events(input, events);
-        }
-        // Time and input: the clock and the keyboard, or the log's — and
-        // headless, a fixed frame of a sixtieth and the script above, so the
-        // run is the same twice. Settled here, before anything reads either.
-        const double now = platform::now_seconds();
-        float dt = static_cast<float>(std::min(now - last_time, 0.1)); // clamp hitches
-        last_time = now;
-        if (!options.replay.empty()) {
-            const platform::InputFrame& frame = log.frames[static_cast<std::size_t>(frame_count)];
-            platform::apply_frame(frame, input);
-            dt = frame.dt;
-        } else if (options.headless) {
-            dt = 1.0f / 60.0f;
-            platform::apply_frame(scripted_frame(frame_count, dt), input);
-        }
-        if (!options.record.empty()) {
-            log.frames.push_back(platform::capture_frame(input, dt));
-        }
-        game_time += static_cast<double>(dt);
+    while (runtime.begin_frame()) {
+        const platform::Input& input = runtime.input();
+        const float dt = runtime.dt();
         report_edges(input);
-        for (const auto& event : events) {
-            switch (event.type) {
-            case platform::EventType::Quit:
-            case platform::EventType::WindowClose:
-                running = false;
-                break;
-            case platform::EventType::WindowResized:
-                TY_LOG_INFO("window", "resized to %dx%d points, %dx%d pixels", event.width, event.height,
-                            event.pixel_width, event.pixel_height);
-                break;
-            case platform::EventType::WindowFocusGained:
-            case platform::EventType::WindowFocusLost:
-                break;
-            }
-        }
         if (input.key_pressed(platform::Key::Escape)) {
-            running = false;
+            runtime.quit();
         }
         if (input.key_pressed(platform::Key::R)) {
-            reset_pile(world, *physics, pile);
+            reset_pile(world, physics, pile);
         }
         if (input.key_pressed(platform::Key::F)) {
             fly.follow = !fly.follow;
             TY_LOG_INFO("camera", "%s", fly.follow ? "following the character" : "flying free");
         }
         const Vec3 character_position = character.position();
-        fly.update(input, *window, dt, fly.follow ? &character_position : nullptr);
-        shading.update(input, dt);
+        fly.update(input, *runtime.window(), dt, fly.follow ? &character_position : nullptr);
+        runtime.camera = fly.camera;
+        shading.update(runtime, input, dt);
 
         // The character walks where the camera's WASD point, when the camera
         // is following it.
-        Vec3 walk = Vec3::zero();
+        character_step.walk = Vec3::zero();
         if (fly.follow) {
             const bool run =
                 input.key_down(platform::Key::LeftShift) || input.key_down(platform::Key::RightShift);
-            walk = fly.walk_direction(input) * (kWalkSpeed * (run ? 2.0f : 1.0f));
-            jump_latched = jump_latched || input.key_pressed(platform::Key::Space);
+            character_step.walk = fly.walk_direction(input) * (kWalkSpeed * (run ? 2.0f : 1.0f));
+            character_step.jump_latched =
+                character_step.jump_latched || input.key_pressed(platform::Key::Space);
         }
 
-        engine_context.time_seconds = game_time;
-        const bool reloaded = game.poll(engine_context); // a reload allocates; that frame is exempt below
-        {
-            TY_PROFILE_SCOPE_NAMED("systems");
-            game.update(engine_context, dt);
-            stepper.advance(*physics, dt, [&](float step) {
-                scene::record_previous_poses(world, *physics);
-                character.move(walk, jump_latched, step);
-                jump_latched = false;
-            });
-            scene::update_bodies(world, *physics, stepper.alpha());
-            scene::update_transforms(world);
-        }
-
-        if (renderer.device != nullptr) {
-            TY_PROFILE_SCOPE_NAMED("render");
-            // begin_frame() blocks for vsync, which is what paces the loop.
-            if (auto frame = renderer.device->begin_frame()) {
-                if (frame->has_swapchain_image()) {
-                    if (!reported_swapchain) {
-                        TY_LOG_INFO("swap", "%ux%u pixels", frame->width(), frame->height());
-                        reported_swapchain = true;
-                    }
-                    draw_frame(renderer, *frame, world, fly, shading, static_cast<float>(game_time));
-                    const std::uint32_t culled = renderer.graph->stats().culled;
-                    if (frame_count == 60 || (frame_count > 60 && culled != last_culled)) {
-                        report_graph(renderer);
-                        last_culled = culled;
-                    }
-                }
-                frame->submit();
-            } else {
-                TY_LOG_ERROR("gpu", "frame failed: %s", platform::last_error());
-                running = false;
-            }
-        } else {
-            // Nothing to draw and nothing to wait on: pace the loop by hand.
-            platform::sleep_ns(4'000'000);
-        }
-
-        // The rule from the roadmap, enforced: after warm-up, engine code
-        // allocates nothing on the heap during a frame. The GPU driver and the
-        // OS allocate plenty inside the calls we make; that is reported, not judged.
-        const std::uint64_t engine_allocations = heap_scope.allocations();
-        const std::uint64_t external_allocations = heap_scope.total() - engine_allocations;
-        TY_PROFILE_PLOT("engine heap allocations / frame", static_cast<std::int64_t>(engine_allocations));
-        TY_PROFILE_PLOT("external heap allocations / frame", static_cast<std::int64_t>(external_allocations));
-        TY_PROFILE_PLOT("frame arena bytes", static_cast<std::int64_t>(frame_arena.used()));
-        if (frame_count == 60) {
-            TY_LOG_INFO("heap", "per frame: engine %llu, external (driver, OS, Jolt) %llu",
-                        static_cast<unsigned long long>(engine_allocations),
-                        static_cast<unsigned long long>(external_allocations));
-        }
-        if (frame_count >= 10 && engine_allocations > 0 && !reloaded) {
-            TY_LOG_ERROR("heap", "frame %ld: engine code made %llu heap allocation(s)", frame_count,
-                         static_cast<unsigned long long>(engine_allocations));
-            TY_ASSERT(engine_allocations == 0, "a frame allocated on the heap from engine code");
-        }
-
-        TY_PROFILE_FRAME();
-        ++frame_count;
-        ++frames_since_report;
-        if (now - last_report >= 5.0) {
-            const rhi::Device::GpuStats gpu =
-                renderer.device != nullptr ? renderer.device->gpu_stats() : rhi::Device::GpuStats{};
-            TY_LOG_INFO("sandbox", "%.0f frames/s, GPU %.2f ms a frame",
-                        static_cast<double>(frames_since_report) / (now - last_report), gpu.frame_ms);
-            last_report = now;
-            frames_since_report = 0;
-        }
-        if (options.max_frames >= 0 && frame_count >= options.max_frames) {
-            running = false;
-        }
+        // The lights, which the game module knows nothing about; then the
+        // runtime runs the module, the physics and the renderer.
+        animate_lights(static_cast<float>(runtime.time()), lights, kLightCount);
+        runtime.set_lights(lights, kLightCount);
+        runtime.end_frame();
     }
 
-    const auto state_hash = static_cast<unsigned long long>(physics->state_hash());
-    const auto steps_taken = static_cast<unsigned long long>(stepper.total_steps);
+    const auto state_hash = static_cast<unsigned long long>(physics.state_hash());
+    const auto steps_taken = static_cast<unsigned long long>(runtime.stepper().total_steps);
     TY_LOG_INFO("sandbox", "ran %ld frames, %llu physics steps, %u bodies awake, state hash %016llx",
-                frame_count, steps_taken, physics->active_body_count(), state_hash);
+                runtime.frame_index(), steps_taken, physics.active_body_count(), state_hash);
     if (has_model) {
         report_pile(world, pile);
-        report_rest(world, *physics, character, rest);
+        report_rest(world, physics, character, rest);
     }
     int exit_code = 0;
     if (!options.record.empty()) {
-        log.backend = physics->backend_name();
-        log.steps = stepper.total_steps;
-        log.state_hash = state_hash;
-        log.has_end = true;
+        const platform::InputLog recorded = runtime.recording();
         std::string error;
-        if (log.save(options.record.c_str(), error)) {
-            TY_LOG_INFO("replay", "recorded %zu frames to %s", log.frames.size(), options.record.c_str());
+        if (recorded.save(options.record.c_str(), error)) {
+            TY_LOG_INFO("replay", "recorded %zu frames to %s", recorded.frames.size(),
+                        options.record.c_str());
         } else {
             TY_LOG_ERROR("replay", "%s", error.c_str());
             exit_code = 1;
@@ -2314,20 +976,19 @@ int main(int argc, char** argv) {
             exit_code = kExitSkipped;
         } else if (!log.has_end) {
             TY_LOG_WARN("replay", "the log has no end hash to compare with (an unfinished recording)");
-        } else if (log.state_hash == state_hash && log.steps == stepper.total_steps) {
+        } else if (log.state_hash == state_hash && log.steps == runtime.stepper().total_steps) {
             TY_LOG_INFO("replay", "%zu frames replayed: %llu steps and state hash %016llx, as recorded",
                         log.frames.size(), steps_taken, state_hash);
         } else {
-            TY_LOG_ERROR("replay", "the replay diverged: %llu steps and state hash %016llx; recorded %llu "
-                                   "steps and %016llx (on %s)",
+            TY_LOG_ERROR("replay",
+                         "the replay diverged: %llu steps and state hash %016llx; recorded %llu "
+                         "steps and %016llx (on %s)",
                          steps_taken, state_hash, static_cast<unsigned long long>(log.steps),
                          static_cast<unsigned long long>(log.state_hash), log.backend.c_str());
             exit_code = kExitReplayMismatch;
         }
     }
-    game.unload(engine_context);
-    renderer.destroy(); // GPU objects go before the window they present to
-    window.reset();
-    platform::shutdown();
+    // The character controller holds its body in the runtime's physics world:
+    // it goes first, and the runtime last, as the destructors run.
     return exit_code;
 }

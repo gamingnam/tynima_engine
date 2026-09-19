@@ -176,6 +176,11 @@ void RenderPass::push_fragment_uniforms(std::uint32_t slot, const void* data, st
     device_->pass_push_fragment_uniforms(command_buffer_, pass_, slot, data, size);
 }
 
+void RenderPass::set_scissor(std::uint32_t x, std::uint32_t y, std::uint32_t width,
+                             std::uint32_t height) noexcept {
+    device_->pass_set_scissor(pass_, x, y, width, height);
+}
+
 void RenderPass::draw(std::uint32_t vertex_count, std::uint32_t instance_count) noexcept {
     device_->pass_draw(pass_, vertex_count, instance_count);
 }

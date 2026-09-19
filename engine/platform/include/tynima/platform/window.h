@@ -39,6 +39,11 @@ public:
     // Hides the cursor and reports unbounded relative motion — for fly cameras.
     void set_relative_mouse_mode(bool enabled) noexcept;
 
+    // Whether typed text arrives as TextInput events (and, on platforms with
+    // one, the on-screen keyboard shows). Off by default: a game reads keys,
+    // a text field reads text.
+    void set_text_input(bool enabled) noexcept;
+
     // The underlying SDL_Window*, for rhi/ to attach a swapchain. Nothing above
     // rhi/ should need this.
     [[nodiscard]] void* native_handle() const noexcept;

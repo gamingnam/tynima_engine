@@ -9,3 +9,7 @@ compile_commands.json
 .vs/
 .idea/
 *.swp
+
+# the editor's remembered layout, and ImGui's own
+tynima-editor.ini
+imgui.ini

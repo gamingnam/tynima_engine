@@ -15,5 +15,7 @@ IncludeCategories:
     Priority: 2
   - Regex: '^<doctest/'
     Priority: 3
+  - Regex: '^<imgui'
+    Priority: 3
   - Regex: '^<'
     Priority: 4

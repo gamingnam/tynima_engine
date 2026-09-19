@@ -5,6 +5,7 @@
 #include <tynima/platform/window.h>
 
 #include <SDL3/SDL.h>
+#include <algorithm>
 #include <cstring>
 #include <initializer_list>
 #include <utility>
@@ -93,6 +94,8 @@ SDL_GPUVertexElementFormat to_sdl(VertexFormat format) noexcept {
         return SDL_GPU_VERTEXELEMENTFORMAT_FLOAT3;
     case VertexFormat::Float4:
         return SDL_GPU_VERTEXELEMENTFORMAT_FLOAT4;
+    case VertexFormat::Ubyte4Norm:
+        return SDL_GPU_VERTEXELEMENTFORMAT_UBYTE4_NORM;
     }
     return SDL_GPU_VERTEXELEMENTFORMAT_FLOAT3;
 }
@@ -317,6 +320,8 @@ protected:
                                    std::uint32_t size) noexcept override;
     void pass_push_fragment_uniforms(void* command_buffer, void* pass, std::uint32_t slot, const void* data,
                                      std::uint32_t size) noexcept override;
+    void pass_set_scissor(void* pass, std::uint32_t x, std::uint32_t y, std::uint32_t width,
+                          std::uint32_t height) noexcept override;
     void pass_draw(void* pass, std::uint32_t vertex_count, std::uint32_t instance_count) noexcept override;
     void pass_draw_indexed(void* pass, std::uint32_t index_count, std::uint32_t first_index,
                            std::int32_t vertex_offset, std::uint32_t instance_count) noexcept override;
@@ -345,6 +350,7 @@ private:
     bool want_linear_swapchain_;
     bool swapchain_linear_ = false;
     TextureFormat swapchain_format_ = TextureFormat::Bgra8Unorm;
+    Extent2D pass_extent_{}; // the current pass's attachment size, which a scissor is clipped to
 };
 
 // One pool per resource type. Handles index into these; the device's public
@@ -431,6 +437,23 @@ void SdlDevice::pass_push_fragment_uniforms(void* command_buffer, void*, std::ui
                                             std::uint32_t size) noexcept {
     TY_EXTERNAL_ALLOCATIONS();
     SDL_PushGPUFragmentUniformData(cmd(command_buffer), slot, data, size);
+}
+
+void SdlDevice::pass_set_scissor(void* pass, std::uint32_t x, std::uint32_t y, std::uint32_t width,
+                                 std::uint32_t height) noexcept {
+    TY_EXTERNAL_ALLOCATIONS();
+    // Clipped to the attachments, as the GPU APIs underneath require; an
+    // empty rectangle becomes one pixel that no draw will touch.
+    const std::uint32_t x0 = std::min(x, pass_extent_.width);
+    const std::uint32_t y0 = std::min(y, pass_extent_.height);
+    const std::uint32_t x1 = std::min(x0 + width, pass_extent_.width);
+    const std::uint32_t y1 = std::min(y0 + height, pass_extent_.height);
+    SDL_Rect rect{};
+    rect.w = static_cast<int>(std::max(x1 - x0, 1u));
+    rect.h = static_cast<int>(std::max(y1 - y0, 1u));
+    rect.x = static_cast<int>(std::min(x0, pass_extent_.width - static_cast<std::uint32_t>(rect.w)));
+    rect.y = static_cast<int>(std::min(y0, pass_extent_.height - static_cast<std::uint32_t>(rect.h)));
+    SDL_SetGPUScissor(rp(pass), &rect);
 }
 
 void SdlDevice::pass_draw(void* pass, std::uint32_t vertex_count, std::uint32_t instance_count) noexcept {
@@ -577,6 +600,7 @@ std::optional<RenderPass> SdlDevice::frame_begin_pass(void* command_buffer,
         }
         return std::nullopt;
     }
+    pass_extent_ = extent;
     return make_render_pass(this, command_buffer, pass, labelled);
 }
 
@@ -874,9 +898,24 @@ PipelineHandle SdlDevice::create_graphics_pipeline(const GraphicsPipelineDesc& d
     SDL_GPUColorTargetDescription colors[kMaxColorTargets]{};
     for (std::uint32_t i = 0; i < desc.color_target_count; ++i) {
         colors[i].format = to_sdl(desc.color_formats[i]);
+        SDL_GPUColorTargetBlendState& blend = colors[i].blend_state;
         if (!desc.color_write[i]) {
-            colors[i].blend_state.enable_color_write_mask = true;
-            colors[i].blend_state.color_write_mask = 0;
+            blend.enable_color_write_mask = true;
+            blend.color_write_mask = 0;
+        }
+        if (desc.blend[i] != BlendMode::Off) {
+            blend.enable_blend = true;
+            blend.color_blend_op = SDL_GPU_BLENDOP_ADD;
+            blend.alpha_blend_op = SDL_GPU_BLENDOP_ADD;
+            blend.src_color_blendfactor = desc.blend[i] == BlendMode::Alpha ? SDL_GPU_BLENDFACTOR_SRC_ALPHA
+                                                                            : SDL_GPU_BLENDFACTOR_ONE;
+            blend.dst_color_blendfactor = desc.blend[i] == BlendMode::Additive
+                                              ? SDL_GPU_BLENDFACTOR_ONE
+                                              : SDL_GPU_BLENDFACTOR_ONE_MINUS_SRC_ALPHA;
+            blend.src_alpha_blendfactor = SDL_GPU_BLENDFACTOR_ONE;
+            blend.dst_alpha_blendfactor = desc.blend[i] == BlendMode::Additive
+                                              ? SDL_GPU_BLENDFACTOR_ONE
+                                              : SDL_GPU_BLENDFACTOR_ONE_MINUS_SRC_ALPHA;
         }
     }
 

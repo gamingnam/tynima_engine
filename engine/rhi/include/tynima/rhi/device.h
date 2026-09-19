@@ -183,9 +183,17 @@ struct SamplerDesc {
 // ---------------------------------------------------------------- pipelines
 
 enum class PrimitiveTopology : std::uint8_t { TriangleList, TriangleStrip, LineList };
-enum class VertexFormat : std::uint8_t { Float2, Float3, Float4 };
+// Ubyte4Norm: four bytes read as floats in [0, 1] — a packed RGBA colour.
+enum class VertexFormat : std::uint8_t { Float2, Float3, Float4, Ubyte4Norm };
 enum class CullMode : std::uint8_t { None, Back, Front };
 enum class IndexType : std::uint8_t { Uint16, Uint32 };
+
+// How a draw's colour combines with what the target already holds. Off
+// writes over it. Alpha is ordinary transparency: source alpha, one minus
+// source alpha. Premultiplied is the same for colour already multiplied by
+// its alpha: one, one minus source alpha. Additive adds: one, one. Alpha
+// itself always accumulates as one, one minus source alpha.
+enum class BlendMode : std::uint8_t { Off, Alpha, Premultiplied, Additive };
 
 // One vertex attribute; `location` is [[attribute(n)]] in MSL.
 struct VertexAttribute {
@@ -229,6 +237,7 @@ struct GraphicsPipelineDesc {
     // in place (MSL's [[color(n)]] inputs, on tile-based GPUs) and writes
     // another declares the ones it only reads this way.
     bool color_write[kMaxColorTargets] = {true, true, true, true};
+    BlendMode blend[kMaxColorTargets] = {BlendMode::Off, BlendMode::Off, BlendMode::Off, BlendMode::Off};
     std::optional<TextureFormat> depth_format; // nullopt: no depth target
 };
 
@@ -308,6 +317,11 @@ public:
     // Slot n is [[buffer(n)]] in MSL. Keep structs 16-byte aligned like the shader expects.
     void push_vertex_uniforms(std::uint32_t slot, const void* data, std::uint32_t size) noexcept;
     void push_fragment_uniforms(std::uint32_t slot, const void* data, std::uint32_t size) noexcept;
+
+    // Limits the next draws to a rectangle of the attachments, in pixels
+    // from the top left; clipped to the attachments' size. A pass starts
+    // with the whole attachment.
+    void set_scissor(std::uint32_t x, std::uint32_t y, std::uint32_t width, std::uint32_t height) noexcept;
 
     void draw(std::uint32_t vertex_count, std::uint32_t instance_count = 1) noexcept;
     void draw_indexed(std::uint32_t index_count, std::uint32_t first_index = 0,
@@ -570,6 +584,8 @@ protected:
                                            const void* data, std::uint32_t size) noexcept = 0;
     virtual void pass_push_fragment_uniforms(void* command_buffer, void* pass, std::uint32_t slot,
                                              const void* data, std::uint32_t size) noexcept = 0;
+    virtual void pass_set_scissor(void* pass, std::uint32_t x, std::uint32_t y, std::uint32_t width,
+                                  std::uint32_t height) noexcept = 0;
     virtual void pass_draw(void* pass, std::uint32_t vertex_count, std::uint32_t instance_count) noexcept = 0;
     virtual void pass_draw_indexed(void* pass, std::uint32_t index_count, std::uint32_t first_index,
                                    std::int32_t vertex_offset, std::uint32_t instance_count) noexcept = 0;

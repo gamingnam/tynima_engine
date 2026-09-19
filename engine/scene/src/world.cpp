@@ -79,6 +79,16 @@ ComponentId World::register_component(const ComponentInfo& info) {
     return component_count_++;
 }
 
+ComponentId World::find_component(const char* name) const noexcept {
+    const std::uint64_t hash = component_name_hash(name != nullptr ? name : "");
+    for (std::uint32_t i = 0; i < component_count_; ++i) {
+        if (infos_[i].name_hash == hash) {
+            return i;
+        }
+    }
+    return kNoComponent;
+}
+
 std::uint32_t World::find_or_create_archetype(std::uint64_t mask) {
     for (std::uint32_t i = 0; i < archetypes_.size(); ++i) {
         if (archetypes_[i]->mask == mask) {
@@ -213,6 +223,19 @@ bool World::alive(Entity entity) const noexcept {
 
 std::uint32_t World::entity_count() const noexcept {
     return entities_.size();
+}
+
+std::uint32_t World::entity_components(Entity entity, ComponentId* out, std::uint32_t max) const noexcept {
+    const EntityRecord* record = entities_.get(entity);
+    if (record == nullptr) {
+        return 0;
+    }
+    const Archetype& archetype = *archetypes_[record->archetype];
+    const auto count = static_cast<std::uint32_t>(archetype.components.size());
+    for (std::uint32_t i = 0; i < count && i < max; ++i) {
+        out[i] = archetype.components[i];
+    }
+    return count;
 }
 
 void* World::get_raw(Entity entity, ComponentId id) noexcept {
