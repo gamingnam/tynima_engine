@@ -327,3 +327,57 @@ TEST_CASE("an entity lists its components, ascending, and a Name is plain data t
     CHECK(std::string(longer.text).size() == scene::Name::kCapacity - 1);
     CHECK(std::string(scene::Name(nullptr).text).empty());
 }
+
+TEST_CASE("the World keeps every component's fields, and takes a description for one that had none") {
+    World world(64);
+    const scene::ComponentId transform = world.component_id<scene::Transform>();
+    const scene::ComponentInfo& info = world.component_info(transform);
+    REQUIRE(info.field_count == 3);
+    CHECK(std::string(info.fields[0].name) == "position");
+    CHECK(info.fields[1].kind == core::FieldKind::Quat);
+    CHECK(info.fields[2].offset == offsetof(scene::Transform, scale));
+    const scene::ComponentInfo& body = world.component_info(world.component_id<scene::RigidBody>());
+    REQUIRE(body.field_count == 4);
+    CHECK(body.fields[0].flags == core::kFieldReadOnly);
+    CHECK(body.fields[1].flags == core::kFieldHidden);
+    const scene::ComponentInfo& parent = world.component_info(world.component_id<scene::Parent>());
+    CHECK(parent.fields[0].kind == core::FieldKind::Entity);
+
+    // A component registered blind (by name and layout, as the C API does)
+    // and described later — with strings that then go away, as a game
+    // module's do on reload.
+    struct Launcher {
+        float speed;
+        float spread;
+    };
+    std::string name = "Launcher";
+    const scene::ComponentId launcher = world.register_component(
+        {name.c_str(), scene::component_name_hash(name.c_str()), sizeof(Launcher), alignof(Launcher)});
+    CHECK(world.component_info(launcher).fields == nullptr);
+    {
+        std::string speed = "speed", spread = "spread";
+        const core::FieldInfo fields[2] = {
+            core::field_of<float>(speed.c_str(), offsetof(Launcher, speed)),
+            core::field_of<float>(spread.c_str(), offsetof(Launcher, spread)),
+        };
+        CHECK(world.describe_component(launcher, fields, 2));
+        speed = "gone";
+        spread = "gone";
+    }
+    name = "gone";
+    const scene::ComponentInfo& described = world.component_info(launcher);
+    CHECK(std::string(described.name) == "Launcher");
+    REQUIRE(described.field_count == 2);
+    CHECK(std::string(described.fields[0].name) == "speed");
+    CHECK(std::string(described.fields[1].name) == "spread");
+    CHECK(described.fields[1].offset == 4);
+    // The first description stands; a field outside the component is refused.
+    const core::FieldInfo other = core::field_of<float>("other", 0);
+    CHECK(world.describe_component(launcher, &other, 1));
+    CHECK(std::string(world.component_info(launcher).fields[0].name) == "speed");
+    const core::FieldInfo outside = core::field_of<double>("outside", 4);
+    const scene::ComponentId bare =
+        world.register_component({"Bare", scene::component_name_hash("Bare"), 8, 4});
+    CHECK_FALSE(world.describe_component(bare, &outside, 1));
+    CHECK_FALSE(world.describe_component(99, &other, 1));
+}

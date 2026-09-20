@@ -7,8 +7,11 @@
 #include <cstdint>
 
 // The engine's built-in components. Plain data with a name — the World copies
-// them with memcpy and identifies them by kName. Header-only on purpose: a
-// hot-reloaded game module includes this without linking the engine.
+// them with memcpy and identifies them by kName — and a list of fields
+// (TY_REFLECT, core/reflect.h) that the World keeps beside the layout, so
+// the editor's inspector shows every one of them without knowing any.
+// Header-only on purpose: a hot-reloaded game module includes this without
+// linking the engine.
 namespace tynima::scene {
 
 // What an entity is called, for people: the hierarchy panel, a scene file.
@@ -29,6 +32,7 @@ struct Name {
         text[i] = '\0';
     }
 };
+TY_REFLECT(Name, TY_FIELD(text));
 
 // Where an entity is, relative to its Parent (or the world when it has none).
 struct Transform {
@@ -39,6 +43,7 @@ struct Transform {
 
     [[nodiscard]] math::Mat4 matrix() const noexcept { return math::trs(position, rotation, scale); }
 };
+TY_REFLECT(Transform, TY_FIELD(position), TY_FIELD(rotation), TY_FIELD(scale));
 
 // The entity's world matrix, written by update_transforms(). Add it to every
 // entity that has a Transform and is drawn or otherwise needs its world pose.
@@ -46,12 +51,14 @@ struct LocalToWorld {
     static constexpr const char* kName = "LocalToWorld";
     math::Mat4 matrix = math::Mat4::identity();
 };
+TY_REFLECT(LocalToWorld, TY_FIELD_FLAGS(matrix, core::kFieldReadOnly));
 
 // Makes the entity's Transform relative to another entity's.
 struct Parent {
     static constexpr const char* kName = "Parent";
     Entity entity;
 };
+TY_REFLECT(Parent, TY_FIELD(entity));
 
 // Draws a model — an index into whatever model list the application keeps —
 // at the entity's LocalToWorld.
@@ -60,6 +67,7 @@ struct MeshRenderer {
     std::uint32_t model = 0;
     bool visible = true;
 };
+TY_REFLECT(MeshRenderer, TY_FIELD(model), TY_FIELD(visible));
 
 // Ties the entity to a body in the application's PhysicsWorld. The body
 // drives the Transform: update_bodies() copies its pose in after every step.
@@ -76,5 +84,9 @@ struct RigidBody {
     math::Quat previous_rotation = math::Quat::identity();
     bool has_previous = false; // until the first record_previous_poses()
 };
+TY_REFLECT(RigidBody, TY_FIELD_FLAGS(body, core::kFieldReadOnly),
+           TY_FIELD_FLAGS(previous_position, core::kFieldHidden),
+           TY_FIELD_FLAGS(previous_rotation, core::kFieldHidden),
+           TY_FIELD_FLAGS(has_previous, core::kFieldHidden));
 
 } // namespace tynima::scene

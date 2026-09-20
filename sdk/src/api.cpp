@@ -68,6 +68,18 @@ static_assert(sizeof(tynima_rigid_body) == sizeof(RigidBody) &&
               offsetof(tynima_rigid_body, previous_rotation) == offsetof(RigidBody, previous_rotation) &&
               offsetof(tynima_rigid_body, has_previous) == offsetof(RigidBody, has_previous));
 static_assert(TYNIMA_MAX_COMPONENT_TYPES == tynima::scene::kMaxComponentTypes);
+static_assert(TYNIMA_MAX_COMPONENT_FIELDS == tynima::scene::kMaxComponentFields);
+
+// A field, as reflection keeps it and as C sees it: the same enum values
+// and the same flags, so the two convert by cast.
+using tynima::core::FieldInfo;
+using tynima::core::FieldKind;
+static_assert(static_cast<int>(TYNIMA_FIELD_BOOL) == static_cast<int>(FieldKind::Bool) &&
+              static_cast<int>(TYNIMA_FIELD_QUAT) == static_cast<int>(FieldKind::Quat) &&
+              static_cast<int>(TYNIMA_FIELD_ENTITY) == static_cast<int>(FieldKind::Entity) &&
+              static_cast<int>(TYNIMA_FIELD_BYTES) == static_cast<int>(FieldKind::Bytes));
+static_assert(TYNIMA_FIELD_READ_ONLY == tynima::core::kFieldReadOnly &&
+              TYNIMA_FIELD_HIDDEN == tynima::core::kFieldHidden);
 
 // The rendering choices, as the enums the engine keeps them in.
 static_assert(static_cast<int>(TYNIMA_SHADING_SPLIT) == static_cast<int>(tynima::render::ShadingPath::Split));
@@ -252,6 +264,48 @@ void api_mouse_wheel(tynima_engine* engine, float* dx, float* dy) {
         *dy = engine->input != nullptr ? engine->input->wheel_y() : 0.0f;
 }
 
+uint32_t api_component_field_count(tynima_engine* engine, tynima_component_id id) {
+    return id < engine->world->component_type_count() ? engine->world->component_info(id).field_count : 0;
+}
+
+bool api_component_field(tynima_engine* engine, tynima_component_id id, uint32_t index, tynima_field* out) {
+    if (id >= engine->world->component_type_count() || out == nullptr) {
+        return false;
+    }
+    const tynima::scene::ComponentInfo& info = engine->world->component_info(id);
+    if (index >= info.field_count) {
+        return false;
+    }
+    const FieldInfo& field = info.fields[index];
+    out->name = field.name;
+    out->kind = static_cast<tynima_field_kind>(field.kind);
+    out->offset = field.offset;
+    out->size = field.size;
+    out->count = field.count;
+    out->flags = field.flags;
+    return true;
+}
+
+bool api_describe_component(tynima_engine* engine, tynima_component_id id, const tynima_field* fields,
+                            uint32_t count) {
+    if (fields == nullptr || count == 0 || count > TYNIMA_MAX_COMPONENT_FIELDS) {
+        return false;
+    }
+    FieldInfo converted[TYNIMA_MAX_COMPONENT_FIELDS];
+    for (uint32_t i = 0; i < count; ++i) {
+        if (fields[i].kind < TYNIMA_FIELD_BOOL || fields[i].kind > TYNIMA_FIELD_BYTES) {
+            return false;
+        }
+        converted[i] = FieldInfo{.name = fields[i].name,
+                                 .kind = static_cast<FieldKind>(fields[i].kind),
+                                 .offset = fields[i].offset,
+                                 .size = fields[i].size,
+                                 .count = fields[i].count,
+                                 .flags = fields[i].flags};
+    }
+    return engine->world->describe_component(id, converted, count);
+}
+
 void api_body_set_transform(tynima_engine* engine, tynima_body body, tynima_vec3 position,
                             tynima_quat rotation) {
     if (engine->physics != nullptr && engine->physics->valid(to_body(body))) {
@@ -294,6 +348,9 @@ const tynima_api kApi{
     api_mouse_wheel,
     api_body_set_transform,
     api_body_set_velocity,
+    api_component_field_count,
+    api_component_field,
+    api_describe_component,
 };
 
 // ---- hosting ----

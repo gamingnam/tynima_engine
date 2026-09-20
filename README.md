@@ -106,12 +106,17 @@ layout restores it):
 
 - **Hierarchy** — every entity, under its `Parent`, by its `Name` or as
   "entity N". Click to select.
-- **Inspector** — the selected entity's components, as the world lists them.
-  The built-in ones are editable: `Transform` as position, yaw/pitch/roll and
-  scale (an entity with a `RigidBody` teleports its body along, since the body
-  drives the transform every frame), `Name`, `MeshRenderer`; `LocalToWorld`,
-  `Parent` and `RigidBody` are shown. A component the editor has no editor for
-  shows its size — Phase 5's reflection task is what makes it populate itself.
+- **Inspector** — the selected entity's components, as the world lists them,
+  every field of every one drawn from the description the engine keeps (see
+  [Reflection](#reflection)): the editor knows no component's layout, not
+  even `Transform`'s. Each kind of field gets its widget — a quaternion is
+  edited as yaw, pitch and roll, an entity offers to select what it points
+  at, a string has its capacity, read-only fields are shown greyed and
+  hidden ones not at all. Editing the transform of an entity with a
+  `RigidBody` teleports the body along, since the body drives the transform
+  every frame. Every edit goes on an undo stack: Cmd+Z and Cmd+Shift+Z, or
+  the Edit menu, which counts what is there. An undo is the component's
+  bytes put back, so a component whose entity has since gone is skipped.
 - **Viewport** — the scene, drawn by the engine into a texture the panel
   shows at its own size (`tynima_ui_scene_texture`); the window behind is
   cleared. Hold the right mouse button over it to look, W/A/S/D and Q/E to
@@ -129,6 +134,43 @@ anti-aliasing — the same choices the sandbox's keys make.
 `--game path.so` loads a game module, hot-reloaded as in the sandbox;
 `--headless --frames N` draws the panels without a display, which is what the
 `editor_headless` CTest does.
+
+### Reflection
+
+A component lists its fields beside its definition, and that list is what
+the inspector draws, what a scene file will write and what a script binding
+will read — instead of the C++ type, which none of them can see:
+
+```cpp
+struct Transform {
+    math::Vec3 position;
+    math::Quat rotation;
+    math::Vec3 scale;
+};
+TY_REFLECT(Transform, TY_FIELD(position), TY_FIELD(rotation), TY_FIELD(scale));
+```
+
+Macros, not codegen ([`core/reflect.h`](engine/core/include/tynima/core/reflect.h)):
+no build step, nothing generated to check in, and the compiler still checks
+every name — a field that does not exist fails to compile, and its kind,
+size and offset come from `decltype` and `offsetof`, never from a second
+copy. The cost is that the list is written by hand; it is one line. A
+field's kind comes from a `FieldTraits` specialization for its type (the
+numbers, the vectors, quaternions and matrices, handles, entities, `char`
+arrays as strings) and anything else is opaque bytes; `TY_FIELD_FLAGS`
+marks a field read-only or hidden.
+
+The World keeps the fields beside the layout when a component is registered
+(`register_component` copies both, names included — a game module's strings
+do not survive its reload, the World does) and the C API hands them out:
+`component_field_count`, `component_field`. A module describes its own
+components the other way, `describe_component`, and for one written in C++
+[`sdk/reflect.h`](sdk/include/tynima/sdk/reflect.h) does it from the same
+`TY_REFLECT` list. The sandbox's game module does exactly that: its launch
+speed and spread are no longer constants but a `Launcher` component on a
+"launcher" entity, which the module finds again after a reload and which
+`tynima-editor --game build/macos-debug/apps/sandbox/game/sandbox_game.so`
+shows and edits like any other — an editor that has never heard of it.
 
 ### The host half of tynima.h
 
@@ -184,7 +226,8 @@ engine swap the library for a new build while everything keeps running.
 
 To see it: run the sandbox and press L — the game module launches the
 pile through the API. Edit `apps/sandbox/game/src/game.cpp` (the launch
-speed or spread), and rebuild only the module:
+speed or spread: the defaults of its `Launcher` component), and rebuild
+only the module:
 
 ```sh
 cmake --build --preset macos-debug --target tynima_sandbox_game

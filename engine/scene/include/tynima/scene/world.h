@@ -3,6 +3,7 @@
 #include <tynima/core/assert.h>
 #include <tynima/core/handle.h>
 #include <tynima/core/jobs.h>
+#include <tynima/core/reflect.h>
 #include <tynima/scene/entity.h>
 
 #include <atomic>
@@ -10,6 +11,7 @@
 #include <cstdint>
 #include <memory>
 #include <span>
+#include <string>
 #include <type_traits>
 #include <utility>
 #include <vector>
@@ -33,15 +35,21 @@ inline constexpr std::size_t kChunkBytes = 16 * 1024;
 }
 
 // Everything the World needs to know about a component type: its name (for
-// identity) and its layout (for storage). Components are plain data —
-// trivially copyable, no destructors — because the World moves them with
-// memcpy as entities change archetype.
+// identity), its layout (for storage) and, when the type is reflected, its
+// fields (for tools). Components are plain data — trivially copyable, no
+// destructors — because the World moves them with memcpy as entities change
+// archetype. The World copies the name and the field list it is given: a
+// game module's strings do not survive its reload, and the World does.
 struct ComponentInfo {
     const char* name = nullptr;
     std::uint64_t name_hash = 0;
     std::uint32_t size = 0;
     std::uint32_t alignment = 0;
+    const core::FieldInfo* fields = nullptr; // may be null: not reflected (yet)
+    std::uint32_t field_count = 0;
 };
+inline constexpr std::uint32_t kMaxComponentFields = 64;
+inline constexpr std::uint32_t kMaxComponentNameLength = 63;
 
 template <typename T>
 concept Component = std::is_trivially_copyable_v<T> && requires {
@@ -75,10 +83,17 @@ public:
 
     template <Component T>
     [[nodiscard]] ComponentId component_id() {
-        return register_component({T::kName, component_name_hash(T::kName), sizeof(T), alignof(T)});
+        const core::TypeInfo type = core::type_info<T>();
+        return register_component(
+            {T::kName, component_name_hash(T::kName), sizeof(T), alignof(T), type.fields, type.count});
     }
     [[nodiscard]] std::uint32_t component_type_count() const noexcept { return component_count_; }
     [[nodiscard]] const ComponentInfo& component_info(ComponentId id) const noexcept { return infos_[id]; }
+    // Gives a registered component its fields after the fact (a game
+    // module describing its own component through the C API). A component
+    // that already has fields keeps them; false for an id that is not one,
+    // more than kMaxComponentFields, or a field outside the component.
+    bool describe_component(ComponentId id, const core::FieldInfo* fields, std::uint32_t count);
     // The id registered under `name`, or kNoComponent: a question, never a registration.
     static constexpr ComponentId kNoComponent = 0xFFFFFFFFu;
     [[nodiscard]] ComponentId find_component(const char* name) const noexcept;
@@ -229,9 +244,18 @@ private:
     void allocate_row(std::uint32_t archetype_index, std::uint32_t& chunk, std::uint32_t& row);
     void remove_row(std::uint32_t archetype_index, std::uint32_t chunk, std::uint32_t row) noexcept;
 
+    // A component's name and fields, in the World's own storage.
+    struct ComponentStorage {
+        char name[kMaxComponentNameLength + 1] = {};
+        std::vector<core::FieldInfo> fields;
+        std::vector<std::string> field_names;
+    };
+    void keep_fields(ComponentId id, const core::FieldInfo* fields, std::uint32_t count);
+
     core::HandlePool<EntityRecord, EntityTag> entities_;
     std::vector<std::unique_ptr<Archetype>> archetypes_;
     ComponentInfo infos_[kMaxComponentTypes] = {};
+    std::unique_ptr<ComponentStorage[]> storage_; // kMaxComponentTypes of them
     std::uint32_t component_count_ = 0;
     std::atomic<std::uint32_t> iterating_{0}; // structural changes are refused while > 0
 };

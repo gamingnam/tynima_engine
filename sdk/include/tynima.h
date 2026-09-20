@@ -20,6 +20,7 @@
  *   3  physics: impulses on a RigidBody's body
  *   4  hosting: the engine, frames, models, the camera, the UI, the log ring;
  *      component queries; the built-in components as C structs; body poses
+ *   5  reflection: a component's fields, read by tools and described by modules
  */
 #ifndef TYNIMA_H
 #define TYNIMA_H
@@ -32,7 +33,7 @@
 extern "C" {
 #endif
 
-#define TYNIMA_API_VERSION 4u
+#define TYNIMA_API_VERSION 5u
 
 /* ---- engine version ---- */
 
@@ -85,6 +86,45 @@ typedef struct tynima_component_info {
     uint32_t size;
     uint32_t alignment;
 } tynima_component_info;
+
+/* A component's fields, as reflection sees them (core/reflect.h): what an
+ * inspector draws and a scene file writes. The engine describes its own
+ * components; a module describes its through the table. */
+typedef enum tynima_field_kind {
+    TYNIMA_FIELD_BOOL,
+    TYNIMA_FIELD_INT8,
+    TYNIMA_FIELD_UINT8,
+    TYNIMA_FIELD_INT16,
+    TYNIMA_FIELD_UINT16,
+    TYNIMA_FIELD_INT32,
+    TYNIMA_FIELD_UINT32,
+    TYNIMA_FIELD_INT64,
+    TYNIMA_FIELD_UINT64,
+    TYNIMA_FIELD_FLOAT,
+    TYNIMA_FIELD_DOUBLE,
+    TYNIMA_FIELD_VEC2,
+    TYNIMA_FIELD_VEC3,
+    TYNIMA_FIELD_VEC4,
+    TYNIMA_FIELD_QUAT,
+    TYNIMA_FIELD_MAT4,
+    TYNIMA_FIELD_ENTITY, /* a tynima_entity */
+    TYNIMA_FIELD_HANDLE, /* another two-integer handle: shown, never edited */
+    TYNIMA_FIELD_STRING, /* a char array of `count` bytes, NUL-terminated */
+    TYNIMA_FIELD_BYTES   /* anything else: `size` opaque bytes */
+} tynima_field_kind;
+
+#define TYNIMA_FIELD_READ_ONLY 1u /* shown, never edited */
+#define TYNIMA_FIELD_HIDDEN 2u    /* an implementation detail: not shown */
+#define TYNIMA_MAX_COMPONENT_FIELDS 64u
+
+typedef struct tynima_field {
+    const char* name;
+    tynima_field_kind kind;
+    uint32_t offset; /* bytes from the component's start */
+    uint32_t size;   /* bytes */
+    uint32_t count;  /* a string's capacity; 1 otherwise */
+    uint32_t flags;  /* TYNIMA_FIELD_* */
+} tynima_field;
 
 /* Called once per chunk of entities: `count` entities, and for each
  * requested component a pointer to its contiguous array, in request order. */
@@ -261,6 +301,20 @@ typedef struct tynima_api {
                                tynima_quat rotation);
     void (*body_set_velocity)(tynima_engine* engine, tynima_body body, tynima_vec3 linear,
                               tynima_vec3 angular);
+
+    /* ---- version 5 ---- */
+
+    /* A component's fields: how many, and each by index (false past them,
+     * or for an id that is not a component). The name in `out` is the
+     * engine's copy and stays valid. */
+    uint32_t (*component_field_count)(tynima_engine* engine, tynima_component_id id);
+    bool (*component_field)(tynima_engine* engine, tynima_component_id id, uint32_t index, tynima_field* out);
+    /* Describes a component the caller registered: the fields are copied,
+     * names included, so a module's own strings need not outlive its reload.
+     * A component already described keeps its description; false for a bad
+     * id, more than TYNIMA_MAX_COMPONENT_FIELDS, or a field outside it. */
+    bool (*describe_component)(tynima_engine* engine, tynima_component_id id, const tynima_field* fields,
+                               uint32_t count);
 } tynima_api;
 
 /* ---- what a game module exports ---- */

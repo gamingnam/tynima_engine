@@ -206,3 +206,54 @@ TEST_CASE("the inline C math agrees with the engine's") {
     CHECK(tynima_vec3_length(tynima_vec3_normalize(tynima_vec3_make(3.0f, 4.0f, 0.0f))) ==
           doctest::Approx(1.0f));
 }
+
+TEST_CASE("fields cross the C API: the engine's components come described, a module's are described") {
+    HostedEngine hosted;
+    REQUIRE_MESSAGE(hosted.engine != nullptr, tynima_last_error());
+    const tynima_api& api = *hosted.api;
+    const tynima_component_id transform = api.find_component(hosted.engine, TYNIMA_COMPONENT_TRANSFORM);
+    REQUIRE(api.component_field_count(hosted.engine, transform) == 3);
+    tynima_field field{};
+    REQUIRE(api.component_field(hosted.engine, transform, 1, &field));
+    CHECK(std::string(field.name) == "rotation");
+    CHECK(field.kind == TYNIMA_FIELD_QUAT);
+    CHECK(field.offset == offsetof(tynima_transform, rotation));
+    CHECK(field.size == sizeof(tynima_quat));
+    CHECK_FALSE(api.component_field(hosted.engine, transform, 3, &field));
+    const tynima_component_id name = api.find_component(hosted.engine, TYNIMA_COMPONENT_NAME);
+    REQUIRE(api.component_field(hosted.engine, name, 0, &field));
+    CHECK(field.kind == TYNIMA_FIELD_STRING);
+    CHECK(field.count == TYNIMA_NAME_CAPACITY);
+    const tynima_component_id body = api.find_component(hosted.engine, TYNIMA_COMPONENT_RIGID_BODY);
+    REQUIRE(api.component_field(hosted.engine, body, 0, &field));
+    CHECK(field.kind == TYNIMA_FIELD_HANDLE);
+    CHECK(field.flags == TYNIMA_FIELD_READ_ONLY);
+    REQUIRE(api.component_field(hosted.engine, body, 1, &field));
+    CHECK(field.flags == TYNIMA_FIELD_HIDDEN);
+
+    // What a game module does for its own component, in C terms.
+    struct Launcher {
+        float speed;
+        float spread;
+        bool armed;
+    };
+    const tynima_component_id launcher =
+        api.register_component(hosted.engine, "Launcher", sizeof(Launcher), alignof(Launcher));
+    CHECK(api.component_field_count(hosted.engine, launcher) == 0);
+    const tynima_field fields[3] = {
+        {"speed", TYNIMA_FIELD_FLOAT, offsetof(Launcher, speed), sizeof(float), 1, 0},
+        {"spread", TYNIMA_FIELD_FLOAT, offsetof(Launcher, spread), sizeof(float), 1, 0},
+        {"armed", TYNIMA_FIELD_BOOL, offsetof(Launcher, armed), sizeof(bool), 1, 0},
+    };
+    CHECK(api.describe_component(hosted.engine, launcher, fields, 3));
+    REQUIRE(api.component_field_count(hosted.engine, launcher) == 3);
+    REQUIRE(api.component_field(hosted.engine, launcher, 2, &field));
+    CHECK(std::string(field.name) == "armed");
+    CHECK(field.kind == TYNIMA_FIELD_BOOL);
+    CHECK(field.offset == 8);
+    const tynima_field outside = {"outside", TYNIMA_FIELD_MAT4, 0, 64, 1, 0};
+    // The description stands, whatever comes later.
+    CHECK_FALSE(api.describe_component(hosted.engine, launcher, &outside, 1));
+    CHECK_FALSE(api.describe_component(hosted.engine, 99, fields, 3));
+    CHECK_FALSE(api.describe_component(hosted.engine, launcher, fields, 0));
+}

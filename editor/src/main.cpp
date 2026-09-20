@@ -8,11 +8,13 @@
 //                 [--headless] [--frames N]
 //
 // Four docked panels: the hierarchy (every entity, under its parent), the
-// inspector (the selected entity's components, the built-in ones editable),
-// the viewport (the scene, drawn by the engine into a texture the panel
-// shows, with a fly camera: hold the right mouse button to look, WASD/QE to
-// move, Shift to hurry), and the console (the engine's log, filtered). A
-// stats panel beside the console. The layout is remembered in
+// inspector (the selected entity's components, every field of every one,
+// drawn from the fields the engine describes — the editor knows no
+// component's layout), the viewport (the scene, drawn by the engine into a
+// texture the panel shows, with a fly camera: hold the right mouse button to
+// look, WASD/QE to move, Shift to hurry), and the console (the engine's log,
+// filtered). A stats panel beside the console. Every edit in the inspector
+// goes on an undo stack (Cmd+Z, Cmd+Shift+Z). The layout is remembered in
 // tynima-editor.ini; View > Reset layout puts it back.
 #include <tynima.h>
 
@@ -164,6 +166,36 @@ void entity_label(const tynima_api& api, tynima_engine* engine, const Components
     std::snprintf(out, capacity, "entity %u", entity.index);
 }
 
+// -------------------------------------------------------------------- undo
+
+// An edit is a component's bytes before and after. The inspector snapshots
+// a component's bytes before it draws its widgets, and when a widget is
+// released after a change, the snapshot and the bytes now become one edit.
+// Undo copies the old bytes back; redo the new. What a change means to the
+// rest of the engine (a body that must follow its transform) happens after
+// either, the same as after the edit.
+struct Edit {
+    tynima_entity entity;
+    tynima_component_id component;
+    std::vector<std::uint8_t> before, after;
+};
+
+struct UndoStack {
+    std::vector<Edit> done, undone;
+    static constexpr std::size_t kLimit = 256;
+
+    void push(Edit edit) {
+        if (edit.before == edit.after) {
+            return;
+        }
+        done.push_back(std::move(edit));
+        undone.clear();
+        if (done.size() > kLimit) {
+            done.erase(done.begin());
+        }
+    }
+};
+
 // ---------------------------------------------------------------- the panels
 
 struct Editor {
@@ -172,6 +204,8 @@ struct Editor {
     Components components;
     Hierarchy hierarchy;
     tynima_entity selected{};
+    UndoStack undo;
+    std::vector<std::uint8_t> component_snapshot; // the component being drawn, before its widgets ran
     bool show_hierarchy = true, show_inspector = true, show_viewport = true, show_console = true,
          show_stats = true;
     bool show_demo = false;
@@ -190,6 +224,12 @@ struct Editor {
     bool console_autoscroll = true;
 
     void draw_menu_bar();
+    void after_edit(tynima_entity entity, tynima_component_id component);
+    bool apply(const Edit& edit, bool forward);
+    void undo_last();
+    void redo_last();
+    void draw_field(const tynima_field& field, void* data);
+    void draw_component(tynima_component_id id, const tynima_component_info& info, void* data);
     void draw_hierarchy();
     void draw_hierarchy_node(const Hierarchy::Node& node, int depth);
     void draw_inspector();
@@ -225,6 +265,18 @@ void Editor::draw_menu_bar() {
     if (ImGui::BeginMenu("File")) {
         if (ImGui::MenuItem("Quit", "Cmd+Q")) {
             quit = true;
+        }
+        ImGui::EndMenu();
+    }
+    if (ImGui::BeginMenu("Edit")) {
+        char label[64];
+        std::snprintf(label, sizeof label, "Undo (%zu)", undo.done.size());
+        if (ImGui::MenuItem(label, "Cmd+Z", false, !undo.done.empty())) {
+            undo_last();
+        }
+        std::snprintf(label, sizeof label, "Redo (%zu)", undo.undone.size());
+        if (ImGui::MenuItem(label, "Cmd+Shift+Z", false, !undo.undone.empty())) {
+            redo_last();
         }
         ImGui::EndMenu();
     }
@@ -354,6 +406,197 @@ void Editor::draw_hierarchy() {
     ImGui::End();
 }
 
+// A body drives its entity's transform every frame: an edit to the
+// transform sticks only if the body moves too.
+void Editor::after_edit(tynima_entity entity, tynima_component_id component) {
+    if (component != components.transform || components.rigid_body == TYNIMA_NO_COMPONENT) {
+        return;
+    }
+    const auto* transform =
+        static_cast<const tynima_transform*>(api->get_component(engine, entity, component));
+    const auto* body =
+        static_cast<const tynima_rigid_body*>(api->get_component(engine, entity, components.rigid_body));
+    if (transform != nullptr && body != nullptr) {
+        api->body_set_transform(engine, body->body, transform->position, transform->rotation);
+        api->body_set_velocity(engine, body->body, tynima_vec3_make(0.0f, 0.0f, 0.0f),
+                               tynima_vec3_make(0.0f, 0.0f, 0.0f));
+    }
+}
+
+bool Editor::apply(const Edit& edit, bool forward) {
+    const std::vector<std::uint8_t>& bytes = forward ? edit.after : edit.before;
+    void* data = api->get_component(engine, edit.entity, edit.component);
+    tynima_component_info info{};
+    if (data == nullptr || !api->component_info(engine, edit.component, &info) || info.size != bytes.size()) {
+        return false; // the entity or the component is gone: the edit is stale, and stays skipped
+    }
+    std::memcpy(data, bytes.data(), bytes.size());
+    after_edit(edit.entity, edit.component);
+    return true;
+}
+
+void Editor::undo_last() {
+    while (!undo.done.empty()) {
+        Edit edit = std::move(undo.done.back());
+        undo.done.pop_back();
+        const bool applied = apply(edit, false);
+        undo.undone.push_back(std::move(edit));
+        if (applied) {
+            return;
+        }
+    }
+}
+
+void Editor::redo_last() {
+    while (!undo.undone.empty()) {
+        Edit edit = std::move(undo.undone.back());
+        undo.undone.pop_back();
+        const bool applied = apply(edit, true);
+        undo.done.push_back(std::move(edit));
+        if (applied) {
+            return;
+        }
+    }
+}
+
+// One field, as a widget for its kind. `data` is the field's own bytes.
+void Editor::draw_field(const tynima_field& field, void* data) {
+    const bool read_only = (field.flags & TYNIMA_FIELD_READ_ONLY) != 0;
+    ImGui::BeginDisabled(read_only);
+    switch (field.kind) {
+    case TYNIMA_FIELD_BOOL:
+        ImGui::Checkbox(field.name, static_cast<bool*>(data));
+        break;
+    case TYNIMA_FIELD_INT8:
+        ImGui::DragScalar(field.name, ImGuiDataType_S8, data, 0.2f);
+        break;
+    case TYNIMA_FIELD_UINT8:
+        ImGui::DragScalar(field.name, ImGuiDataType_U8, data, 0.2f);
+        break;
+    case TYNIMA_FIELD_INT16:
+        ImGui::DragScalar(field.name, ImGuiDataType_S16, data, 0.2f);
+        break;
+    case TYNIMA_FIELD_UINT16:
+        ImGui::DragScalar(field.name, ImGuiDataType_U16, data, 0.2f);
+        break;
+    case TYNIMA_FIELD_INT32:
+        ImGui::DragScalar(field.name, ImGuiDataType_S32, data, 0.2f);
+        break;
+    case TYNIMA_FIELD_UINT32:
+        ImGui::DragScalar(field.name, ImGuiDataType_U32, data, 0.2f);
+        break;
+    case TYNIMA_FIELD_INT64:
+        ImGui::DragScalar(field.name, ImGuiDataType_S64, data, 0.2f);
+        break;
+    case TYNIMA_FIELD_UINT64:
+        ImGui::DragScalar(field.name, ImGuiDataType_U64, data, 0.2f);
+        break;
+    case TYNIMA_FIELD_FLOAT:
+        ImGui::DragFloat(field.name, static_cast<float*>(data), 0.01f, 0.0f, 0.0f, "%.3f");
+        break;
+    case TYNIMA_FIELD_DOUBLE:
+        ImGui::DragScalar(field.name, ImGuiDataType_Double, data, 0.01f);
+        break;
+    case TYNIMA_FIELD_VEC2:
+        ImGui::DragFloat2(field.name, static_cast<float*>(data), 0.01f, 0.0f, 0.0f, "%.3f");
+        break;
+    case TYNIMA_FIELD_VEC3:
+        ImGui::DragFloat3(field.name, static_cast<float*>(data), 0.01f, 0.0f, 0.0f, "%.3f");
+        break;
+    case TYNIMA_FIELD_VEC4:
+        ImGui::DragFloat4(field.name, static_cast<float*>(data), 0.01f, 0.0f, 0.0f, "%.3f");
+        break;
+    case TYNIMA_FIELD_QUAT: {
+        // Edited as yaw, pitch and roll in degrees; the quaternion follows.
+        auto* quat = static_cast<tynima_quat*>(data);
+        float angles[3];
+        tynima_quat_to_euler(*quat, &angles[0], &angles[1], &angles[2]);
+        float euler[3] = {angles[0] * 180.0f / kPi, angles[1] * 180.0f / kPi, angles[2] * 180.0f / kPi};
+        if (ImGui::DragFloat3(field.name, euler, 0.5f, 0.0f, 0.0f, "%.1f°")) {
+            *quat = tynima_quat_from_euler(euler[0] * kPi / 180.0f, euler[1] * kPi / 180.0f,
+                                           euler[2] * kPi / 180.0f);
+        }
+        break;
+    }
+    case TYNIMA_FIELD_MAT4: {
+        const auto* m = static_cast<const tynima_mat4*>(data);
+        ImGui::Text("%s", field.name);
+        for (int row = 0; row < 4; ++row) {
+            ImGui::Text("%8.3f %8.3f %8.3f %8.3f", static_cast<double>(m->m[row]),
+                        static_cast<double>(m->m[4 + row]), static_cast<double>(m->m[8 + row]),
+                        static_cast<double>(m->m[12 + row]));
+        }
+        break;
+    }
+    case TYNIMA_FIELD_ENTITY: {
+        const auto* entity = static_cast<const tynima_entity*>(data);
+        char label[TYNIMA_NAME_CAPACITY + 32];
+        if (entity->generation == 0) {
+            std::snprintf(label, sizeof label, "none");
+        } else {
+            entity_label(*api, engine, components, *entity, label, sizeof label);
+        }
+        ImGui::Text("%s: %s", field.name, label);
+        if (entity->generation != 0 && api->entity_alive(engine, *entity)) {
+            ImGui::SameLine();
+            ImGui::PushID(field.name);
+            if (ImGui::SmallButton("select")) {
+                selected = *entity;
+            }
+            ImGui::PopID();
+        }
+        break;
+    }
+    case TYNIMA_FIELD_HANDLE: {
+        const auto* handle = static_cast<const std::uint32_t*>(data);
+        ImGui::Text("%s: #%u.%u", field.name, handle[0], handle[1]);
+        break;
+    }
+    case TYNIMA_FIELD_STRING:
+        ImGui::InputText(field.name, static_cast<char*>(data), field.count);
+        break;
+    case TYNIMA_FIELD_BYTES:
+        ImGui::TextDisabled("%s: %u bytes", field.name, field.size);
+        break;
+    }
+    ImGui::EndDisabled();
+}
+
+void Editor::draw_component(tynima_component_id id, const tynima_component_info& info, void* data) {
+    const uint32_t field_count = api->component_field_count(engine, id);
+    if (field_count == 0) {
+        ImGui::TextDisabled("%u bytes, aligned to %u — not described by whoever registered it", info.size,
+                            info.alignment);
+        return;
+    }
+    // The bytes before any widget runs: what an edit begun this frame undoes to.
+    const auto* bytes = static_cast<const std::uint8_t*>(data);
+    component_snapshot.assign(bytes, bytes + info.size);
+    for (uint32_t i = 0; i < field_count; ++i) {
+        tynima_field field{};
+        if (!api->component_field(engine, id, i, &field) || (field.flags & TYNIMA_FIELD_HIDDEN) != 0) {
+            continue;
+        }
+        if (field.offset + field.size > info.size) {
+            continue; // a description that lies: not this editor's problem to act on
+        }
+        ImGui::PushID(static_cast<int>(i));
+        draw_field(field, static_cast<std::uint8_t*>(data) + field.offset);
+        // An edit begins when a widget takes hold and ends when it lets go
+        // having changed something: the whole component goes on the stack.
+        if (ImGui::IsItemDeactivatedAfterEdit()) {
+            Edit edit{.entity = selected, .component = id, .before = component_snapshot, .after = {}};
+            edit.after.assign(bytes, bytes + info.size);
+            undo.push(std::move(edit));
+            after_edit(selected, id);
+        } else if (ImGui::IsItemActive() &&
+                   !std::equal(component_snapshot.begin(), component_snapshot.end(), bytes)) {
+            after_edit(selected, id); // mid-drag: the body follows as the value moves
+        }
+        ImGui::PopID();
+    }
+}
+
 void Editor::draw_inspector() {
     if (!ImGui::Begin("Inspector", &show_inspector)) {
         ImGui::End();
@@ -385,71 +628,7 @@ void Editor::draw_inspector() {
         }
         ImGui::PushID(static_cast<int>(ids[i]));
         if (ImGui::CollapsingHeader(info.name, ImGuiTreeNodeFlags_DefaultOpen)) {
-            if (ids[i] == components.name) {
-                auto* name = static_cast<tynima_name*>(data);
-                ImGui::InputText("text", name->text, sizeof name->text);
-            } else if (ids[i] == components.transform) {
-                auto* transform = static_cast<tynima_transform*>(data);
-                bool changed =
-                    ImGui::DragFloat3("position", &transform->position.x, 0.01f, 0.0f, 0.0f, "%.3f");
-                float yaw_deg, pitch_deg, roll_deg;
-                tynima_quat_to_euler(transform->rotation, &yaw_deg, &pitch_deg, &roll_deg);
-                float euler[3] = {yaw_deg * 180.0f / kPi, pitch_deg * 180.0f / kPi, roll_deg * 180.0f / kPi};
-                if (ImGui::DragFloat3("rotation", euler, 0.5f, 0.0f, 0.0f, "%.1f°")) {
-                    transform->rotation = tynima_quat_from_euler(
-                        euler[0] * kPi / 180.0f, euler[1] * kPi / 180.0f, euler[2] * kPi / 180.0f);
-                    changed = true;
-                }
-                changed |= ImGui::DragFloat3("scale", &transform->scale.x, 0.01f, 0.0f, 0.0f, "%.3f");
-                ImGui::TextDisabled("yaw, pitch, roll");
-                // A body drives its entity's transform every frame: an edit
-                // sticks only if the body moves too.
-                if (changed && components.rigid_body != TYNIMA_NO_COMPONENT) {
-                    if (const auto* body = static_cast<const tynima_rigid_body*>(
-                            api->get_component(engine, selected, components.rigid_body))) {
-                        api->body_set_transform(engine, body->body, transform->position, transform->rotation);
-                        api->body_set_velocity(engine, body->body, tynima_vec3_make(0.0f, 0.0f, 0.0f),
-                                               tynima_vec3_make(0.0f, 0.0f, 0.0f));
-                    }
-                }
-            } else if (ids[i] == components.local_to_world) {
-                const auto* l = static_cast<const tynima_local_to_world*>(data);
-                for (int row = 0; row < 4; ++row) {
-                    ImGui::Text("%8.3f %8.3f %8.3f %8.3f", static_cast<double>(l->matrix.m[row]),
-                                static_cast<double>(l->matrix.m[4 + row]),
-                                static_cast<double>(l->matrix.m[8 + row]),
-                                static_cast<double>(l->matrix.m[12 + row]));
-                }
-                ImGui::TextDisabled("written by the engine each frame");
-            } else if (ids[i] == components.parent) {
-                auto* parent = static_cast<tynima_parent*>(data);
-                char parent_label[TYNIMA_NAME_CAPACITY + 32];
-                entity_label(*api, engine, components, parent->entity, parent_label, sizeof parent_label);
-                ImGui::Text("%s", parent_label);
-                ImGui::SameLine();
-                if (ImGui::SmallButton("select")) {
-                    selected = parent->entity;
-                }
-            } else if (ids[i] == components.mesh_renderer) {
-                auto* renderer = static_cast<tynima_mesh_renderer*>(data);
-                int model = static_cast<int>(renderer->model);
-                const int model_count = static_cast<int>(tynima_model_count(engine));
-                if (ImGui::InputInt("model", &model)) {
-                    renderer->model = static_cast<uint32_t>(std::max(model, 0));
-                }
-                if (model >= model_count) {
-                    ImGui::SameLine();
-                    ImGui::TextDisabled("(none loaded)");
-                }
-                ImGui::Checkbox("visible", &renderer->visible);
-            } else if (ids[i] == components.rigid_body) {
-                const auto* body = static_cast<const tynima_rigid_body*>(data);
-                ImGui::Text("body #%u.%u", body->body.index, body->body.generation);
-                ImGui::TextDisabled("drives the transform; edit the transform to move it");
-            } else {
-                ImGui::TextDisabled("%u bytes, aligned to %u — no editor for this component yet", info.size,
-                                    info.alignment);
-            }
+            draw_component(ids[i], info, data);
         }
         ImGui::PopID();
     }

@@ -3,6 +3,7 @@
 #include <tynima/core/profile.h>
 
 #include <algorithm>
+#include <cstdio>
 #include <cstring>
 #include <new>
 
@@ -69,14 +70,59 @@ ComponentId World::register_component(const ComponentInfo& info) {
         if (infos_[i].name_hash == info.name_hash) {
             TY_ASSERT(infos_[i].size == info.size && infos_[i].alignment == info.alignment,
                       "a component name was registered twice with different layouts");
+            if (infos_[i].fields == nullptr && info.fields != nullptr) {
+                keep_fields(i, info.fields, info.field_count); // the first registration was blind
+            }
             return i;
         }
     }
     TY_ASSERT(component_count_ < kMaxComponentTypes, "too many component types");
     TY_ASSERT(info.size > 0 && info.alignment > 0 && (info.alignment & (info.alignment - 1)) == 0,
               "component layout must have a size and a power-of-two alignment");
-    infos_[component_count_] = info;
-    return component_count_++;
+    if (storage_ == nullptr) {
+        storage_ = std::make_unique<ComponentStorage[]>(kMaxComponentTypes);
+    }
+    const ComponentId id = component_count_++;
+    ComponentStorage& storage = storage_[id];
+    std::snprintf(storage.name, sizeof storage.name, "%s", info.name != nullptr ? info.name : "");
+    infos_[id] = info;
+    infos_[id].name = storage.name;
+    infos_[id].fields = nullptr;
+    infos_[id].field_count = 0;
+    if (info.fields != nullptr) {
+        keep_fields(id, info.fields, info.field_count);
+    }
+    return id;
+}
+
+bool World::describe_component(ComponentId id, const core::FieldInfo* fields, std::uint32_t count) {
+    if (id >= component_count_ || fields == nullptr || count == 0 || count > kMaxComponentFields) {
+        return false;
+    }
+    for (std::uint32_t i = 0; i < count; ++i) {
+        if (fields[i].name == nullptr || fields[i].offset + fields[i].size > infos_[id].size) {
+            return false;
+        }
+    }
+    if (infos_[id].fields != nullptr) {
+        return true; // already described: the first description stands
+    }
+    keep_fields(id, fields, count);
+    return true;
+}
+
+void World::keep_fields(ComponentId id, const core::FieldInfo* fields, std::uint32_t count) {
+    ComponentStorage& storage = storage_[id];
+    count = std::min(count, kMaxComponentFields);
+    storage.fields.assign(fields, fields + count);
+    storage.field_names.clear();
+    storage.field_names.reserve(count);
+    for (std::uint32_t i = 0; i < count; ++i) {
+        storage.field_names.emplace_back(fields[i].name != nullptr ? fields[i].name : "");
+        storage.fields[i].name = storage.field_names.back().c_str();
+    }
+    infos_[id].fields = storage.fields.data();
+    infos_[id].field_count = count;
 }
 
 ComponentId World::find_component(const char* name) const noexcept {
