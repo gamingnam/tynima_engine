@@ -47,6 +47,7 @@ struct ComponentInfo {
     std::uint32_t alignment = 0;
     const core::FieldInfo* fields = nullptr; // may be null: not reflected (yet)
     std::uint32_t field_count = 0;
+    const void* defaults = nullptr; // `size` bytes a new instance starts as; null: all zero
 };
 inline constexpr std::uint32_t kMaxComponentFields = 64;
 inline constexpr std::uint32_t kMaxComponentNameLength = 63;
@@ -84,8 +85,8 @@ public:
     template <Component T>
     [[nodiscard]] ComponentId component_id() {
         const core::TypeInfo type = core::type_info<T>();
-        return register_component(
-            {T::kName, component_name_hash(T::kName), sizeof(T), alignof(T), type.fields, type.count});
+        return register_component({T::kName, component_name_hash(T::kName), sizeof(T), alignof(T),
+                                   type.fields, type.count, type.defaults});
     }
     [[nodiscard]] std::uint32_t component_type_count() const noexcept { return component_count_; }
     [[nodiscard]] const ComponentInfo& component_info(ComponentId id) const noexcept { return infos_[id]; }
@@ -94,6 +95,9 @@ public:
     // that already has fields keeps them; false for an id that is not one,
     // more than kMaxComponentFields, or a field outside the component.
     bool describe_component(ComponentId id, const core::FieldInfo* fields, std::uint32_t count);
+    // Gives a registered component its defaults after the fact: `size` bytes
+    // copied. A component that already has defaults keeps them.
+    bool set_component_defaults(ComponentId id, const void* defaults);
     // The id registered under `name`, or kNoComponent: a question, never a registration.
     static constexpr ComponentId kNoComponent = 0xFFFFFFFFu;
     [[nodiscard]] ComponentId find_component(const char* name) const noexcept;
@@ -249,6 +253,7 @@ private:
         char name[kMaxComponentNameLength + 1] = {};
         std::vector<core::FieldInfo> fields;
         std::vector<std::string> field_names;
+        std::vector<std::uint8_t> defaults;
     };
     void keep_fields(ComponentId id, const core::FieldInfo* fields, std::uint32_t count);
 

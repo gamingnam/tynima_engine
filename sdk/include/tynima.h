@@ -21,6 +21,7 @@
  *   4  hosting: the engine, frames, models, the camera, the UI, the log ring;
  *      component queries; the built-in components as C structs; body poses
  *   5  reflection: a component's fields, read by tools and described by modules
+ *   6  a component's defaults; scenes saved and loaded as text
  */
 #ifndef TYNIMA_H
 #define TYNIMA_H
@@ -33,7 +34,7 @@
 extern "C" {
 #endif
 
-#define TYNIMA_API_VERSION 5u
+#define TYNIMA_API_VERSION 6u
 
 /* ---- engine version ---- */
 
@@ -315,6 +316,15 @@ typedef struct tynima_api {
      * id, more than TYNIMA_MAX_COMPONENT_FIELDS, or a field outside it. */
     bool (*describe_component)(tynima_engine* engine, tynima_component_id id, const tynima_field* fields,
                                uint32_t count);
+
+    /* ---- version 6 ---- */
+
+    /* What a new instance of a component starts out as: `size` bytes, the
+     * engine's copy, valid as long as the engine; NULL when nobody said (a
+     * tool then starts from zeros). set_component_defaults gives a component
+     * the caller registered its defaults; the first ones given stand. */
+    const void* (*component_defaults)(tynima_engine* engine, tynima_component_id id);
+    bool (*set_component_defaults)(tynima_engine* engine, tynima_component_id id, const void* defaults);
 } tynima_api;
 
 /* ---- what a game module exports ---- */
@@ -395,6 +405,19 @@ uint64_t tynima_engine_frame_index(tynima_engine* engine);
 #define TYNIMA_NO_MODEL 0xFFFFFFFFu
 uint32_t tynima_load_model(tynima_engine* engine, const char* path);
 uint32_t tynima_model_count(tynima_engine* engine);
+
+/* ---- scenes ----
+ *
+ * The world as a text file (TOML: an entity after another, a table per
+ * component, a line per field — what version control diffs). Every
+ * component in a file must be registered before it is loaded: the module
+ * that defines one goes in first. false with tynima_last_error() naming
+ * the line, and the world as it was. */
+bool tynima_save_scene(tynima_engine* engine, const char* path);
+/* `clear`: the world's entities go first; otherwise the file's are added. */
+bool tynima_load_scene(tynima_engine* engine, const char* path, bool clear);
+/* Every entity destroyed: an empty scene. */
+void tynima_clear_scene(tynima_engine* engine);
 
 /* ---- the view ---- */
 

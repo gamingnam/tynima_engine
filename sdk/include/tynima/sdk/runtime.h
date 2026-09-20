@@ -148,6 +148,8 @@ public:
     }
     // This frame's point lights, copied: at most render::kMaxSceneLights.
     void set_lights(const render::PointLight* lights, std::uint32_t count) noexcept;
+    // Every entity destroyed. (Physics bodies are the host's, and stay.)
+    void clear_scene();
 
     // ---- hooks ----
 

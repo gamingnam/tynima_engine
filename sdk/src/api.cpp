@@ -8,6 +8,7 @@
 #include <tynima/physics/physics.h>
 #include <tynima/platform/platform.h>
 #include <tynima/scene/components.h>
+#include <tynima/scene/scene_file.h>
 #include <tynima/scene/world.h>
 #include <tynima/sdk/game_module.h>
 #include <tynima/sdk/runtime.h>
@@ -306,6 +307,14 @@ bool api_describe_component(tynima_engine* engine, tynima_component_id id, const
     return engine->world->describe_component(id, converted, count);
 }
 
+const void* api_component_defaults(tynima_engine* engine, tynima_component_id id) {
+    return id < engine->world->component_type_count() ? engine->world->component_info(id).defaults : nullptr;
+}
+
+bool api_set_component_defaults(tynima_engine* engine, tynima_component_id id, const void* defaults) {
+    return engine->world->set_component_defaults(id, defaults);
+}
+
 void api_body_set_transform(tynima_engine* engine, tynima_body body, tynima_vec3 position,
                             tynima_quat rotation) {
     if (engine->physics != nullptr && engine->physics->valid(to_body(body))) {
@@ -351,6 +360,8 @@ const tynima_api kApi{
     api_component_field_count,
     api_component_field,
     api_describe_component,
+    api_component_defaults,
+    api_set_component_defaults,
 };
 
 // ---- hosting ----
@@ -464,6 +475,40 @@ uint32_t tynima_load_model(tynima_engine* engine, const char* path) {
 uint32_t tynima_model_count(tynima_engine* engine) {
     const Runtime* runtime = runtime_of(engine);
     return runtime != nullptr ? runtime->model_count() : 0;
+}
+
+bool tynima_save_scene(tynima_engine* engine, const char* path) {
+    Runtime* runtime = runtime_of(engine);
+    if (runtime == nullptr || path == nullptr) {
+        g_last_error = "tynima_save_scene: no engine or no path";
+        return false;
+    }
+    std::string error;
+    if (!tynima::scene::save_scene_file(runtime->world(), path, error)) {
+        g_last_error = error;
+        return false;
+    }
+    return true;
+}
+
+bool tynima_load_scene(tynima_engine* engine, const char* path, bool clear) {
+    Runtime* runtime = runtime_of(engine);
+    if (runtime == nullptr || path == nullptr) {
+        g_last_error = "tynima_load_scene: no engine or no path";
+        return false;
+    }
+    std::string error;
+    if (!tynima::scene::load_scene_file(runtime->world(), path, error, {.clear = clear})) {
+        g_last_error = error;
+        return false;
+    }
+    return true;
+}
+
+void tynima_clear_scene(tynima_engine* engine) {
+    if (Runtime* runtime = runtime_of(engine)) {
+        runtime->clear_scene();
+    }
 }
 
 void tynima_get_camera(tynima_engine* engine, tynima_camera* out) {

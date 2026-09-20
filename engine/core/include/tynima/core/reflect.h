@@ -23,11 +23,14 @@
 //   TY_REFLECT(Transform, TY_FIELD(position), TY_FIELD(rotation), TY_FIELD(scale));
 //
 // TY_REFLECT goes in the struct's own namespace (it is found by argument-
-// dependent lookup) and takes the struct's unqualified name. TY_FIELD_FLAGS
-// marks a field ReadOnly (shown, never edited) or Hidden (an
-// implementation detail). A field of a type this file does not know shows
-// as bytes: describe it as Bytes and give it an editor later, or add a
-// FieldTraits specialization for its type where the type is declared.
+// dependent lookup) and takes the struct's unqualified name; the struct
+// must be default-constructible at compile time, since its defaults are
+// kept beside the fields. TY_FIELD_FLAGS marks a field ReadOnly (shown,
+// never edited, never saved — derived or runtime state) or Hidden (an
+// implementation detail: neither shown nor saved). A field of a type this
+// file does not know shows as bytes: describe it as Bytes and give it an
+// editor later, or add a FieldTraits specialization for its type where the
+// type is declared.
 namespace tynima::core {
 
 enum class FieldKind : std::uint8_t {
@@ -71,6 +74,10 @@ struct FieldInfo {
 struct TypeInfo {
     const FieldInfo* fields = nullptr;
     std::uint32_t count = 0;
+    // A default-constructed instance, `size` bytes: what a field not named
+    // in a file, or a component added by a tool, starts out as.
+    const void* defaults = nullptr;
+    std::uint32_t size = 0;
 };
 
 // What a field's type is to reflection. The primary template is the
@@ -149,9 +156,11 @@ template <typename T> [[nodiscard]] constexpr TypeInfo type_info() noexcept {
     struct TynimaReflect_##Type {                                                                            \
         using ReflectedType = Type;                                                                          \
         static constexpr ::tynima::core::FieldInfo fields[] = {__VA_ARGS__};                                 \
+        static constexpr Type defaults{};                                                                    \
     };                                                                                                       \
     [[maybe_unused]] constexpr ::tynima::core::TypeInfo tynima_reflect(const Type*) noexcept {               \
         return {TynimaReflect_##Type::fields,                                                                \
                 static_cast<std::uint32_t>(sizeof(TynimaReflect_##Type::fields) /                            \
-                                           sizeof(::tynima::core::FieldInfo))};                              \
+                                           sizeof(::tynima::core::FieldInfo)),                               \
+                &TynimaReflect_##Type::defaults, static_cast<std::uint32_t>(sizeof(Type))};                  \
     }

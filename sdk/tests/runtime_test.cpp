@@ -6,6 +6,8 @@
 #include <doctest/doctest.h>
 
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 
@@ -256,4 +258,71 @@ TEST_CASE("fields cross the C API: the engine's components come described, a mod
     CHECK_FALSE(api.describe_component(hosted.engine, launcher, &outside, 1));
     CHECK_FALSE(api.describe_component(hosted.engine, 99, fields, 3));
     CHECK_FALSE(api.describe_component(hosted.engine, launcher, fields, 0));
+}
+
+TEST_CASE("a scene goes to a file and comes back through the public header") {
+    HostedEngine hosted;
+    REQUIRE_MESSAGE(hosted.engine != nullptr, tynima_last_error());
+    const tynima_api& api = *hosted.api;
+    const tynima_component_id name = api.find_component(hosted.engine, TYNIMA_COMPONENT_NAME);
+    const tynima_component_id transform = api.find_component(hosted.engine, TYNIMA_COMPONENT_TRANSFORM);
+    const tynima_component_id parent = api.find_component(hosted.engine, TYNIMA_COMPONENT_PARENT);
+    // The defaults an editor adds a component as.
+    const auto* transform_defaults =
+        static_cast<const tynima_transform*>(api.component_defaults(hosted.engine, transform));
+    REQUIRE(transform_defaults != nullptr);
+    CHECK(transform_defaults->scale.x == 1.0f);
+    CHECK(transform_defaults->rotation.w == 1.0f);
+    CHECK(api.component_defaults(hosted.engine, 99) == nullptr);
+
+    tynima_name floor_name{};
+    std::strcpy(floor_name.text, "floor");
+    tynima_transform t = *transform_defaults;
+    t.position = tynima_vec3_make(0.0f, -0.25f, 0.0f);
+    const tynima_component_id floor_ids[2] = {name, transform};
+    const void* floor_values[2] = {&floor_name, &t};
+    const tynima_entity floor = api.create_entity(hosted.engine, floor_ids, floor_values, 2);
+    tynima_name crate_name{};
+    std::strcpy(crate_name.text, "crate");
+    const tynima_parent on_floor{floor};
+    const tynima_component_id crate_ids[3] = {name, transform, parent};
+    const void* crate_values[3] = {&crate_name, transform_defaults, &on_floor};
+    (void)api.create_entity(hosted.engine, crate_ids, crate_values, 3);
+
+    const std::string path = std::string(std::getenv("TMPDIR") != nullptr ? std::getenv("TMPDIR") : "/tmp") +
+                             "/tynima_sdk_scene.toml";
+    REQUIRE_MESSAGE(tynima_save_scene(hosted.engine, path.c_str()), tynima_last_error());
+    tynima_clear_scene(hosted.engine);
+    CHECK(api.entity_count(hosted.engine) == 0);
+    REQUIRE_MESSAGE(tynima_load_scene(hosted.engine, path.c_str(), true), tynima_last_error());
+    CHECK(api.entity_count(hosted.engine) == 2);
+    REQUIRE_MESSAGE(tynima_load_scene(hosted.engine, path.c_str(), false), tynima_last_error());
+    CHECK(api.entity_count(hosted.engine) == 4);
+    // The crate's parent is the loaded floor, not the old handle.
+    struct Found {
+        const tynima_api* api;
+        tynima_engine* engine;
+        tynima_component_id name;
+        int crates_on_a_floor = 0;
+    } found{&api, hosted.engine, name};
+    const tynima_component_id query[2] = {parent, name};
+    api.each_chunk(
+        hosted.engine, query, 2,
+        [](void* user, const tynima_entity*, uint32_t count, void* const* columns) {
+            auto* f = static_cast<Found*>(user);
+            const auto* parents = static_cast<const tynima_parent*>(columns[0]);
+            for (uint32_t i = 0; i < count; ++i) {
+                const auto* parent_name = static_cast<const tynima_name*>(
+                    f->api->get_component(f->engine, parents[i].entity, f->name));
+                if (parent_name != nullptr && std::string(parent_name->text) == "floor") {
+                    ++f->crates_on_a_floor;
+                }
+            }
+        },
+        &found);
+    CHECK(found.crates_on_a_floor == 2);
+    CHECK_FALSE(tynima_load_scene(hosted.engine, "/no/such/scene.toml", true));
+    CHECK(std::string(tynima_last_error()).find("cannot read") != std::string::npos);
+    CHECK(api.entity_count(hosted.engine) == 4); // untouched
+    std::remove(path.c_str());
 }

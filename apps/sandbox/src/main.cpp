@@ -7,7 +7,7 @@
 //
 //   tynima-sandbox [--headless] [--frames N] [--model path.glb] [--physics tynima|jolt]
 //                  [--rhi sdl|metal] [--shading forward|fused|split]
-//                  [--record log.tyrec | --replay log.tyrec]
+//                  [--record log.tyrec | --replay log.tyrec] [--save-scene scene.toml]
 //
 // The pile runs on the engine's own physics by default; --physics jolt
 // drops the same pile through Jolt, and the report line at exit compares.
@@ -24,7 +24,8 @@
 // world's hash at the end, to a text log; --replay feeds that log back in
 // place of the clock and the keyboard and checks the run ends on the same
 // hash — the simulation is deterministic, so it must, and CI replays a
-// recorded pile to prove it (exit code 3 when it does not).
+// recorded pile to prove it (exit code 3 when it does not). --save-scene
+// writes the world as it ended to a scene file, for the editor to open.
 //
 // Controls: hold the right mouse button to look; W/A/S/D move, Q/E descend
 // and climb, Shift runs; R drops the pile again; L (the game module)
@@ -50,6 +51,7 @@
 #include <tynima/render/scene_renderer.h>
 #include <tynima/rhi/device.h>
 #include <tynima/scene/components.h>
+#include <tynima/scene/scene_file.h>
 #include <tynima/scene/world.h>
 #include <tynima/sdk/runtime.h>
 
@@ -433,6 +435,7 @@ struct Options {
     render::ShadingPath shading = render::ShadingPath::Forward;
     std::string record; // write the input log here at exit
     std::string replay; // play this input log instead of live input and time
+    std::string save_scene; // write the scene here at exit
 };
 
 // Exit codes past the usual 0 and 1.
@@ -482,10 +485,12 @@ Options parse_options(int argc, char** argv) {
             options.record = argv[++i];
         } else if (std::strcmp(argv[i], "--replay") == 0 && i + 1 < argc) {
             options.replay = argv[++i];
+        } else if (std::strcmp(argv[i], "--save-scene") == 0 && i + 1 < argc) {
+            options.save_scene = argv[++i];
         } else {
             std::fprintf(stderr, "usage: tynima-sandbox [--headless] [--frames N] [--model path.glb] "
                                  "[--physics tynima|jolt] [--rhi sdl|metal] [--shading forward|fused|split] "
-                                 "[--record log.tyrec | --replay log.tyrec]\n");
+                                 "[--record log.tyrec | --replay log.tyrec] [--save-scene scene.toml]\n");
             std::exit(kExitUsage);
         }
     }
@@ -959,6 +964,15 @@ int main(int argc, char** argv) {
         report_rest(world, physics, character, rest);
     }
     int exit_code = 0;
+    if (!options.save_scene.empty()) {
+        std::string error;
+        if (scene::save_scene_file(world, options.save_scene.c_str(), error)) {
+            TY_LOG_INFO("scene", "saved %u entities to %s", world.entity_count(), options.save_scene.c_str());
+        } else {
+            TY_LOG_ERROR("scene", "%s", error.c_str());
+            exit_code = 1;
+        }
+    }
     if (!options.record.empty()) {
         const platform::InputLog recorded = runtime.recording();
         std::string error;

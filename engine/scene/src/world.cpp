@@ -73,6 +73,9 @@ ComponentId World::register_component(const ComponentInfo& info) {
             if (infos_[i].fields == nullptr && info.fields != nullptr) {
                 keep_fields(i, info.fields, info.field_count); // the first registration was blind
             }
+            if (infos_[i].defaults == nullptr && info.defaults != nullptr) {
+                (void)set_component_defaults(i, info.defaults);
+            }
             return i;
         }
     }
@@ -89,10 +92,28 @@ ComponentId World::register_component(const ComponentInfo& info) {
     infos_[id].name = storage.name;
     infos_[id].fields = nullptr;
     infos_[id].field_count = 0;
+    infos_[id].defaults = nullptr;
     if (info.fields != nullptr) {
         keep_fields(id, info.fields, info.field_count);
     }
+    if (info.defaults != nullptr) {
+        (void)set_component_defaults(id, info.defaults);
+    }
     return id;
+}
+
+bool World::set_component_defaults(ComponentId id, const void* defaults) {
+    if (id >= component_count_ || defaults == nullptr) {
+        return false;
+    }
+    if (infos_[id].defaults != nullptr) {
+        return true; // the first defaults stand
+    }
+    ComponentStorage& storage = storage_[id];
+    const auto* bytes = static_cast<const std::uint8_t*>(defaults);
+    storage.defaults.assign(bytes, bytes + infos_[id].size);
+    infos_[id].defaults = storage.defaults.data();
+    return true;
 }
 
 bool World::describe_component(ComponentId id, const core::FieldInfo* fields, std::uint32_t count) {

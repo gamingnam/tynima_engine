@@ -4,8 +4,8 @@
 // editor needs is not in tynima.h, tynima.h is incomplete; that rule is
 // what keeps the SDK honest, and tools/check_layering.py enforces it.
 //
-//   tynima-editor [--model path.glb] [--game module.so] [--physics tynima|jolt] [--rhi sdl|metal]
-//                 [--headless] [--frames N]
+//   tynima-editor [--scene file.toml] [--model path.glb] [--game module.so] [--physics tynima|jolt]
+//                 [--rhi sdl|metal] [--headless] [--frames N]
 //
 // Four docked panels: the hierarchy (every entity, under its parent), the
 // inspector (the selected entity's components, every field of every one,
@@ -34,6 +34,7 @@ namespace {
 constexpr float kPi = 3.14159265358979f;
 
 struct Options {
+    std::string scene;
     std::string model;
     std::string game;
     const char* physics = nullptr;
@@ -45,7 +46,9 @@ struct Options {
 Options parse_options(int argc, char** argv) {
     Options options;
     for (int i = 1; i < argc; ++i) {
-        if (std::strcmp(argv[i], "--model") == 0 && i + 1 < argc) {
+        if (std::strcmp(argv[i], "--scene") == 0 && i + 1 < argc) {
+            options.scene = argv[++i];
+        } else if (std::strcmp(argv[i], "--model") == 0 && i + 1 < argc) {
             options.model = argv[++i];
         } else if (std::strcmp(argv[i], "--game") == 0 && i + 1 < argc) {
             options.game = argv[++i];
@@ -58,8 +61,9 @@ Options parse_options(int argc, char** argv) {
         } else if (std::strcmp(argv[i], "--frames") == 0 && i + 1 < argc) {
             options.max_frames = std::strtol(argv[++i], nullptr, 10);
         } else {
-            std::fprintf(stderr, "usage: tynima-editor [--model path.glb] [--game module.so] "
-                                 "[--physics tynima|jolt] [--rhi sdl|metal] [--headless] [--frames N]\n");
+            std::fprintf(stderr,
+                         "usage: tynima-editor [--scene file.toml] [--model path.glb] [--game module.so] "
+                         "[--physics tynima|jolt] [--rhi sdl|metal] [--headless] [--frames N]\n");
             std::exit(2);
         }
     }
@@ -206,6 +210,12 @@ struct Editor {
     tynima_entity selected{};
     UndoStack undo;
     std::vector<std::uint8_t> component_snapshot; // the component being drawn, before its widgets ran
+
+    // The scene on disk: where Save goes, and the path dialog's text.
+    std::string scene_path;
+    char path_buffer[512] = "";
+    enum class PathDialog { None, Open, SaveAs } path_dialog = PathDialog::None;
+    std::string scene_status; // the last save or load, for the status line
     bool show_hierarchy = true, show_inspector = true, show_viewport = true, show_console = true,
          show_stats = true;
     bool show_demo = false;
@@ -224,6 +234,9 @@ struct Editor {
     bool console_autoscroll = true;
 
     void draw_menu_bar();
+    void draw_path_dialog();
+    void save_scene(const std::string& path);
+    void load_scene(const std::string& path);
     void after_edit(tynima_entity entity, tynima_component_id component);
     bool apply(const Edit& edit, bool forward);
     void undo_last();
@@ -263,6 +276,32 @@ void Editor::draw_menu_bar() {
         return;
     }
     if (ImGui::BeginMenu("File")) {
+        if (ImGui::MenuItem("New scene")) {
+            tynima_clear_scene(engine);
+            selected = tynima_entity{};
+            undo.done.clear();
+            undo.undone.clear();
+            scene_path.clear();
+            scene_status = "new scene";
+        }
+        if (ImGui::MenuItem("Open scene...", "Cmd+O")) {
+            path_dialog = PathDialog::Open;
+            std::snprintf(path_buffer, sizeof path_buffer, "%s", scene_path.c_str());
+        }
+        if (ImGui::MenuItem("Save scene", "Cmd+S")) {
+            if (scene_path.empty()) {
+                path_dialog = PathDialog::SaveAs;
+            } else {
+                save_scene(scene_path);
+            }
+        }
+        if (ImGui::MenuItem("Save scene as...", "Cmd+Shift+S")) {
+            path_dialog = PathDialog::SaveAs;
+            std::snprintf(path_buffer, sizeof path_buffer, "%s", scene_path.c_str());
+        }
+        ImGui::Separator();
+        ImGui::TextDisabled("%s", scene_path.empty() ? "(unsaved scene)" : scene_path.c_str());
+        ImGui::Separator();
         if (ImGui::MenuItem("Quit", "Cmd+Q")) {
             quit = true;
         }
@@ -350,6 +389,10 @@ void Editor::draw_menu_bar() {
         }
         ImGui::EndMenu();
     }
+    if (!scene_status.empty()) {
+        ImGui::SameLine(ImGui::GetWindowWidth() - ImGui::CalcTextSize(scene_status.c_str()).x - 16.0f);
+        ImGui::TextDisabled("%s", scene_status.c_str());
+    }
     if (ImGui::BeginMenu("Help")) {
         ImGui::MenuItem("Dear ImGui demo", nullptr, &show_demo);
         ImGui::Separator();
@@ -394,6 +437,27 @@ void Editor::draw_hierarchy() {
     }
     hierarchy.rebuild(*api, engine, components);
     ImGui::TextDisabled("%zu entities", hierarchy.nodes.size());
+    ImGui::SameLine();
+    if (ImGui::SmallButton("New entity")) {
+        // A name, a transform and a world matrix: enough to draw and to place.
+        tynima_name name{};
+        std::snprintf(name.text, sizeof name.text, "entity");
+        tynima_transform transform{};
+        transform.rotation = tynima_quat_identity();
+        transform.scale = tynima_vec3_make(1.0f, 1.0f, 1.0f);
+        tynima_local_to_world local_to_world{};
+        const tynima_component_id ids[3] = {components.name, components.transform, components.local_to_world};
+        const void* values[3] = {&name, &transform, &local_to_world};
+        selected = api->create_entity(engine, ids, values, 3);
+    }
+    if (selected.generation != 0 && api->entity_alive(engine, selected)) {
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Delete") || ImGui::IsKeyPressed(ImGuiKey_Delete, false) ||
+            (ImGui::IsWindowFocused() && ImGui::IsKeyPressed(ImGuiKey_Backspace, false))) {
+            (void)api->destroy_entity(engine, selected);
+            selected = tynima_entity{};
+        }
+    }
     ImGui::Separator();
     if (ImGui::BeginChild("tree")) {
         for (const Hierarchy::Node& node : hierarchy.nodes) {
@@ -404,6 +468,61 @@ void Editor::draw_hierarchy() {
     }
     ImGui::EndChild();
     ImGui::End();
+}
+
+// A path typed into a small modal: the editor has no native file dialog yet.
+void Editor::draw_path_dialog() {
+    if (path_dialog == PathDialog::None) {
+        return;
+    }
+    const char* title = path_dialog == PathDialog::Open ? "Open scene" : "Save scene as";
+    ImGui::OpenPopup(title);
+    ImGui::SetNextWindowSize(ImVec2(520.0f, 0.0f), ImGuiCond_Appearing);
+    if (ImGui::BeginPopupModal(title, nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
+        ImGui::TextDisabled("a .toml scene file, relative to the working directory or absolute");
+        if (ImGui::IsWindowAppearing()) {
+            ImGui::SetKeyboardFocusHere();
+        }
+        const bool entered =
+            ImGui::InputText("path", path_buffer, sizeof path_buffer, ImGuiInputTextFlags_EnterReturnsTrue);
+        const bool confirmed = ImGui::Button(path_dialog == PathDialog::Open ? "Open" : "Save") || entered;
+        ImGui::SameLine();
+        const bool cancelled = ImGui::Button("Cancel") || ImGui::IsKeyPressed(ImGuiKey_Escape);
+        if (confirmed && path_buffer[0] != '\0') {
+            if (path_dialog == PathDialog::Open) {
+                load_scene(path_buffer);
+            } else {
+                save_scene(path_buffer);
+            }
+            path_dialog = PathDialog::None;
+            ImGui::CloseCurrentPopup();
+        } else if (cancelled) {
+            path_dialog = PathDialog::None;
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::EndPopup();
+    }
+}
+
+void Editor::save_scene(const std::string& path) {
+    if (tynima_save_scene(engine, path.c_str())) {
+        scene_path = path;
+        scene_status = "saved " + path;
+    } else {
+        scene_status = std::string("save failed: ") + tynima_last_error();
+    }
+}
+
+void Editor::load_scene(const std::string& path) {
+    if (tynima_load_scene(engine, path.c_str(), true)) {
+        scene_path = path;
+        scene_status = "opened " + path;
+        selected = tynima_entity{};
+        undo.done.clear(); // every handle in it is gone
+        undo.undone.clear();
+    } else {
+        scene_status = std::string("open failed: ") + tynima_last_error();
+    }
 }
 
 // A body drives its entity's transform every frame: an edit to the
@@ -627,10 +746,43 @@ void Editor::draw_inspector() {
             continue;
         }
         ImGui::PushID(static_cast<int>(ids[i]));
-        if (ImGui::CollapsingHeader(info.name, ImGuiTreeNodeFlags_DefaultOpen)) {
+        const bool open = ImGui::CollapsingHeader(info.name, ImGuiTreeNodeFlags_DefaultOpen);
+        ImGui::SameLine(ImGui::GetContentRegionAvail().x - 24.0f);
+        const bool remove = ImGui::SmallButton("x");
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("Remove %s", info.name);
+        }
+        if (open && !remove) {
             draw_component(ids[i], info, data);
         }
         ImGui::PopID();
+        if (remove) {
+            (void)api->remove_component(engine, selected, ids[i]);
+            break; // the list just changed
+        }
+    }
+    // Any registered component the entity lacks, added as its defaults.
+    ImGui::Separator();
+    if (ImGui::BeginCombo("##add", "Add component...")) {
+        const uint32_t type_count = api->component_count(engine);
+        for (uint32_t id = 0; id < type_count; ++id) {
+            bool present = false;
+            for (uint32_t i = 0; i < count; ++i) {
+                present = present || ids[i] == id;
+            }
+            tynima_component_info info{};
+            if (present || !api->component_info(engine, id, &info)) {
+                continue;
+            }
+            if (ImGui::Selectable(info.name)) {
+                std::vector<std::uint8_t> bytes(info.size, 0);
+                if (const void* defaults = api->component_defaults(engine, id)) {
+                    std::memcpy(bytes.data(), defaults, info.size);
+                }
+                (void)api->add_component(engine, selected, id, bytes.data());
+            }
+        }
+        ImGui::EndCombo();
     }
     ImGui::End();
 }
@@ -858,6 +1010,12 @@ int main(int argc, char** argv) {
 
     ImGui::SetCurrentContext(static_cast<ImGuiContext*>(tynima_ui_context(engine)));
     ImGui::GetIO().IniFilename = "tynima-editor.ini";
+    if (!options.scene.empty()) {
+        editor.load_scene(options.scene);
+        if (editor.scene_status.rfind("open failed", 0) == 0) {
+            std::fprintf(stderr, "tynima-editor: %s\n", editor.scene_status.c_str());
+        }
+    }
 
     long frames = 0;
     while (tynima_engine_begin_frame(engine)) {

@@ -1,0 +1,1399 @@
+# Tynima scene
+version = 1
+
+[[entities]]
+[entities.Name]
+text = "launcher"
+[entities.Launcher]
+speed = 4.0
+spread = 1.5
+
+[[entities]]
+[entities.Name]
+text = "floor"
+[entities.Transform]
+position = [0.0, -0.25, 0.0]
+rotation = [0.0, 0.0, 0.0, 1.0]
+scale = [1.0, 1.0, 1.0]
+[entities.LocalToWorld]
+[entities.MeshRenderer]
+model = 1
+visible = true
+
+[[entities]]
+[entities.Name]
+text = "bottle 0"
+[entities.Transform]
+position = [-0.47136107, 0.051931567, -0.46186984]
+rotation = [0.22666337, 0.2244159, -0.6764568, -0.6638279]
+scale = [1.0, 1.0, 1.0]
+[entities.LocalToWorld]
+[entities.MeshRenderer]
+model = 0
+visible = true
+[entities.RigidBody]
+
+[[entities]]
+[entities.Name]
+text = "bottle 1"
+[entities.Transform]
+position = [-0.18087554, 0.1404032, -0.30808258]
+rotation = [0.041458674, 0.948621, -0.14799064, 0.27658337]
+scale = [1.0, 1.0, 1.0]
+[entities.LocalToWorld]
+[entities.MeshRenderer]
+model = 0
+visible = true
+[entities.RigidBody]
+
+[[entities]]
+[entities.Name]
+text = "bottle 2"
+[entities.Transform]
+position = [-0.16587308, 0.05219473, -0.41780725]
+rotation = [-0.34735712, 0.61444396, -0.6233051, -0.33658937]
+scale = [1.0, 1.0, 1.0]
+[entities.LocalToWorld]
+[entities.MeshRenderer]
+model = 0
+visible = true
+[entities.RigidBody]
+
+[[entities]]
+[entities.Name]
+text = "bottle 3"
+[entities.Transform]
+position = [0.30898693, 0.053753987, -0.524093]
+rotation = [0.6929164, 0.6938857, -0.13748462, -0.13959815]
+scale = [1.0, 1.0, 1.0]
+[entities.LocalToWorld]
+[entities.MeshRenderer]
+model = 0
+visible = true
+[entities.RigidBody]
+
+[[entities]]
+[entities.Name]
+text = "bottle 4"
+[entities.Transform]
+position = [0.37111372, 0.05241389, -0.42942685]
+rotation = [0.5831195, 0.39480102, 0.40003055, -0.58658284]
+scale = [1.0, 1.0, 1.0]
+[entities.LocalToWorld]
+[entities.MeshRenderer]
+model = 0
+visible = true
+[entities.RigidBody]
+
+[[entities]]
+[entities.Name]
+text = "bottle 5"
+[entities.Transform]
+position = [-0.42879537, 0.05384617, -0.2789394]
+rotation = [-0.6274746, 0.32092273, 0.32463914, 0.6307882]
+scale = [1.0, 1.0, 1.0]
+[entities.LocalToWorld]
+[entities.MeshRenderer]
+model = 0
+visible = true
+[entities.RigidBody]
+
+[[entities]]
+[entities.Name]
+text = "bottle 6"
+[entities.Transform]
+position = [-0.078002565, 0.12990451, -0.22123758]
+rotation = [0.0023445184, 0.8335403, -0.0019870915, -0.55245006]
+scale = [1.0, 1.0, 1.0]
+[entities.LocalToWorld]
+[entities.MeshRenderer]
+model = 0
+visible = true
+[entities.RigidBody]
+
+[[entities]]
+[entities.Name]
+text = "bottle 7"
+[entities.Transform]
+position = [-0.00012376044, 0.14089659, -0.12569198]
+rotation = [-0.1755937, 0.2732788, -0.052737534, -0.94430095]
+scale = [1.0, 1.0, 1.0]
+[entities.LocalToWorld]
+[entities.MeshRenderer]
+model = 0
+visible = true
+[entities.RigidBody]
+
+[[entities]]
+[entities.Name]
+text = "bottle 8"
+[entities.Transform]
+position = [0.1471129, 0.12995091, -0.13179453]
+rotation = [-0.022010393, 0.36849388, -0.009796662, 0.92931795]
+scale = [1.0, 1.0, 1.0]
+[entities.LocalToWorld]
+[entities.MeshRenderer]
+model = 0
+visible = true
+[entities.RigidBody]
+
+[[entities]]
+[entities.Name]
+text = "bottle 9"
+[entities.Transform]
+position = [0.41146106, 0.053110536, -0.08910587]
+rotation = [0.21203497, 0.6792037, 0.6747195, -0.19615594]
+scale = [1.0, 1.0, 1.0]
+[entities.LocalToWorld]
+[entities.MeshRenderer]
+model = 0
+visible = true
+[entities.RigidBody]
+
+[[entities]]
+[entities.Name]
+text = "bottle 10"
+[entities.Transform]
+position = [-0.2781392, 0.10582893, -0.12089454]
+rotation = [0.3613669, 0.7353561, -0.47549593, -0.32026407]
+scale = [1.0, 1.0, 1.0]
+[entities.LocalToWorld]
+[entities.MeshRenderer]
+model = 0
+visible = true
+[entities.RigidBody]
+
+[[entities]]
+[entities.Name]
+text = "bottle 11"
+[entities.Transform]
+position = [-0.19908826, 0.13823779, 0.012887276]
+rotation = [-0.29954353, 0.95161676, -0.015081439, 0.06687119]
+scale = [1.0, 1.0, 1.0]
+[entities.LocalToWorld]
+[entities.MeshRenderer]
+model = 0
+visible = true
+[entities.RigidBody]
+
+[[entities]]
+[entities.Name]
+text = "bottle 12"
+[entities.Transform]
+position = [-0.047148425, 0.14085178, 0.025459254]
+rotation = [-0.14860097, 0.7143521, 0.15962002, 0.66493636]
+scale = [1.0, 1.0, 1.0]
+[entities.LocalToWorld]
+[entities.MeshRenderer]
+model = 0
+visible = true
+[entities.RigidBody]
+
+[[entities]]
+[entities.Name]
+text = "bottle 13"
+[entities.Transform]
+position = [0.122558296, 0.130169, 0.013339857]
+rotation = [-0.00033236758, 0.99877214, 0.00017212835, -0.049538437]
+scale = [1.0, 1.0, 1.0]
+[entities.LocalToWorld]
+[entities.MeshRenderer]
+model = 0
+visible = true
+[entities.RigidBody]
+
+[[entities]]
+[entities.Name]
+text = "bottle 14"
+[entities.Transform]
+position = [0.31512722, 0.13011143, 0.05079639]
+rotation = [-0.0010052918, 0.9394965, 0.00030986604, -0.34255692]
+scale = [1.0, 1.0, 1.0]
+[entities.LocalToWorld]
+[entities.MeshRenderer]
+model = 0
+visible = true
+[entities.RigidBody]
+
+[[entities]]
+[entities.Name]
+text = "bottle 15"
+[entities.Transform]
+position = [-0.27220896, 0.12867062, 0.12779191]
+rotation = [-0.022747723, 0.73793244, 0.007110177, -0.6744537]
+scale = [1.0, 1.0, 1.0]
+[entities.LocalToWorld]
+[entities.MeshRenderer]
+model = 0
+visible = true
+[entities.RigidBody]
+
+[[entities]]
+[entities.Name]
+text = "bottle 16"
+[entities.Transform]
+position = [-0.14286001, 0.13024883, 0.14142832]
+rotation = [0.0017712421, -0.0097964555, 0.0010779211, 0.99994993]
+scale = [1.0, 1.0, 1.0]
+[entities.LocalToWorld]
+[entities.MeshRenderer]
+model = 0
+visible = true
+[entities.RigidBody]
+
+[[entities]]
+[entities.Name]
+text = "bottle 17"
+[entities.Transform]
+position = [-0.023560192, 0.12977026, 0.20678471]
+rotation = [0.000452288, 0.03782581, 0.0022009593, -0.9992818]
+scale = [1.0, 1.0, 1.0]
+[entities.LocalToWorld]
+[entities.MeshRenderer]
+model = 0
+visible = true
+[entities.RigidBody]
+
+[[entities]]
+[entities.Name]
+text = "bottle 18"
+[entities.Transform]
+position = [0.09767336, 0.13016252, 0.12910847]
+rotation = [4.2938176e-05, 0.6990979, -0.00019599574, 0.7150261]
+scale = [1.0, 1.0, 1.0]
+[entities.LocalToWorld]
+[entities.MeshRenderer]
+model = 0
+visible = true
+[entities.RigidBody]
+
+[[entities]]
+[entities.Name]
+text = "bottle 19"
+[entities.Transform]
+position = [0.3092726, 0.13010068, 0.19030629]
+rotation = [-3.2553777e-05, 0.2643046, -0.00030869097, 0.9644392]
+scale = [1.0, 1.0, 1.0]
+[entities.LocalToWorld]
+[entities.MeshRenderer]
+model = 0
+visible = true
+[entities.RigidBody]
+
+[[entities]]
+[entities.Name]
+text = "bottle 20"
+[entities.Transform]
+position = [-0.5934714, 0.05344494, 0.3885604]
+rotation = [-0.70671684, 0.7041065, 0.05047272, -0.04730629]
+scale = [1.0, 1.0, 1.0]
+[entities.LocalToWorld]
+[entities.MeshRenderer]
+model = 0
+visible = true
+[entities.RigidBody]
+
+[[entities]]
+[entities.Name]
+text = "bottle 21"
+[entities.Transform]
+position = [-0.31727153, 0.054314937, 0.43517432]
+rotation = [-0.45913753, 0.53827876, 0.53748244, 0.4588697]
+scale = [1.0, 1.0, 1.0]
+[entities.LocalToWorld]
+[entities.MeshRenderer]
+model = 0
+visible = true
+[entities.RigidBody]
+
+[[entities]]
+[entities.Name]
+text = "bottle 22"
+[entities.Transform]
+position = [0.019393781, 0.13020276, 0.3844101]
+rotation = [1.4903167e-05, -0.0925678, 0.00016072212, -0.99570644]
+scale = [1.0, 1.0, 1.0]
+[entities.LocalToWorld]
+[entities.MeshRenderer]
+model = 0
+visible = true
+[entities.RigidBody]
+
+[[entities]]
+[entities.Name]
+text = "bottle 23"
+[entities.Transform]
+position = [0.09546214, 0.13206747, 0.25217193]
+rotation = [-0.029245403, 0.9959579, -0.0104747275, 0.08427926]
+scale = [1.0, 1.0, 1.0]
+[entities.LocalToWorld]
+[entities.MeshRenderer]
+model = 0
+visible = true
+[entities.RigidBody]
+
+[[entities]]
+[entities.Name]
+text = "bottle 24"
+[entities.Transform]
+position = [0.2694093, 0.12740752, 0.3291685]
+rotation = [-0.3619899, 0.8128612, -0.18641518, 0.41649663]
+scale = [1.0, 1.0, 1.0]
+[entities.LocalToWorld]
+[entities.MeshRenderer]
+model = 0
+visible = true
+[entities.RigidBody]
+
+[[entities]]
+[entities.Name]
+text = "bottle 25"
+[entities.Transform]
+position = [-0.90602595, 0.054449387, -0.69199747]
+rotation = [-0.4756922, 0.52318513, -0.52317977, -0.47568613]
+scale = [1.0, 1.0, 1.0]
+[entities.LocalToWorld]
+[entities.MeshRenderer]
+model = 0
+visible = true
+[entities.RigidBody]
+
+[[entities]]
+[entities.Name]
+text = "bottle 26"
+[entities.Transform]
+position = [-0.245636, 0.054302856, -0.6414336]
+rotation = [-0.5185245, 0.48068014, -0.48016, -0.5191582]
+scale = [1.0, 1.0, 1.0]
+[entities.LocalToWorld]
+[entities.MeshRenderer]
+model = 0
+visible = true
+[entities.RigidBody]
+
+[[entities]]
+[entities.Name]
+text = "bottle 27"
+[entities.Transform]
+position = [0.052828632, 0.053732388, -0.5854289]
+rotation = [0.09559895, 0.70112073, -0.69948334, 0.100068495]
+scale = [1.0, 1.0, 1.0]
+[entities.LocalToWorld]
+[entities.MeshRenderer]
+model = 0
+visible = true
+[entities.RigidBody]
+
+[[entities]]
+[entities.Name]
+text = "bottle 28"
+[entities.Transform]
+position = [0.5694228, 0.10221827, -0.5306798]
+rotation = [0.5646085, 0.352181, -0.62927586, -0.4014943]
+scale = [1.0, 1.0, 1.0]
+[entities.LocalToWorld]
+[entities.MeshRenderer]
+model = 0
+visible = true
+[entities.RigidBody]
+
+[[entities]]
+[entities.Name]
+text = "bottle 29"
+[entities.Transform]
+position = [0.69794506, 0.054092117, -0.35151023]
+rotation = [0.4686266, 0.5295511, -0.52813196, 0.47015056]
+scale = [1.0, 1.0, 1.0]
+[entities.LocalToWorld]
+[entities.MeshRenderer]
+model = 0
+visible = true
+[entities.RigidBody]
+
+[[entities]]
+[entities.Name]
+text = "bottle 30"
+[entities.Transform]
+position = [-0.7079037, 0.054293554, -0.39575487]
+rotation = [-0.39726487, -0.3978007, -0.5847949, -0.5847651]
+scale = [1.0, 1.0, 1.0]
+[entities.LocalToWorld]
+[entities.MeshRenderer]
+model = 0
+visible = true
+[entities.RigidBody]
+
+[[entities]]
+[entities.Name]
+text = "bottle 31"
+[entities.Transform]
+position = [-0.45661473, 0.22427067, -0.16509515]
+rotation = [-0.5124467, -0.0471262, -0.09509988, -0.85213476]
+scale = [1.0, 1.0, 1.0]
+[entities.LocalToWorld]
+[entities.MeshRenderer]
+model = 0
+visible = true
+[entities.RigidBody]
+
+[[entities]]
+[entities.Name]
+text = "bottle 32"
+[entities.Transform]
+position = [-0.06370752, 0.13640156, -0.57561105]
+rotation = [0.729135, 0.177705, -0.19709179, -0.63082325]
+scale = [1.0, 1.0, 1.0]
+[entities.LocalToWorld]
+[entities.MeshRenderer]
+model = 0
+visible = true
+[entities.RigidBody]
+
+[[entities]]
+[entities.Name]
+text = "bottle 33"
+[entities.Transform]
+position = [0.57064265, 0.05440809, -0.18532595]
+rotation = [0.09036991, -0.0909023, -0.7013097, 0.7012381]
+scale = [1.0, 1.0, 1.0]
+[entities.LocalToWorld]
+[entities.MeshRenderer]
+model = 0
+visible = true
+[entities.RigidBody]
+
+[[entities]]
+[entities.Name]
+text = "bottle 34"
+[entities.Transform]
+position = [1.1265087, 0.05444921, -0.6501263]
+rotation = [0.69558334, -0.12714769, -0.12713762, -0.6955814]
+scale = [1.0, 1.0, 1.0]
+[entities.LocalToWorld]
+[entities.MeshRenderer]
+model = 0
+visible = true
+[entities.RigidBody]
+
+[[entities]]
+[entities.Name]
+text = "bottle 35"
+[entities.Transform]
+position = [-0.6648932, 0.05428435, -0.039947905]
+rotation = [-0.60300016, 0.60187757, -0.3693162, 0.37113324]
+scale = [1.0, 1.0, 1.0]
+[entities.LocalToWorld]
+[entities.MeshRenderer]
+model = 0
+visible = true
+[entities.RigidBody]
+
+[[entities]]
+[entities.Name]
+text = "bottle 36"
+[entities.Transform]
+position = [-0.45900166, 0.16906376, 0.0069084065]
+rotation = [-0.084761284, -0.094124034, -0.72266966, -0.67948866]
+scale = [1.0, 1.0, 1.0]
+[entities.LocalToWorld]
+[entities.MeshRenderer]
+model = 0
+visible = true
+[entities.RigidBody]
+
+[[entities]]
+[entities.Name]
+text = "bottle 37"
+[entities.Transform]
+position = [-0.18930501, 0.2771565, -0.15030251]
+rotation = [-0.537201, -0.14613988, 0.4575957, 0.69329965]
+scale = [1.0, 1.0, 1.0]
+[entities.LocalToWorld]
+[entities.MeshRenderer]
+model = 0
+visible = true
+[entities.RigidBody]
+
+[[entities]]
+[entities.Name]
+text = "bottle 38"
+[entities.Transform]
+position = [0.10334981, 0.31181994, -0.14889425]
+rotation = [0.49429527, 0.4942263, -0.52984387, -0.48028955]
+scale = [1.0, 1.0, 1.0]
+[entities.LocalToWorld]
+[entities.MeshRenderer]
+model = 0
+visible = true
+[entities.RigidBody]
+
+[[entities]]
+[entities.Name]
+text = "bottle 39"
+[entities.Transform]
+position = [0.47134295, 0.15958188, -0.07346817]
+rotation = [0.53680396, 0.4360307, -0.47001725, 0.54845476]
+scale = [1.0, 1.0, 1.0]
+[entities.LocalToWorld]
+[entities.MeshRenderer]
+model = 0
+visible = true
+[entities.RigidBody]
+
+[[entities]]
+[entities.Name]
+text = "bottle 40"
+[entities.Transform]
+position = [-0.2914262, 0.38765252, 0.14648414]
+rotation = [-0.04124381, 0.7952181, 0.007215868, -0.60487616]
+scale = [1.0, 1.0, 1.0]
+[entities.LocalToWorld]
+[entities.MeshRenderer]
+model = 0
+visible = true
+[entities.RigidBody]
+
+[[entities]]
+[entities.Name]
+text = "bottle 41"
+[entities.Transform]
+position = [-0.17329179, 0.15143646, 0.33586505]
+rotation = [-0.15742129, 0.6956381, 0.5452624, -0.44044873]
+scale = [1.0, 1.0, 1.0]
+[entities.LocalToWorld]
+[entities.MeshRenderer]
+model = 0
+visible = true
+[entities.RigidBody]
+
+[[entities]]
+[entities.Name]
+text = "bottle 42"
+[entities.Transform]
+position = [-0.02434309, 0.33987075, 0.30763406]
+rotation = [0.43914396, 0.5328783, 0.44800693, 0.56787604]
+scale = [1.0, 1.0, 1.0]
+[entities.LocalToWorld]
+[entities.MeshRenderer]
+model = 0
+visible = true
+[entities.RigidBody]
+
+[[entities]]
+[entities.Name]
+text = "bottle 43"
+[entities.Transform]
+position = [0.32786494, 0.31445527, 0.06736356]
+rotation = [0.5324917, 0.46354297, 0.46236885, -0.53646594]
+scale = [1.0, 1.0, 1.0]
+[entities.LocalToWorld]
+[entities.MeshRenderer]
+model = 0
+visible = true
+[entities.RigidBody]
+
+[[entities]]
+[entities.Name]
+text = "bottle 44"
+[entities.Transform]
+position = [0.6194349, 0.14158627, 0.16856317]
+rotation = [0.9061687, -0.24258895, -0.039199755, -0.3441981]
+scale = [1.0, 1.0, 1.0]
+[entities.LocalToWorld]
+[entities.MeshRenderer]
+model = 0
+visible = true
+[entities.RigidBody]
+
+[[entities]]
+[entities.Name]
+text = "bottle 45"
+[entities.Transform]
+position = [-0.56487346, 0.16176012, 0.3518057]
+rotation = [0.6764329, 0.19835266, -0.18620118, 0.68441504]
+scale = [1.0, 1.0, 1.0]
+[entities.LocalToWorld]
+[entities.MeshRenderer]
+model = 0
+visible = true
+[entities.RigidBody]
+
+[[entities]]
+[entities.Name]
+text = "bottle 46"
+[entities.Transform]
+position = [-0.18575338, 0.05434918, 0.5430905]
+rotation = [0.09354491, -0.093613684, 0.7011504, -0.700624]
+scale = [1.0, 1.0, 1.0]
+[entities.LocalToWorld]
+[entities.MeshRenderer]
+model = 0
+visible = true
+[entities.RigidBody]
+
+[[entities]]
+[entities.Name]
+text = "bottle 47"
+[entities.Transform]
+position = [-0.008918675, 0.1573672, 0.7218198]
+rotation = [0.72764474, -0.47540596, 0.32220855, 0.37510526]
+scale = [1.0, 1.0, 1.0]
+[entities.LocalToWorld]
+[entities.MeshRenderer]
+model = 0
+visible = true
+[entities.RigidBody]
+
+[[entities]]
+[entities.Name]
+text = "bottle 48"
+[entities.Transform]
+position = [0.31784022, 0.31451172, 0.1859571]
+rotation = [0.54604536, 0.4495034, 0.45096958, -0.5444333]
+scale = [1.0, 1.0, 1.0]
+[entities.LocalToWorld]
+[entities.MeshRenderer]
+model = 0
+visible = true
+[entities.RigidBody]
+
+[[entities]]
+[entities.Name]
+text = "bottle 49"
+[entities.Transform]
+position = [0.20060785, 0.05444858, 0.4896913]
+rotation = [-0.68853366, 0.16098602, 0.1609843, 0.6885413]
+scale = [1.0, 1.0, 1.0]
+[entities.LocalToWorld]
+[entities.MeshRenderer]
+model = 0
+visible = true
+[entities.RigidBody]
+
+[[entities]]
+[entities.Name]
+text = "bottle 50"
+[entities.Transform]
+position = [-0.8993348, 0.054449916, -0.9183828]
+rotation = [-0.20612411, -0.6763973, -0.6763967, 0.20612389]
+scale = [1.0, 1.0, 1.0]
+[entities.LocalToWorld]
+[entities.MeshRenderer]
+model = 0
+visible = true
+[entities.RigidBody]
+
+[[entities]]
+[entities.Name]
+text = "bottle 51"
+[entities.Transform]
+position = [-0.23911543, 0.24071364, -0.4604562]
+rotation = [0.40334505, 0.84749347, 0.14927927, -0.31110027]
+scale = [1.0, 1.0, 1.0]
+[entities.LocalToWorld]
+[entities.MeshRenderer]
+model = 0
+visible = true
+[entities.RigidBody]
+
+[[entities]]
+[entities.Name]
+text = "bottle 52"
+[entities.Transform]
+position = [-0.3826873, 0.054300763, -0.7727664]
+rotation = [0.6994554, -0.6996814, -0.10266573, 0.103286095]
+scale = [1.0, 1.0, 1.0]
+[entities.LocalToWorld]
+[entities.MeshRenderer]
+model = 0
+visible = true
+[entities.RigidBody]
+
+[[entities]]
+[entities.Name]
+text = "bottle 53"
+[entities.Transform]
+position = [0.13696946, 0.054374557, -0.93349546]
+rotation = [0.5440476, -0.45101032, -0.4517115, -0.544572]
+scale = [1.0, 1.0, 1.0]
+[entities.LocalToWorld]
+[entities.MeshRenderer]
+model = 0
+visible = true
+[entities.RigidBody]
+
+[[entities]]
+[entities.Name]
+text = "bottle 54"
+[entities.Transform]
+position = [1.0309952, 0.054433204, -1.1161159]
+rotation = [-0.45886022, -0.53811604, -0.53799087, 0.4587421]
+scale = [1.0, 1.0, 1.0]
+[entities.LocalToWorld]
+[entities.MeshRenderer]
+model = 0
+visible = true
+[entities.RigidBody]
+
+[[entities]]
+[entities.Name]
+text = "bottle 55"
+[entities.Transform]
+position = [-0.98169863, 0.05417741, -0.5165255]
+rotation = [0.17003413, 0.16967897, -0.68712056, -0.68568426]
+scale = [1.0, 1.0, 1.0]
+[entities.LocalToWorld]
+[entities.MeshRenderer]
+model = 0
+visible = true
+[entities.RigidBody]
+
+[[entities]]
+[entities.Name]
+text = "bottle 56"
+[entities.Transform]
+position = [-0.5970516, 0.16322908, -0.40420222]
+rotation = [-0.57407063, -0.41310608, -0.4127074, 0.57398516]
+scale = [1.0, 1.0, 1.0]
+[entities.LocalToWorld]
+[entities.MeshRenderer]
+model = 0
+visible = true
+[entities.RigidBody]
+
+[[entities]]
+[entities.Name]
+text = "bottle 57"
+[entities.Transform]
+position = [-0.050250042, 0.30732176, -0.4114449]
+rotation = [0.20453636, 0.6841209, -0.6091995, -0.34499207]
+scale = [1.0, 1.0, 1.0]
+[entities.LocalToWorld]
+[entities.MeshRenderer]
+model = 0
+visible = true
+[entities.RigidBody]
+
+[[entities]]
+[entities.Name]
+text = "bottle 58"
+[entities.Transform]
+position = [0.09634632, 0.18523712, -0.41809902]
+rotation = [-0.40491632, 0.8788829, 0.034831554, -0.24978922]
+scale = [1.0, 1.0, 1.0]
+[entities.LocalToWorld]
+[entities.MeshRenderer]
+model = 0
+visible = true
+[entities.RigidBody]
+
+[[entities]]
+[entities.Name]
+text = "bottle 59"
+[entities.Transform]
+position = [0.715114, 0.1630072, -0.37041014]
+rotation = [-0.69179267, -0.6936891, 0.14181738, 0.1417966]
+scale = [1.0, 1.0, 1.0]
+[entities.LocalToWorld]
+[entities.MeshRenderer]
+model = 0
+visible = true
+[entities.RigidBody]
+
+[[entities]]
+[entities.Name]
+text = "bottle 60"
+[entities.Transform]
+position = [-0.8269464, 0.074046955, 0.19715945]
+rotation = [-0.59051436, 0.16283359, 0.39930284, -0.6821549]
+scale = [1.0, 1.0, 1.0]
+[entities.LocalToWorld]
+[entities.MeshRenderer]
+model = 0
+visible = true
+[entities.RigidBody]
+
+[[entities]]
+[entities.Name]
+text = "bottle 61"
+[entities.Transform]
+position = [-0.65483993, 0.17060542, 0.17760731]
+rotation = [-0.3624951, 0.30837262, 0.85336447, 0.21277437]
+scale = [1.0, 1.0, 1.0]
+[entities.LocalToWorld]
+[entities.MeshRenderer]
+model = 0
+visible = true
+[entities.RigidBody]
+
+[[entities]]
+[entities.Name]
+text = "bottle 62"
+[entities.Transform]
+position = [0.07423131, 0.34880415, 0.081316635]
+rotation = [0.43575442, 0.8645252, 0.17054683, 0.18337992]
+scale = [1.0, 1.0, 1.0]
+[entities.LocalToWorld]
+[entities.MeshRenderer]
+model = 0
+visible = true
+[entities.RigidBody]
+
+[[entities]]
+[entities.Name]
+text = "bottle 63"
+[entities.Transform]
+position = [0.7058032, 0.26113135, 0.28509915]
+rotation = [0.81174916, -0.34974357, -0.09235838, 0.4584898]
+scale = [1.0, 1.0, 1.0]
+[entities.LocalToWorld]
+[entities.MeshRenderer]
+model = 0
+visible = true
+[entities.RigidBody]
+
+[[entities]]
+[entities.Name]
+text = "bottle 64"
+[entities.Transform]
+position = [0.9449216, 0.053486984, -0.10190843]
+rotation = [-0.096241504, 0.09633756, 0.6987943, -0.7022416]
+scale = [1.0, 1.0, 1.0]
+[entities.LocalToWorld]
+[entities.MeshRenderer]
+model = 0
+visible = true
+[entities.RigidBody]
+
+[[entities]]
+[entities.Name]
+text = "bottle 65"
+[entities.Transform]
+position = [-0.831514, 0.05444972, 0.67238474]
+rotation = [-0.33566356, -0.62235665, 0.6223585, -0.3356668]
+scale = [1.0, 1.0, 1.0]
+[entities.LocalToWorld]
+[entities.MeshRenderer]
+model = 0
+visible = true
+[entities.RigidBody]
+
+[[entities]]
+[entities.Name]
+text = "bottle 66"
+[entities.Transform]
+position = [-0.28660363, 0.16220486, 0.62829643]
+rotation = [-0.6718797, 0.27971122, -0.25832057, -0.63530296]
+scale = [1.0, 1.0, 1.0]
+[entities.LocalToWorld]
+[entities.MeshRenderer]
+model = 0
+visible = true
+[entities.RigidBody]
+
+[[entities]]
+[entities.Name]
+text = "bottle 67"
+[entities.Transform]
+position = [-0.34190124, 0.30058178, -0.12387258]
+rotation = [-0.29818162, 0.7295575, -0.60499156, 0.11322005]
+scale = [1.0, 1.0, 1.0]
+[entities.LocalToWorld]
+[entities.MeshRenderer]
+model = 0
+visible = true
+[entities.RigidBody]
+
+[[entities]]
+[entities.Name]
+text = "bottle 68"
+[entities.Transform]
+position = [0.46234518, 0.13414809, 0.62472224]
+rotation = [-0.023654686, -0.6076952, 0.030875085, 0.7932174]
+scale = [1.0, 1.0, 1.0]
+[entities.LocalToWorld]
+[entities.MeshRenderer]
+model = 0
+visible = true
+[entities.RigidBody]
+
+[[entities]]
+[entities.Name]
+text = "bottle 69"
+[entities.Transform]
+position = [0.808026, 0.054082092, 0.12094226]
+rotation = [0.706748, 0.03301832, 0.029520212, -0.7060777]
+scale = [1.0, 1.0, 1.0]
+[entities.LocalToWorld]
+[entities.MeshRenderer]
+model = 0
+visible = true
+[entities.RigidBody]
+
+[[entities]]
+[entities.Name]
+text = "bottle 70"
+[entities.Transform]
+position = [-0.22633108, 0.04987903, 0.8856991]
+rotation = [-0.26364404, -0.65590835, 0.6566221, -0.2629134]
+scale = [1.0, 1.0, 1.0]
+[entities.LocalToWorld]
+[entities.MeshRenderer]
+model = 0
+visible = true
+[entities.RigidBody]
+
+[[entities]]
+[entities.Name]
+text = "bottle 71"
+[entities.Transform]
+position = [-0.21810795, 0.15071297, 0.7389124]
+rotation = [-0.28175598, 0.39707637, 0.06749424, -0.87085503]
+scale = [1.0, 1.0, 1.0]
+[entities.LocalToWorld]
+[entities.MeshRenderer]
+model = 0
+visible = true
+[entities.RigidBody]
+
+[[entities]]
+[entities.Name]
+text = "bottle 72"
+[entities.Transform]
+position = [0.1351074, 0.05444035, 0.9555344]
+rotation = [-0.7032452, -0.70323175, 0.073800735, 0.07392416]
+scale = [1.0, 1.0, 1.0]
+[entities.LocalToWorld]
+[entities.MeshRenderer]
+model = 0
+visible = true
+[entities.RigidBody]
+
+[[entities]]
+[entities.Name]
+text = "bottle 73"
+[entities.Transform]
+position = [0.83862907, 0.0504454, 0.4195831]
+rotation = [0.5637253, 0.43283165, -0.427435, 0.5587216]
+scale = [1.0, 1.0, 1.0]
+[entities.LocalToWorld]
+[entities.MeshRenderer]
+model = 0
+visible = true
+[entities.RigidBody]
+
+[[entities]]
+[entities.Name]
+text = "bottle 74"
+[entities.Transform]
+position = [0.5147823, 0.053683486, 0.34066397]
+rotation = [0.36670935, 0.3628712, 0.60629493, 0.6051903]
+scale = [1.0, 1.0, 1.0]
+[entities.LocalToWorld]
+[entities.MeshRenderer]
+model = 0
+visible = true
+[entities.RigidBody]
+
+[[entities]]
+[entities.Name]
+text = "bottle 75"
+[entities.Transform]
+position = [-1.1882892, 0.05444969, -0.6655642]
+rotation = [0.5129946, -0.51299745, -0.4866586, 0.48665565]
+scale = [1.0, 1.0, 1.0]
+[entities.LocalToWorld]
+[entities.MeshRenderer]
+model = 0
+visible = true
+[entities.RigidBody]
+
+[[entities]]
+[entities.Name]
+text = "bottle 76"
+[entities.Transform]
+position = [-0.29140306, 0.05429245, -1.114779]
+rotation = [0.5523397, 0.55106527, -0.4415025, -0.4430843]
+scale = [1.0, 1.0, 1.0]
+[entities.LocalToWorld]
+[entities.MeshRenderer]
+model = 0
+visible = true
+[entities.RigidBody]
+
+[[entities]]
+[entities.Name]
+text = "bottle 77"
+[entities.Transform]
+position = [-0.08181043, 0.13022794, -0.77234876]
+rotation = [-0.7722058, -0.00010482769, -0.6353714, -0.0011366103]
+scale = [1.0, 1.0, 1.0]
+[entities.LocalToWorld]
+[entities.MeshRenderer]
+model = 0
+visible = true
+[entities.RigidBody]
+
+[[entities]]
+[entities.Name]
+text = "bottle 78"
+[entities.Transform]
+position = [0.038303312, 0.13019685, -0.79363835]
+rotation = [-0.00013848029, 0.23410062, -0.00010990526, 0.97221243]
+scale = [1.0, 1.0, 1.0]
+[entities.LocalToWorld]
+[entities.MeshRenderer]
+model = 0
+visible = true
+[entities.RigidBody]
+
+[[entities]]
+[entities.Name]
+text = "bottle 79"
+[entities.Transform]
+position = [0.8143955, 0.054433253, -1.0070897]
+rotation = [0.5805178, -0.40391016, -0.40373152, -0.58039355]
+scale = [1.0, 1.0, 1.0]
+[entities.LocalToWorld]
+[entities.MeshRenderer]
+model = 0
+visible = true
+[entities.RigidBody]
+
+[[entities]]
+[entities.Name]
+text = "bottle 80"
+[entities.Transform]
+position = [-0.4468787, 0.12873973, -0.62174344]
+rotation = [0.0008036716, 0.08608384, 0.012870679, 0.9962045]
+scale = [1.0, 1.0, 1.0]
+[entities.LocalToWorld]
+[entities.MeshRenderer]
+model = 0
+visible = true
+[entities.RigidBody]
+
+[[entities]]
+[entities.Name]
+text = "bottle 81"
+[entities.Transform]
+position = [-0.36371264, 0.12057962, -0.92071384]
+rotation = [-0.27188808, 0.4081749, -0.804674, -0.3346188]
+scale = [1.0, 1.0, 1.0]
+[entities.LocalToWorld]
+[entities.MeshRenderer]
+model = 0
+visible = true
+[entities.RigidBody]
+
+[[entities]]
+[entities.Name]
+text = "bottle 82"
+[entities.Transform]
+position = [0.3753556, 0.107926324, -0.7136123]
+rotation = [-0.5789654, -0.72500217, 0.16042303, -0.3368017]
+scale = [1.0, 1.0, 1.0]
+[entities.LocalToWorld]
+[entities.MeshRenderer]
+model = 0
+visible = true
+[entities.RigidBody]
+
+[[entities]]
+[entities.Name]
+text = "bottle 83"
+[entities.Transform]
+position = [0.4926554, 0.16200495, -0.34205097]
+rotation = [0.60635865, 0.60956615, 0.3597071, 0.36244893]
+scale = [1.0, 1.0, 1.0]
+[entities.LocalToWorld]
+[entities.MeshRenderer]
+model = 0
+visible = true
+[entities.RigidBody]
+
+[[entities]]
+[entities.Name]
+text = "bottle 84"
+[entities.Transform]
+position = [0.56665206, 0.13170153, -0.71400994]
+rotation = [-0.42769796, 0.03638077, -0.1522549, -0.8902636]
+scale = [1.0, 1.0, 1.0]
+[entities.LocalToWorld]
+[entities.MeshRenderer]
+model = 0
+visible = true
+[entities.RigidBody]
+
+[[entities]]
+[entities.Name]
+text = "bottle 85"
+[entities.Transform]
+position = [-1.0458652, 0.054434404, -0.19206728]
+rotation = [-0.5417462, -0.54656196, 0.45935422, 0.4435931]
+scale = [1.0, 1.0, 1.0]
+[entities.LocalToWorld]
+[entities.MeshRenderer]
+model = 0
+visible = true
+[entities.RigidBody]
+
+[[entities]]
+[entities.Name]
+text = "bottle 86"
+[entities.Transform]
+position = [-1.0394511, 0.063973136, 0.011415866]
+rotation = [-0.46305394, -0.44531065, -0.5369629, 0.54676336]
+scale = [1.0, 1.0, 1.0]
+[entities.LocalToWorld]
+[entities.MeshRenderer]
+model = 0
+visible = true
+[entities.RigidBody]
+
+[[entities]]
+[entities.Name]
+text = "bottle 87"
+[entities.Transform]
+position = [-0.11284157, 0.3502665, -0.22292727]
+rotation = [-0.37306455, 0.73427224, -0.56701624, 0.012639012]
+scale = [1.0, 1.0, 1.0]
+[entities.LocalToWorld]
+[entities.MeshRenderer]
+model = 0
+visible = true
+[entities.RigidBody]
+
+[[entities]]
+[entities.Name]
+text = "bottle 88"
+[entities.Transform]
+position = [0.31294802, 0.13160647, -0.2718764]
+rotation = [0.0070918426, 0.27732933, -0.46050844, 0.8431904]
+scale = [1.0, 1.0, 1.0]
+[entities.LocalToWorld]
+[entities.MeshRenderer]
+model = 0
+visible = true
+[entities.RigidBody]
+
+[[entities]]
+[entities.Name]
+text = "bottle 89"
+[entities.Transform]
+position = [0.7810879, 0.16257371, -0.023464564]
+rotation = [0.4863392, 0.49265876, 0.50946414, 0.51108503]
+scale = [1.0, 1.0, 1.0]
+[entities.LocalToWorld]
+[entities.MeshRenderer]
+model = 0
+visible = true
+[entities.RigidBody]
+
+[[entities]]
+[entities.Name]
+text = "bottle 90"
+[entities.Transform]
+position = [-1.0762286, 0.054447714, 0.902517]
+rotation = [0.47226852, -0.4722799, -0.5262664, 0.52626795]
+scale = [1.0, 1.0, 1.0]
+[entities.LocalToWorld]
+[entities.MeshRenderer]
+model = 0
+visible = true
+[entities.RigidBody]
+
+[[entities]]
+[entities.Name]
+text = "bottle 91"
+[entities.Transform]
+position = [-0.44465366, 0.13800421, 0.5622118]
+rotation = [0.3508871, 0.8196844, -0.2678183, 0.3650607]
+scale = [1.0, 1.0, 1.0]
+[entities.LocalToWorld]
+[entities.MeshRenderer]
+model = 0
+visible = true
+[entities.RigidBody]
+
+[[entities]]
+[entities.Name]
+text = "bottle 92"
+[entities.Transform]
+position = [-0.08153705, 0.22976254, 0.54561484]
+rotation = [-0.6455015, -0.3076472, -0.63238376, -0.29794616]
+scale = [1.0, 1.0, 1.0]
+[entities.LocalToWorld]
+[entities.MeshRenderer]
+model = 0
+visible = true
+[entities.RigidBody]
+
+[[entities]]
+[entities.Name]
+text = "bottle 93"
+[entities.Transform]
+position = [0.7069016, 0.052247267, 0.62675005]
+rotation = [-0.3270463, -0.33192915, 0.620608, 0.63064224]
+scale = [1.0, 1.0, 1.0]
+[entities.LocalToWorld]
+[entities.MeshRenderer]
+model = 0
+visible = true
+[entities.RigidBody]
+
+[[entities]]
+[entities.Name]
+text = "bottle 94"
+[entities.Transform]
+position = [0.76603305, 0.13032517, 0.52541417]
+rotation = [0.6787116, 0.50174814, 0.53019094, -0.08060447]
+scale = [1.0, 1.0, 1.0]
+[entities.LocalToWorld]
+[entities.MeshRenderer]
+model = 0
+visible = true
+[entities.RigidBody]
+
+[[entities]]
+[entities.Name]
+text = "bottle 95"
+[entities.Transform]
+position = [-1.1269764, 0.05444992, 0.3691319]
+rotation = [0.541458, -0.5414585, -0.45477834, 0.45477766]
+scale = [1.0, 1.0, 1.0]
+[entities.LocalToWorld]
+[entities.MeshRenderer]
+model = 0
+visible = true
+[entities.RigidBody]
+
+[[entities]]
+[entities.Name]
+text = "bottle 96"
+[entities.Transform]
+position = [-0.3402401, 0.12617889, 0.84044236]
+rotation = [-0.14851953, -0.8349091, -0.40126258, 0.34620407]
+scale = [1.0, 1.0, 1.0]
+[entities.LocalToWorld]
+[entities.MeshRenderer]
+model = 0
+visible = true
+[entities.RigidBody]
+
+[[entities]]
+[entities.Name]
+text = "bottle 97"
+[entities.Transform]
+position = [0.29376224, 0.054306377, 1.2055408]
+rotation = [0.6797233, -0.6804732, -0.19345514, 0.19366872]
+scale = [1.0, 1.0, 1.0]
+[entities.LocalToWorld]
+[entities.MeshRenderer]
+model = 0
+visible = true
+[entities.RigidBody]
+
+[[entities]]
+[entities.Name]
+text = "bottle 98"
+[entities.Transform]
+position = [0.06505973, 0.053168133, 0.6350896]
+rotation = [-0.24084611, 0.21610416, 0.6612648, -0.67677253]
+scale = [1.0, 1.0, 1.0]
+[entities.LocalToWorld]
+[entities.MeshRenderer]
+model = 0
+visible = true
+[entities.RigidBody]
+
+[[entities]]
+[entities.Name]
+text = "bottle 99"
+[entities.Transform]
+position = [1.2979277, 0.05444399, 0.13261186]
+rotation = [-0.22652483, -0.66981554, -0.6698407, 0.22659905]
+scale = [1.0, 1.0, 1.0]
+[entities.LocalToWorld]
+[entities.MeshRenderer]
+model = 0
+visible = true
+[entities.RigidBody]
+
+[[entities]]
+[entities.Name]
+text = "character"
+[entities.Transform]
+position = [4.4962454, 0.7949999, 4.5]
+rotation = [0.0, 0.0, 0.0, 1.0]
+scale = [1.0, 1.0, 1.0]
+[entities.LocalToWorld]
+[entities.MeshRenderer]
+model = 2
+visible = true
+[entities.RigidBody]
+
+[[entities]]
+[entities.Name]
+text = "gate"
+[entities.Transform]
+position = [2.6, 0.9, 1.4040472e-29]
+rotation = [1.209803e-31, -4.408426e-28, -1.3462632e-29, 1.0]
+scale = [1.0, 1.0, 1.0]
+[entities.LocalToWorld]
+[entities.MeshRenderer]
+model = 3
+visible = true
+[entities.RigidBody]
+
+[[entities]]
+[entities.Name]
+text = "chain 0"
+[entities.Transform]
+position = [-2.6, 3.0097554, 0.0]
+rotation = [0.0, 0.0, 0.0, 1.0]
+scale = [1.0, 1.0, 1.0]
+[entities.LocalToWorld]
+[entities.MeshRenderer]
+model = 0
+visible = true
+[entities.RigidBody]
+
+[[entities]]
+[entities.Name]
+text = "chain 1"
+[entities.Transform]
+position = [-2.6, 2.689275, 0.0]
+rotation = [0.0, 0.0, 0.0, 1.0]
+scale = [1.0, 1.0, 1.0]
+[entities.LocalToWorld]
+[entities.MeshRenderer]
+model = 0
+visible = true
+[entities.RigidBody]
+
+[[entities]]
+[entities.Name]
+text = "chain 2"
+[entities.Transform]
+position = [-2.6, 2.3688047, 0.0]
+rotation = [0.0, 0.0, 0.0, 1.0]
+scale = [1.0, 1.0, 1.0]
+[entities.LocalToWorld]
+[entities.MeshRenderer]
+model = 0
+visible = true
+[entities.RigidBody]
+
+[[entities]]
+[entities.Name]
+text = "chain 3"
+[entities.Transform]
+position = [-2.6, 2.0483491, 0.0]
+rotation = [0.0, 0.0, 0.0, 1.0]
+scale = [1.0, 1.0, 1.0]
+[entities.LocalToWorld]
+[entities.MeshRenderer]
+model = 0
+visible = true
+[entities.RigidBody]

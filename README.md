@@ -117,6 +117,8 @@ layout restores it):
   every frame. Every edit goes on an undo stack: Cmd+Z and Cmd+Shift+Z, or
   the Edit menu, which counts what is there. An undo is the component's
   bytes put back, so a component whose entity has since gone is skipped.
+  (Making and deleting entities, adding and removing components are not
+  undoable yet.)
 - **Viewport** — the scene, drawn by the engine into a texture the panel
   shows at its own size (`tynima_ui_scene_texture`); the window behind is
   cleared. Hold the right mouse button over it to look, W/A/S/D and Q/E to
@@ -171,6 +173,61 @@ speed and spread are no longer constants but a `Launcher` component on a
 "launcher" entity, which the module finds again after a reload and which
 `tynima-editor --game build/macos-debug/apps/sandbox/game/sandbox_game.so`
 shows and edits like any other — an editor that has never heard of it.
+
+### Scene files
+
+A scene is a text file, in TOML — the git-native pillar of the plan, in
+its first form:
+
+```toml
+# Tynima scene
+version = 1
+
+[[entities]]
+[entities.Name]
+text = "floor"
+[entities.Transform]
+position = [0.0, -0.25, 0.0]
+rotation = [0.0, 0.0, 0.0, 1.0]
+scale = [1.0, 1.0, 1.0]
+[entities.LocalToWorld]
+[entities.MeshRenderer]
+model = 1
+visible = true
+```
+
+One entity after another, a table per component, a line per field, in an
+order that never changes for the same world, so version control diffs and
+merges it line by line. It is written from the fields reflection describes
+([`scene/scene_file.h`](engine/scene/include/tynima/scene/scene_file.h)),
+so no component needs code of its own — a game module's component saves
+like the engine's, and one nobody described is saved as its name alone and
+loaded with its defaults. Numbers are written with the fewest digits that
+read back to the same value (`std::to_chars`), so a value saved and loaded
+is the same bits, and a file saved again is the same text: the scene tests
+hold every kind of field to that round trip. Read-only and hidden fields
+are derived or runtime state and are not saved; nor are handles — a
+physics body means nothing in another run (recreating bodies from a scene
+is for the physics description that a later phase adds). Entities are
+numbered by their position in the file and an entity-valued field
+(`Parent`) names one by that number; the numbers are given again on the
+next save.
+
+The reader takes the subset of TOML the writer produces and refuses the
+rest with the line number, and it reads and checks the whole file before
+it touches the world, so a bad file changes nothing. Every component in a
+file must be registered before the file is loaded — the module that
+defines one goes in first — and the error says so by name.
+
+In the editor: File > New, Open, Save and Save as (Cmd+O, Cmd+S,
+Cmd+Shift+S; a path typed into a small dialog, since there is no native
+one yet), `--scene file.toml` to open one at start; entities are made and
+deleted from the hierarchy, components added from their defaults and
+removed from the inspector. `tynima-sandbox --save-scene pile.toml` writes
+the pile as it ended, which the editor opens with
+`--game …/sandbox_game.so` (for its `Launcher` component) — 108 entities,
+every bottle where it fell. Through the header:
+`tynima_save_scene`, `tynima_load_scene`, `tynima_clear_scene`.
 
 ### The host half of tynima.h
 

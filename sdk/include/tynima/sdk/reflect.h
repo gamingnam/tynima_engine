@@ -26,6 +26,7 @@ template <typename T> tynima_component_id register_component(const tynima_api& a
                                      field.count,  field.flags};
         }
         (void)api.describe_component(engine, id, fields, count);
+        (void)api.set_component_defaults(engine, id, type.defaults);
     }
     return id;
 }

@@ -75,6 +75,13 @@ TEST_CASE("a reflected struct lists its fields with their kinds, offsets and siz
         CHECK(f[i].offset + f[i].size <= sizeof(Probe));
         last_end = f[i].offset + f[i].size;
     }
+    // The defaults are a default-constructed instance.
+    REQUIRE(type.size == sizeof(Probe));
+    REQUIRE(type.defaults != nullptr);
+    const auto* defaults = static_cast<const Probe*>(type.defaults);
+    CHECK(defaults->weight == 1.0f);
+    CHECK(defaults->count == 0);
+    CHECK(defaults->rotation.w == 1.0f);
     CHECK(std::string(core::field_kind_name(core::FieldKind::Quat)) == "quat");
     CHECK(std::string(core::field_kind_name(core::FieldKind::Bytes)) == "bytes");
 }

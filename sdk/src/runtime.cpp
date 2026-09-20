@@ -1,3 +1,5 @@
+#include <tynima/sdk/runtime.h>
+
 #include <tynima/assets/gltf.h>
 #include <tynima/core/assert.h>
 #include <tynima/core/memory.h>
@@ -7,7 +9,6 @@
 #include <tynima/platform/time.h>
 #include <tynima/scene/components.h>
 #include <tynima/scene/systems.h>
-#include <tynima/sdk/runtime.h>
 
 #include <algorithm>
 #include <cstdio>
@@ -459,7 +460,8 @@ void Runtime::render_frame() {
                                    .height = height,
                                    .encode_srgb = !device_->swapchain_is_linear(),
                                    .view_projection = camera.view_projection(aspect),
-                                   .view_projection_jittered = camera.view_projection(aspect, scene_frame.jitter)});
+                                   .view_projection_jittered =
+                                       camera.view_projection(aspect, scene_frame.jitter)});
         post_.settings.tonemap = tonemap;
         post_.settings.bloom = bloom;
         if (!to_viewport) {
@@ -563,6 +565,20 @@ void Runtime::set_lights(const render::PointLight* lights, std::uint32_t count) 
         std::memcpy(lights_, lights, light_count_ * sizeof(render::PointLight));
     } else {
         light_count_ = 0;
+    }
+}
+
+void Runtime::clear_scene() {
+    std::vector<scene::Entity> entities;
+    world_->each_chunk_raw(
+        nullptr, 0,
+        [](void* user, const scene::ChunkView& view) {
+            auto* out = static_cast<std::vector<scene::Entity>*>(user);
+            out->insert(out->end(), view.entities, view.entities + view.count);
+        },
+        &entities);
+    for (const scene::Entity entity : entities) {
+        (void)world_->destroy(entity);
     }
 }
 
