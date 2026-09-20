@@ -12,10 +12,12 @@
 // drawn from the fields the engine describes — the editor knows no
 // component's layout), the viewport (the scene, drawn by the engine into a
 // texture the panel shows, with a fly camera: hold the right mouse button to
-// look, WASD/QE to move, Shift to hurry), and the console (the engine's log,
-// filtered). A stats panel beside the console. Every edit in the inspector
-// goes on an undo stack (Cmd+Z, Cmd+Shift+Z). The layout is remembered in
-// tynima-editor.ini; View > Reset layout puts it back.
+// look, WASD/QE to move, Shift to hurry; click to select what is under the
+// mouse, and move, rotate or scale it with the gizmo — W, E, R switch, Shift
+// snaps), and the console (the engine's log, filtered). A stats panel beside
+// the console. Every edit in the inspector or the viewport goes on an undo
+// stack (Cmd+Z, Cmd+Shift+Z). The layout is remembered in tynima-editor.ini;
+// View > Reset layout puts it back.
 #include <tynima.h>
 
 #include <imgui.h>
@@ -200,6 +202,85 @@ struct UndoStack {
     }
 };
 
+// ------------------------------------------------------------------ gizmos
+
+// A rotation from the three columns of a world matrix, scale and all: the
+// columns are made unit first (Shepperd's method on the rest).
+tynima_quat quat_from_columns(tynima_vec3 c0, tynima_vec3 c1, tynima_vec3 c2) {
+    c0 = tynima_vec3_normalize(c0);
+    c1 = tynima_vec3_normalize(c1);
+    c2 = tynima_vec3_normalize(c2);
+    // m[row][col]: the rotation matrix whose columns are the axes.
+    const float m00 = c0.x, m01 = c1.x, m02 = c2.x;
+    const float m10 = c0.y, m11 = c1.y, m12 = c2.y;
+    const float m20 = c0.z, m21 = c1.z, m22 = c2.z;
+    const float trace = m00 + m11 + m22;
+    tynima_quat q;
+    if (trace > 0.0f) {
+        const float s = std::sqrt(trace + 1.0f) * 2.0f;
+        q = {(m21 - m12) / s, (m02 - m20) / s, (m10 - m01) / s, 0.25f * s};
+    } else if (m00 > m11 && m00 > m22) {
+        const float s = std::sqrt(1.0f + m00 - m11 - m22) * 2.0f;
+        q = {0.25f * s, (m01 + m10) / s, (m02 + m20) / s, (m21 - m12) / s};
+    } else if (m11 > m22) {
+        const float s = std::sqrt(1.0f + m11 - m00 - m22) * 2.0f;
+        q = {(m01 + m10) / s, 0.25f * s, (m12 + m21) / s, (m02 - m20) / s};
+    } else {
+        const float s = std::sqrt(1.0f + m22 - m00 - m11) * 2.0f;
+        q = {(m02 + m20) / s, (m12 + m21) / s, 0.25f * s, (m10 - m01) / s};
+    }
+    return tynima_quat_normalize(q);
+}
+
+tynima_quat quat_conjugate(tynima_quat q) {
+    return {-q.x, -q.y, -q.z, q.w};
+}
+
+tynima_vec3 column(const tynima_mat4& m, int c) {
+    return tynima_vec3_make(m.m[c * 4], m.m[c * 4 + 1], m.m[c * 4 + 2]);
+}
+
+// Distance from a point to a segment, on screen.
+float segment_distance(ImVec2 p, ImVec2 a, ImVec2 b) {
+    const float abx = b.x - a.x, aby = b.y - a.y;
+    const float length_sq = abx * abx + aby * aby;
+    float t = length_sq > 0.0f ? ((p.x - a.x) * abx + (p.y - a.y) * aby) / length_sq : 0.0f;
+    t = std::clamp(t, 0.0f, 1.0f);
+    const float dx = p.x - (a.x + abx * t), dy = p.y - (a.y + aby * t);
+    return std::sqrt(dx * dx + dy * dy);
+}
+
+// Two perpendicular unit vectors around an axis: a basis for its plane.
+void plane_basis(tynima_vec3 axis, tynima_vec3* u, tynima_vec3* v) {
+    const tynima_vec3 helper =
+        std::fabs(axis.y) < 0.9f ? tynima_vec3_make(0.0f, 1.0f, 0.0f) : tynima_vec3_make(1.0f, 0.0f, 0.0f);
+    *u = tynima_vec3_normalize(tynima_vec3_cross(helper, axis));
+    *v = tynima_vec3_cross(axis, *u);
+}
+
+enum class GizmoMode { Translate, Rotate, Scale };
+
+// The handles drawn over the selected entity and dragged with the mouse.
+// Translation and rotation work along the world's axes, scale along the
+// entity's own. A drag is one undoable edit of the Transform, and the
+// change is applied in the entity's parent's space, so a child of a turned
+// parent still moves where the mouse points.
+struct Gizmo {
+    GizmoMode mode = GizmoMode::Translate;
+    int hover = -1;  // 0..2: an axis; 3: the centre (uniform scale)
+    int active = -1; // the axis being dragged
+    // The drag, from where it began.
+    tynima_transform start_transform{};
+    std::vector<std::uint8_t> start_bytes;
+    tynima_vec3 center{}; // world
+    tynima_vec3 axis{};   // world, unit
+    tynima_vec3 plane_u{}, plane_v{};
+    float start_value = 0.0f; // the axis parameter, or the angle, at the first frame
+    tynima_quat parent_rotation = tynima_quat_identity();
+    tynima_mat4 parent_matrix{};
+    bool has_parent = false;
+};
+
 // ---------------------------------------------------------------- the panels
 
 struct Editor {
@@ -209,7 +290,8 @@ struct Editor {
     Hierarchy hierarchy;
     tynima_entity selected{};
     UndoStack undo;
-    std::vector<std::uint8_t> component_snapshot; // the component being drawn, before its widgets ran
+    std::vector<std::uint8_t> frame_bytes; // the component being drawn, before its widgets ran this frame
+    std::vector<std::uint8_t> edit_bytes;  // the component as it was when the widget being edited took hold
 
     // The scene on disk: where Save goes, and the path dialog's text.
     std::string scene_path;
@@ -221,6 +303,8 @@ struct Editor {
     bool show_demo = false;
     bool reset_layout = false;
     bool quit = false;
+
+    Gizmo gizmo;
 
     // The fly camera in the viewport.
     float yaw = 0.0f, pitch = 0.0f;
@@ -247,6 +331,8 @@ struct Editor {
     void draw_hierarchy_node(const Hierarchy::Node& node, int depth);
     void draw_inspector();
     void draw_viewport();
+    void draw_viewport_overlay(const ImVec2& image_min, const ImVec2& image_size, const tynima_camera& camera,
+                               bool hovered);
     void draw_console();
     void draw_stats();
     void layout(ImGuiID dockspace);
@@ -452,8 +538,11 @@ void Editor::draw_hierarchy() {
     }
     if (selected.generation != 0 && api->entity_alive(engine, selected)) {
         ImGui::SameLine();
-        if (ImGui::SmallButton("Delete") || ImGui::IsKeyPressed(ImGuiKey_Delete, false) ||
-            (ImGui::IsWindowFocused() && ImGui::IsKeyPressed(ImGuiKey_Backspace, false))) {
+        // Delete or Backspace too, with the hierarchy focused and no text field taking keys.
+        const bool key =
+            ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows) && !ImGui::GetIO().WantTextInput &&
+            (ImGui::IsKeyPressed(ImGuiKey_Delete, false) || ImGui::IsKeyPressed(ImGuiKey_Backspace, false));
+        if (ImGui::SmallButton("Delete") || key) {
             (void)api->destroy_entity(engine, selected);
             selected = tynima_entity{};
         }
@@ -688,9 +777,11 @@ void Editor::draw_component(tynima_component_id id, const tynima_component_info&
                             info.alignment);
         return;
     }
-    // The bytes before any widget runs: what an edit begun this frame undoes to.
+    // The bytes before any widget runs this frame. An edit that begins this
+    // frame undoes to these; one that began earlier keeps the bytes it
+    // started from, since a drag changes the value a little every frame.
     const auto* bytes = static_cast<const std::uint8_t*>(data);
-    component_snapshot.assign(bytes, bytes + info.size);
+    frame_bytes.assign(bytes, bytes + info.size);
     for (uint32_t i = 0; i < field_count; ++i) {
         tynima_field field{};
         if (!api->component_field(engine, id, i, &field) || (field.flags & TYNIMA_FIELD_HIDDEN) != 0) {
@@ -702,14 +793,20 @@ void Editor::draw_component(tynima_component_id id, const tynima_component_info&
         ImGui::PushID(static_cast<int>(i));
         draw_field(field, static_cast<std::uint8_t*>(data) + field.offset);
         // An edit begins when a widget takes hold and ends when it lets go
-        // having changed something: the whole component goes on the stack.
+        // having changed something: the whole component, as it was when the
+        // widget took hold and as it is now, goes on the stack.
+        if (ImGui::IsItemActivated()) {
+            edit_bytes = frame_bytes;
+        }
         if (ImGui::IsItemDeactivatedAfterEdit()) {
-            Edit edit{.entity = selected, .component = id, .before = component_snapshot, .after = {}};
+            Edit edit{.entity = selected, .component = id, .before = edit_bytes, .after = {}};
+            if (edit.before.size() != info.size) {
+                edit.before = frame_bytes; // took hold before this editor was watching: the frame's, at least
+            }
             edit.after.assign(bytes, bytes + info.size);
             undo.push(std::move(edit));
             after_edit(selected, id);
-        } else if (ImGui::IsItemActive() &&
-                   !std::equal(component_snapshot.begin(), component_snapshot.end(), bytes)) {
+        } else if (ImGui::IsItemActive() && !std::equal(frame_bytes.begin(), frame_bytes.end(), bytes)) {
             after_edit(selected, id); // mid-drag: the body follows as the value moves
         }
         ImGui::PopID();
@@ -806,6 +903,7 @@ void Editor::draw_viewport() {
     } else {
         ImGui::TextDisabled("  no GPU: nothing to show");
     }
+    const ImVec2 image_min = ImGui::GetItemRectMin();
     const bool hovered = ImGui::IsItemHovered() || ImGui::IsWindowHovered();
 
     // The fly camera: a right-drag over the picture looks around; while it
@@ -852,12 +950,359 @@ void Editor::draw_viewport() {
             tynima_vec3_add(camera.position, tynima_vec3_scale(tynima_vec3_normalize(move), step));
         tynima_set_camera(engine, &camera);
     }
-    // A little overlay in the corner: where the camera is.
+    if (size.x >= 1.0f && size.y >= 1.0f) {
+        draw_viewport_overlay(image_min, size, camera, hovered); // without a GPU too: over the notice
+    }
+    // A little overlay in the corner: where the camera is, and the gizmo's mode.
+    static constexpr const char* kModes[] = {"move (W)", "rotate (E)", "scale (R)"};
     ImGui::SetCursorPos(ImVec2(8.0f, 8.0f));
-    ImGui::TextDisabled("%.1f, %.1f, %.1f  %.1f m/s%s", static_cast<double>(camera.position.x),
+    ImGui::TextDisabled("%.1f, %.1f, %.1f  %.1f m/s%s   %s%s", static_cast<double>(camera.position.x),
                         static_cast<double>(camera.position.y), static_cast<double>(camera.position.z),
-                        static_cast<double>(speed), looking ? "  (looking)" : "  right-drag to look");
+                        static_cast<double>(speed), looking ? "  (looking)" : "  right-drag to look",
+                        kModes[static_cast<int>(gizmo.mode)], gizmo.active >= 0 ? "  (shift snaps)" : "");
     ImGui::End();
+}
+
+// What the viewport draws over the picture: the selected entity's bounds,
+// the gizmo, and the click that selects. Screen space is the image's.
+void Editor::draw_viewport_overlay(const ImVec2& image_min, const ImVec2& image_size,
+                                   const tynima_camera& camera, bool hovered) {
+    ImDrawList* draw = ImGui::GetWindowDrawList();
+    const float aspect = image_size.x / std::max(image_size.y, 1.0f);
+    const auto project = [&](tynima_vec3 point, ImVec2* out) {
+        float ndc_x, ndc_y, depth;
+        if (!tynima_camera_project(&camera, aspect, point, &ndc_x, &ndc_y, &depth)) {
+            return false;
+        }
+        *out = ImVec2(image_min.x + (ndc_x + 1.0f) * 0.5f * image_size.x,
+                      image_min.y + (1.0f - ndc_y) * 0.5f * image_size.y);
+        return true;
+    };
+    const ImVec2 mouse = ImGui::GetMousePos();
+    const auto mouse_ray = [&]() {
+        const float ndc_x = (mouse.x - image_min.x) / image_size.x * 2.0f - 1.0f;
+        const float ndc_y = 1.0f - (mouse.y - image_min.y) / image_size.y * 2.0f;
+        return tynima_camera_ray(&camera, aspect, ndc_x, ndc_y);
+    };
+    const bool shift =
+        api->key_down(engine, TYNIMA_KEY_LeftShift) || api->key_down(engine, TYNIMA_KEY_RightShift);
+    const bool selected_alive = selected.generation != 0 && api->entity_alive(engine, selected);
+
+    // The mode keys, while the mouse is over the picture and not looking.
+    if (hovered && !looking && !ImGui::GetIO().WantTextInput) {
+        if (ImGui::IsKeyPressed(ImGuiKey_W, false))
+            gizmo.mode = GizmoMode::Translate;
+        if (ImGui::IsKeyPressed(ImGuiKey_E, false))
+            gizmo.mode = GizmoMode::Rotate;
+        if (ImGui::IsKeyPressed(ImGuiKey_R, false))
+            gizmo.mode = GizmoMode::Scale;
+    }
+
+    // The selection's bounds: the model's box through the world matrix.
+    auto* local_to_world = selected_alive ? static_cast<const tynima_local_to_world*>(api->get_component(
+                                                engine, selected, components.local_to_world))
+                                          : nullptr;
+    const auto* renderer = selected_alive ? static_cast<const tynima_mesh_renderer*>(api->get_component(
+                                                engine, selected, components.mesh_renderer))
+                                          : nullptr;
+    tynima_vec3 lo, hi;
+    if (local_to_world != nullptr && renderer != nullptr &&
+        tynima_model_bounds(engine, renderer->model, &lo, &hi)) {
+        ImVec2 corners[8];
+        bool visible = true;
+        for (int i = 0; i < 8; ++i) {
+            const tynima_vec3 local =
+                tynima_vec3_make((i & 1) ? hi.x : lo.x, (i & 2) ? hi.y : lo.y, (i & 4) ? hi.z : lo.z);
+            const tynima_mat4& m = local_to_world->matrix;
+            const tynima_vec3 world =
+                tynima_vec3_add(tynima_vec3_add(tynima_vec3_add(tynima_vec3_scale(column(m, 0), local.x),
+                                                                tynima_vec3_scale(column(m, 1), local.y)),
+                                                tynima_vec3_scale(column(m, 2), local.z)),
+                                column(m, 3));
+            visible = visible && project(world, &corners[i]);
+        }
+        if (visible) {
+            static constexpr int kEdges[12][2] = {{0, 1}, {2, 3}, {4, 5}, {6, 7}, {0, 2}, {1, 3},
+                                                  {4, 6}, {5, 7}, {0, 4}, {1, 5}, {2, 6}, {3, 7}};
+            for (const auto& edge : kEdges) {
+                draw->AddLine(corners[edge[0]], corners[edge[1]], IM_COL32(255, 200, 60, 160), 1.0f);
+            }
+        }
+    }
+
+    // The gizmo, for an entity with a transform.
+    auto* transform =
+        selected_alive
+            ? static_cast<tynima_transform*>(api->get_component(engine, selected, components.transform))
+            : nullptr;
+    bool over_gizmo = false;
+    if (transform != nullptr && !looking) {
+        const tynima_vec3 center =
+            local_to_world != nullptr ? column(local_to_world->matrix, 3) : transform->position;
+        float depth = 0.0f;
+        ImVec2 center_screen;
+        const bool center_visible = project(center, &center_screen);
+        if (center_visible) {
+            tynima_camera_project(&camera, aspect, center, nullptr, nullptr, &depth);
+        }
+        // A size that looks the same at any distance: a fixed fraction of the view.
+        const float size = depth * std::tan(0.5f * camera.fov_y) * 0.25f;
+        tynima_vec3 axes[3] = {tynima_vec3_make(1.0f, 0.0f, 0.0f), tynima_vec3_make(0.0f, 1.0f, 0.0f),
+                               tynima_vec3_make(0.0f, 0.0f, 1.0f)};
+        if (gizmo.mode == GizmoMode::Scale && local_to_world != nullptr) {
+            for (int i = 0; i < 3; ++i) {
+                axes[i] = tynima_vec3_normalize(column(local_to_world->matrix, i));
+            }
+        }
+        static constexpr ImU32 kAxisColors[3] = {IM_COL32(235, 70, 70, 255), IM_COL32(90, 210, 90, 255),
+                                                 IM_COL32(80, 140, 240, 255)};
+        static constexpr ImU32 kHot = IM_COL32(255, 230, 80, 255);
+        constexpr float kHitDistance = 9.0f; // points
+
+        // Hover: the nearest handle to the mouse, if any is near enough.
+        if (gizmo.active < 0) {
+            gizmo.hover = -1;
+            float best = kHitDistance;
+            if (center_visible && hovered) {
+                for (int i = 0; i < 3; ++i) {
+                    if (gizmo.mode == GizmoMode::Rotate) {
+                        tynima_vec3 u, v;
+                        plane_basis(axes[i], &u, &v);
+                        ImVec2 previous;
+                        bool have_previous = false;
+                        for (int k = 0; k <= 48; ++k) {
+                            const float angle = static_cast<float>(k) / 48.0f * 2.0f * kPi;
+                            const tynima_vec3 point = tynima_vec3_add(
+                                center,
+                                tynima_vec3_scale(tynima_vec3_add(tynima_vec3_scale(u, std::cos(angle)),
+                                                                  tynima_vec3_scale(v, std::sin(angle))),
+                                                  size));
+                            ImVec2 on_screen;
+                            const bool ok = project(point, &on_screen);
+                            if (ok && have_previous) {
+                                const float d = segment_distance(mouse, previous, on_screen);
+                                if (d < best) {
+                                    best = d;
+                                    gizmo.hover = i;
+                                }
+                            }
+                            previous = on_screen;
+                            have_previous = ok;
+                        }
+                    } else {
+                        ImVec2 tip;
+                        if (project(tynima_vec3_add(center, tynima_vec3_scale(axes[i], size)), &tip)) {
+                            const float d = segment_distance(mouse, center_screen, tip);
+                            if (d < best) {
+                                best = d;
+                                gizmo.hover = i;
+                            }
+                        }
+                    }
+                }
+                if (gizmo.mode == GizmoMode::Scale) {
+                    const float dx = mouse.x - center_screen.x, dy = mouse.y - center_screen.y;
+                    if (std::sqrt(dx * dx + dy * dy) < kHitDistance) {
+                        gizmo.hover = 3;
+                    }
+                }
+            }
+        }
+        over_gizmo = gizmo.hover >= 0;
+
+        // A drag begins on the hovered handle and ends when the button is released.
+        if (gizmo.active < 0 && gizmo.hover >= 0 && hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+            gizmo.active = gizmo.hover;
+            gizmo.start_transform = *transform;
+            const auto* bytes = reinterpret_cast<const std::uint8_t*>(transform);
+            gizmo.start_bytes.assign(bytes, bytes + sizeof(tynima_transform));
+            gizmo.center = center;
+            gizmo.axis = axes[std::min(gizmo.active, 2)];
+            plane_basis(gizmo.axis, &gizmo.plane_u, &gizmo.plane_v);
+            gizmo.has_parent = false;
+            if (const auto* parent = static_cast<const tynima_parent*>(
+                    api->get_component(engine, selected, components.parent))) {
+                if (const auto* parent_matrix = static_cast<const tynima_local_to_world*>(
+                        api->get_component(engine, parent->entity, components.local_to_world))) {
+                    gizmo.has_parent = true;
+                    gizmo.parent_matrix = parent_matrix->matrix;
+                    gizmo.parent_rotation =
+                        quat_from_columns(column(parent_matrix->matrix, 0), column(parent_matrix->matrix, 1),
+                                          column(parent_matrix->matrix, 2));
+                }
+            }
+        }
+        // Where the mouse ray meets the handle: the closest point on the axis
+        // line, or the angle in the axis's plane.
+        const auto axis_parameter = [&](tynima_vec3 c, tynima_vec3 a) {
+            const tynima_vec3 d = mouse_ray();
+            const tynima_vec3 r = tynima_vec3_sub(c, camera.position);
+            const float b = tynima_vec3_dot(a, d), cc = tynima_vec3_dot(a, r), f = tynima_vec3_dot(d, r);
+            const float denom = 1.0f - b * b;
+            return denom > 1e-6f ? (b * f - cc) / denom : 0.0f;
+        };
+        const auto plane_angle = [&](tynima_vec3 c, tynima_vec3 n, tynima_vec3 u, tynima_vec3 v,
+                                     float* angle) {
+            const tynima_vec3 d = mouse_ray();
+            const float denom = tynima_vec3_dot(d, n);
+            if (std::fabs(denom) < 1e-6f) {
+                return false;
+            }
+            const float t = tynima_vec3_dot(tynima_vec3_sub(c, camera.position), n) / denom;
+            const tynima_vec3 hit =
+                tynima_vec3_sub(tynima_vec3_add(camera.position, tynima_vec3_scale(d, t)), c);
+            *angle = std::atan2(tynima_vec3_dot(hit, v), tynima_vec3_dot(hit, u));
+            return true;
+        };
+        if (gizmo.active >= 0 && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+            // The first frame: remember where the mouse took hold.
+            if (gizmo.mode == GizmoMode::Rotate) {
+                (void)plane_angle(gizmo.center, gizmo.axis, gizmo.plane_u, gizmo.plane_v, &gizmo.start_value);
+            } else if (gizmo.active == 3) {
+                gizmo.start_value = mouse.x;
+            } else {
+                gizmo.start_value = axis_parameter(gizmo.center, gizmo.axis);
+            }
+        }
+        if (gizmo.active >= 0 && ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
+            *transform = gizmo.start_transform;
+            if (gizmo.mode == GizmoMode::Translate) {
+                float delta = axis_parameter(gizmo.center, gizmo.axis) - gizmo.start_value;
+                if (shift) {
+                    delta = std::round(delta / 0.1f) * 0.1f;
+                }
+                tynima_vec3 world_delta = tynima_vec3_scale(gizmo.axis, delta);
+                tynima_vec3 local_delta = world_delta;
+                if (gizmo.has_parent) {
+                    // Along the parent's axes, scale and all: dot with each
+                    // column over its length squared.
+                    float components_local[3];
+                    for (int i = 0; i < 3; ++i) {
+                        const tynima_vec3 c = column(gizmo.parent_matrix, i);
+                        const float length_sq = tynima_vec3_dot(c, c);
+                        components_local[i] =
+                            length_sq > 1e-12f ? tynima_vec3_dot(world_delta, c) / length_sq : 0.0f;
+                    }
+                    local_delta =
+                        tynima_vec3_make(components_local[0], components_local[1], components_local[2]);
+                }
+                transform->position = tynima_vec3_add(gizmo.start_transform.position, local_delta);
+            } else if (gizmo.mode == GizmoMode::Rotate) {
+                float angle;
+                if (plane_angle(gizmo.center, gizmo.axis, gizmo.plane_u, gizmo.plane_v, &angle)) {
+                    float delta = angle - gizmo.start_value;
+                    while (delta > kPi)
+                        delta -= 2.0f * kPi;
+                    while (delta < -kPi)
+                        delta += 2.0f * kPi;
+                    if (shift) {
+                        const float step = 15.0f * kPi / 180.0f;
+                        delta = std::round(delta / step) * step;
+                    }
+                    // About a world axis: R' = P^-1 D P R for a child of P.
+                    tynima_quat turn = tynima_quat_from_axis_angle(gizmo.axis, delta);
+                    if (gizmo.has_parent) {
+                        turn = tynima_quat_mul(tynima_quat_mul(quat_conjugate(gizmo.parent_rotation), turn),
+                                               gizmo.parent_rotation);
+                    }
+                    transform->rotation =
+                        tynima_quat_normalize(tynima_quat_mul(turn, gizmo.start_transform.rotation));
+                }
+            } else if (gizmo.active == 3) {
+                float factor = 1.0f + (mouse.x - gizmo.start_value) / 150.0f;
+                if (shift) {
+                    factor = std::round(factor / 0.1f) * 0.1f;
+                }
+                factor = std::max(factor, 0.01f);
+                transform->scale = tynima_vec3_scale(gizmo.start_transform.scale, factor);
+            } else {
+                float factor = 1.0f + (axis_parameter(gizmo.center, gizmo.axis) - gizmo.start_value) / size;
+                if (shift) {
+                    factor = std::round(factor / 0.1f) * 0.1f;
+                }
+                factor = std::max(factor, 0.01f);
+                float* scale = &transform->scale.x;
+                scale[gizmo.active] = (&gizmo.start_transform.scale.x)[gizmo.active] * factor;
+            }
+            after_edit(selected, components.transform);
+        }
+        if (gizmo.active >= 0 && !ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
+            Edit edit{.entity = selected,
+                      .component = components.transform,
+                      .before = gizmo.start_bytes,
+                      .after = {}};
+            const auto* bytes = reinterpret_cast<const std::uint8_t*>(transform);
+            edit.after.assign(bytes, bytes + sizeof(tynima_transform));
+            undo.push(std::move(edit));
+            gizmo.active = -1;
+        }
+
+        // Drawn last, over everything: the axes, and the circles or the ends.
+        if (center_visible) {
+            for (int i = 0; i < 3; ++i) {
+                const bool hot = gizmo.active == i || (gizmo.active < 0 && gizmo.hover == i);
+                const ImU32 color = hot ? kHot : kAxisColors[i];
+                if (gizmo.mode == GizmoMode::Rotate) {
+                    tynima_vec3 u, v;
+                    plane_basis(axes[i], &u, &v);
+                    ImVec2 previous;
+                    bool have_previous = false;
+                    for (int k = 0; k <= 64; ++k) {
+                        const float angle = static_cast<float>(k) / 64.0f * 2.0f * kPi;
+                        const tynima_vec3 point = tynima_vec3_add(
+                            center, tynima_vec3_scale(tynima_vec3_add(tynima_vec3_scale(u, std::cos(angle)),
+                                                                      tynima_vec3_scale(v, std::sin(angle))),
+                                                      size));
+                        ImVec2 on_screen;
+                        const bool ok = project(point, &on_screen);
+                        if (ok && have_previous) {
+                            draw->AddLine(previous, on_screen, color, hot ? 3.0f : 2.0f);
+                        }
+                        previous = on_screen;
+                        have_previous = ok;
+                    }
+                } else {
+                    ImVec2 tip;
+                    if (!project(tynima_vec3_add(center, tynima_vec3_scale(axes[i], size)), &tip)) {
+                        continue;
+                    }
+                    draw->AddLine(center_screen, tip, color, hot ? 4.0f : 2.5f);
+                    if (gizmo.mode == GizmoMode::Translate) {
+                        // An arrowhead pointing along the axis on screen.
+                        float dx = tip.x - center_screen.x, dy = tip.y - center_screen.y;
+                        const float length = std::sqrt(dx * dx + dy * dy);
+                        if (length > 1.0f) {
+                            dx /= length;
+                            dy /= length;
+                            const ImVec2 base(tip.x - dx * 12.0f, tip.y - dy * 12.0f);
+                            draw->AddTriangleFilled(tip, ImVec2(base.x - dy * 5.0f, base.y + dx * 5.0f),
+                                                    ImVec2(base.x + dy * 5.0f, base.y - dx * 5.0f), color);
+                        }
+                    } else {
+                        draw->AddRectFilled(ImVec2(tip.x - 5.0f, tip.y - 5.0f),
+                                            ImVec2(tip.x + 5.0f, tip.y + 5.0f), color);
+                    }
+                }
+            }
+            if (gizmo.mode == GizmoMode::Scale) {
+                const bool hot = gizmo.active == 3 || (gizmo.active < 0 && gizmo.hover == 3);
+                draw->AddRectFilled(ImVec2(center_screen.x - 6.0f, center_screen.y - 6.0f),
+                                    ImVec2(center_screen.x + 6.0f, center_screen.y + 6.0f),
+                                    hot ? kHot : IM_COL32(220, 220, 220, 255));
+            }
+        }
+    } else {
+        gizmo.hover = -1;
+        gizmo.active = -1;
+    }
+
+    // A click on the picture, not on a handle: select what is there, or nothing.
+    if (hovered && !looking && !over_gizmo && gizmo.active < 0 &&
+        ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+        tynima_entity hit{};
+        float distance = 0.0f;
+        selected = tynima_pick(engine, camera.position, mouse_ray(), &hit, &distance) ? hit : tynima_entity{};
+    }
 }
 
 void Editor::draw_console() {
@@ -1026,6 +1471,28 @@ int main(int argc, char** argv) {
             editor.reset_layout = false;
         }
         ImGui::DockSpaceOverViewport(dockspace, ImGui::GetMainViewport());
+        // The shortcuts, routed globally (ImGui reads Ctrl as Cmd on a Mac);
+        // a text field being edited keeps its own Cmd+Z.
+        if (ImGui::Shortcut(ImGuiMod_Ctrl | ImGuiKey_Z, ImGuiInputFlags_RouteGlobal)) {
+            editor.undo_last();
+        }
+        if (ImGui::Shortcut(ImGuiMod_Ctrl | ImGuiMod_Shift | ImGuiKey_Z, ImGuiInputFlags_RouteGlobal)) {
+            editor.redo_last();
+        }
+        if (ImGui::Shortcut(ImGuiMod_Ctrl | ImGuiKey_S, ImGuiInputFlags_RouteGlobal)) {
+            if (editor.scene_path.empty()) {
+                editor.path_dialog = Editor::PathDialog::SaveAs;
+            } else {
+                editor.save_scene(editor.scene_path);
+            }
+        }
+        if (ImGui::Shortcut(ImGuiMod_Ctrl | ImGuiMod_Shift | ImGuiKey_S, ImGuiInputFlags_RouteGlobal)) {
+            editor.path_dialog = Editor::PathDialog::SaveAs;
+        }
+        if (ImGui::Shortcut(ImGuiMod_Ctrl | ImGuiKey_O, ImGuiInputFlags_RouteGlobal)) {
+            editor.path_dialog = Editor::PathDialog::Open;
+        }
+        editor.draw_path_dialog();
         if (editor.show_hierarchy)
             editor.draw_hierarchy();
         if (editor.show_inspector)

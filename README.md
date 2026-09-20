@@ -122,7 +122,10 @@ layout restores it):
 - **Viewport** — the scene, drawn by the engine into a texture the panel
   shows at its own size (`tynima_ui_scene_texture`); the window behind is
   cleared. Hold the right mouse button over it to look, W/A/S/D and Q/E to
-  fly, Shift to hurry, the wheel to change the pace.
+  fly, Shift to hurry, the wheel to change the pace. Click to select what
+  is under the mouse (its bounds are outlined), then move, rotate or scale
+  it with the gizmo — W, E and R switch, Shift snaps to 10 cm, 15° or a
+  tenth; a click on nothing deselects.
 - **Console** — the engine's log, the last 2048 events, filtered by level and
   text; a second combo sets what the engine logs at all.
 - **Stats** — frames per second, CPU and GPU time, entities and bodies, the
@@ -173,6 +176,29 @@ speed and spread are no longer constants but a `Launcher` component on a
 "launcher" entity, which the module finds again after a reload and which
 `tynima-editor --game build/macos-debug/apps/sandbox/game/sandbox_game.so`
 shows and edits like any other — an editor that has never heard of it.
+
+### Picking and gizmos
+
+A click in the viewport asks the engine what is under it: `tynima_pick`
+casts a ray against every drawable's model bounds — each box in its own
+model space, the ray taken there through the inverse of the entity's world
+matrix, which keeps the distance along the ray the same on both sides —
+and answers with the nearest entity and how far it is. Bounds, not
+triangles: right for a click, not for a bullet. The ray itself comes from
+`tynima_camera_ray`, and `tynima_camera_project` goes the other way; both
+are inline in the header, the same projection the engine draws with, so a
+host needs no matrix library to draw over the picture.
+
+The gizmos are the editor's own, drawn with ImGui's draw list over the
+viewport: three arrows to move along the world's axes, three circles to
+rotate about them, three squares to scale along the entity's own axes and
+one in the middle for all three at once. A handle is picked by its distance
+on screen from the mouse, and a drag is solved in the world: for an arrow,
+the point on the axis nearest the mouse's ray; for a circle, where the ray
+meets the axis's plane and the angle it makes there; a move or a turn is
+then taken into the entity's parent's space, so a child of a turned parent
+still goes where the mouse points. The whole drag is one edit on the undo
+stack, and a body follows its transform as it moves.
 
 ### Scene files
 

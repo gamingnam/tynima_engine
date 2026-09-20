@@ -90,3 +90,37 @@ TEST_CASE("texture ids round-trip a handle and never collide with ImGui's invali
     CHECK(ui::ImGuiLayer::texture_id(rhi::TextureHandle{}) == 0); // the null handle is ImTextureID_Invalid
     CHECK(ui::ImGuiLayer::texture_id(rhi::TextureHandle{0, 1}) != 0);
 }
+
+TEST_CASE("Cmd+Z reaches a global shortcut through the layer") {
+    Session session;
+    auto window = platform::Window::create({.title = "ui test", .width = 640, .height = 360});
+    REQUIRE(window != nullptr);
+    ui::ImGuiLayer layer;
+    REQUIRE(layer.create(nullptr, rhi::TextureFormat::Bgra8Unorm, false));
+    platform::Input input;
+    std::vector<platform::Event> events;
+    int fired = 0;
+    for (int frame = 0; frame < 6; ++frame) {
+        platform::Input::Writer::begin_frame(input);
+        if (frame == 2) {
+            platform::Input::Writer::key(input, platform::Key::LeftSuper, true, false);
+        }
+        if (frame == 3) {
+            platform::Input::Writer::key(input, platform::Key::Z, true, false);
+        }
+        if (frame == 4) {
+            platform::Input::Writer::key(input, platform::Key::Z, false, false);
+            platform::Input::Writer::key(input, platform::Key::LeftSuper, false, false);
+        }
+        layer.begin_frame(*window, input, events, 1.0f / 60.0f);
+        ImGui::DockSpaceOverViewport(0, ImGui::GetMainViewport());
+        if (ImGui::Shortcut(ImGuiMod_Ctrl | ImGuiKey_Z, ImGuiInputFlags_RouteGlobal)) {
+            ++fired;
+        }
+        ImGui::Begin("panel");
+        ImGui::Text("hello");
+        ImGui::End();
+        layer.end_frame(*window);
+    }
+    CHECK(fired == 1);
+}

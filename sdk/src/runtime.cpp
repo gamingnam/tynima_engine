@@ -536,6 +536,12 @@ std::uint32_t Runtime::add_model(const render::ModelData& data) {
             render::destroy_model(*device_, model);
             model = render::Model{};
         }
+    } else {
+        // No GPU: nothing to draw with, but the shape is still known — what
+        // picking and bounds need, headless or not.
+        model.mesh.index_count = static_cast<std::uint32_t>(data.mesh.indices.size());
+        model.mesh.bounds_min = data.mesh.bounds_min;
+        model.mesh.bounds_max = data.mesh.bounds_max;
     }
     models_.push_back(std::move(model));
     return static_cast<std::uint32_t>(models_.size() - 1);
@@ -580,6 +586,32 @@ void Runtime::clear_scene() {
     for (const scene::Entity entity : entities) {
         (void)world_->destroy(entity);
     }
+}
+
+scene::Entity Runtime::pick(const Vec3& origin, const Vec3& direction, float& distance) const noexcept {
+    // Every drawable's bounds are in its model's space: the ray goes there
+    // through the inverse of the entity's world matrix, and t means the
+    // same distance on either side of it.
+    scene::Entity nearest;
+    float nearest_t = 3.402823466e+38f;
+    world_->each<scene::LocalToWorld, scene::MeshRenderer>(
+        [&](scene::Entity entity, scene::LocalToWorld& local_to_world, scene::MeshRenderer& renderer) {
+            const render::Model* m = model(renderer.model);
+            if (!renderer.visible || m == nullptr || m->mesh.index_count == 0) {
+                return;
+            }
+            const Mat4 to_local = inverse(local_to_world.matrix);
+            const math::Aabb bounds{m->mesh.bounds_min, m->mesh.bounds_max};
+            float t = 0.0f;
+            const Vec3 local_origin = transform_point(to_local, origin);
+            const Vec3 local_direction = transform_vector(to_local, direction);
+            if (bounds.intersects_ray(local_origin, local_direction, nearest_t, t) && t < nearest_t) {
+                nearest_t = t;
+                nearest = entity;
+            }
+        });
+    distance = nearest ? nearest_t : 0.0f;
+    return nearest;
 }
 
 platform::InputLog Runtime::recording() const {

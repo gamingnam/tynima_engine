@@ -183,6 +183,78 @@ TEST_CASE("the runtime, linked directly: frames stop at the budget, models take 
     CHECK_FALSE(runtime.created());
 }
 
+TEST_CASE("a ray picks the nearest drawable by its model's bounds, headless too") {
+    sdk::Runtime runtime;
+    sdk::RuntimeDesc desc;
+    desc.headless = true;
+    desc.max_entities = 64;
+    REQUIRE(runtime.create(desc));
+    // A unit cube's worth of bounds; the mesh itself never reaches a GPU here.
+    tynima::render::ModelData cube;
+    cube.mesh.vertices.resize(8);
+    cube.mesh.indices.resize(36);
+    cube.mesh.bounds_min = Vec3{-0.5f, -0.5f, -0.5f};
+    cube.mesh.bounds_max = Vec3{0.5f, 0.5f, 0.5f};
+    const std::uint32_t model = runtime.add_model(cube);
+    tynima_vec3 lo{}, hi{};
+    REQUIRE(tynima_model_bounds(&runtime.context(), model, &lo, &hi));
+    CHECK(lo.x == -0.5f);
+    CHECK(hi.z == 0.5f);
+    CHECK_FALSE(tynima_model_bounds(&runtime.context(), 7, &lo, &hi));
+
+    scene::World& world = runtime.world();
+    const scene::Entity near =
+        world.create(scene::Name("near"), scene::Transform{.position = {0.0f, 0.0f, 0.0f}},
+                     scene::LocalToWorld{}, scene::MeshRenderer{.model = model});
+    const scene::Entity far =
+        world.create(scene::Name("far"), scene::Transform{.position = {0.0f, 0.0f, -4.0f}},
+                     scene::LocalToWorld{}, scene::MeshRenderer{.model = model});
+    const scene::Entity aside = world.create(
+        scene::Name("aside"), scene::Transform{.position = {3.0f, 0.0f, 0.0f}, .scale = {2.0f, 2.0f, 2.0f}},
+        scene::LocalToWorld{}, scene::MeshRenderer{.model = model});
+    (void)far;
+    REQUIRE(runtime.begin_frame()); // a frame computes the world matrices
+    runtime.end_frame();
+
+    float distance = 0.0f;
+    tynima_entity hit{};
+    const tynima_vec3 origin = tynima_vec3_make(0.0f, 0.0f, 5.0f);
+    REQUIRE(tynima_pick(&runtime.context(), origin, tynima_vec3_make(0.0f, 0.0f, -1.0f), &hit, &distance));
+    CHECK(hit.index == near.index); // the first box along the ray, not the one behind it
+    CHECK(distance == doctest::Approx(4.5f));
+    // A scaled entity: the bounds scale with it, so a ray past the unit box still hits.
+    REQUIRE(tynima_pick(&runtime.context(), tynima_vec3_make(3.8f, 0.0f, 5.0f),
+                        tynima_vec3_make(0.0f, 0.0f, -1.0f), &hit, &distance));
+    CHECK(hit.index == aside.index);
+    CHECK(distance == doctest::Approx(4.0f));
+    CHECK_FALSE(tynima_pick(&runtime.context(), tynima_vec3_make(0.0f, 10.0f, 5.0f),
+                            tynima_vec3_make(0.0f, 0.0f, -1.0f), &hit, &distance));
+    // Invisible entities are not picked.
+    world.get<scene::MeshRenderer>(near)->visible = false;
+    REQUIRE(tynima_pick(&runtime.context(), origin, tynima_vec3_make(0.0f, 0.0f, -1.0f), &hit, &distance));
+    CHECK(hit.index == far.index);
+    CHECK(distance == doctest::Approx(8.5f));
+
+    // The camera helpers: a ray through the middle of the view looks down
+    // the camera's -z, and a point projects back to where it came from.
+    tynima_camera camera{};
+    tynima_get_camera(&runtime.context(), &camera);
+    camera.position = origin;
+    camera.rotation = tynima_quat_identity();
+    tynima_set_camera(&runtime.context(), &camera);
+    const tynima_vec3 middle = tynima_camera_ray(&camera, 16.0f / 9.0f, 0.0f, 0.0f);
+    CHECK(middle.z == doctest::Approx(-1.0f));
+    const tynima_vec3 corner = tynima_camera_ray(&camera, 16.0f / 9.0f, 1.0f, 1.0f);
+    float ndc_x = 0.0f, ndc_y = 0.0f, depth = 0.0f;
+    const tynima_vec3 ahead = tynima_vec3_add(origin, tynima_vec3_scale(corner, 3.0f));
+    REQUIRE(tynima_camera_project(&camera, 16.0f / 9.0f, ahead, &ndc_x, &ndc_y, &depth));
+    CHECK(ndc_x == doctest::Approx(1.0f));
+    CHECK(ndc_y == doctest::Approx(1.0f));
+    CHECK(depth == doctest::Approx(-corner.z * 3.0f));
+    CHECK_FALSE(
+        tynima_camera_project(&camera, 1.0f, tynima_vec3_make(0.0f, 0.0f, 9.0f), &ndc_x, &ndc_y, &depth));
+}
+
 TEST_CASE("the inline C math agrees with the engine's") {
     const tynima_quat yaw = tynima_quat_from_axis_angle(tynima_vec3_make(0.0f, 1.0f, 0.0f), 0.7f);
     const tynima_quat pitch = tynima_quat_from_axis_angle(tynima_vec3_make(1.0f, 0.0f, 0.0f), -0.3f);

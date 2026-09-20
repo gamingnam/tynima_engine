@@ -151,6 +151,12 @@ public:
     // Every entity destroyed. (Physics bodies are the host's, and stay.)
     void clear_scene();
 
+    // The nearest drawable entity along a ray (origin, unit direction, in
+    // world space): the first whose model's bounds the ray enters, with
+    // the distance to that face. The null entity when it hits nothing.
+    [[nodiscard]] scene::Entity pick(const math::Vec3& origin, const math::Vec3& direction,
+                                     float& distance) const noexcept;
+
     // ---- hooks ----
 
     // Called before every fixed physics step with the step's length: a

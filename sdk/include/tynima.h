@@ -22,6 +22,7 @@
  *      component queries; the built-in components as C structs; body poses
  *   5  reflection: a component's fields, read by tools and described by modules
  *   6  a component's defaults; scenes saved and loaded as text
+ *   7  picking, a model's bounds, and the camera's rays and projection inline
  */
 #ifndef TYNIMA_H
 #define TYNIMA_H
@@ -34,7 +35,7 @@
 extern "C" {
 #endif
 
-#define TYNIMA_API_VERSION 6u
+#define TYNIMA_API_VERSION 7u
 
 /* ---- engine version ---- */
 
@@ -405,6 +406,18 @@ uint64_t tynima_engine_frame_index(tynima_engine* engine);
 #define TYNIMA_NO_MODEL 0xFFFFFFFFu
 uint32_t tynima_load_model(tynima_engine* engine, const char* path);
 uint32_t tynima_model_count(tynima_engine* engine);
+/* The box around a model's mesh, in the model's own space. False for an
+ * index that is not a model, or one with nothing in it. */
+bool tynima_model_bounds(tynima_engine* engine, uint32_t model, tynima_vec3* min, tynima_vec3* max);
+
+/* ---- picking ---- */
+
+/* The nearest drawable entity along a ray (origin and unit direction in
+ * world space): the first whose model's bounds the ray enters, and how far
+ * along the ray that is. False when it hits nothing. Bounds, not
+ * triangles: enough for an editor's click, not for a bullet. */
+bool tynima_pick(tynima_engine* engine, tynima_vec3 origin, tynima_vec3 direction, tynima_entity* out,
+                 float* distance);
 
 /* ---- scenes ----
  *
@@ -618,6 +631,36 @@ static inline void tynima_quat_to_euler(tynima_quat q, float* yaw, float* pitch,
         *pitch = p;
     if (roll)
         *roll = atan2f(-u0.x, u0.y);
+}
+
+/* ---- the camera, inline: the same projection the engine draws with ----
+ *
+ * Normalized device coordinates run -1..1 across the view, x to the right
+ * and y up; `aspect` is the view's width over its height. */
+
+/* The direction, unit length, of the ray through (ndc_x, ndc_y). */
+static inline tynima_vec3 tynima_camera_ray(const tynima_camera* camera, float aspect, float ndc_x,
+                                            float ndc_y) {
+    const float tan_half_y = tanf(0.5f * camera->fov_y);
+    const tynima_vec3 view = tynima_vec3_make(ndc_x * tan_half_y * aspect, ndc_y * tan_half_y, -1.0f);
+    return tynima_vec3_normalize(tynima_quat_rotate(camera->rotation, view));
+}
+/* Where a world point lands: (ndc_x, ndc_y) and its distance along the
+ * view direction. False, with nothing written, for a point behind the
+ * camera. */
+static inline bool tynima_camera_project(const tynima_camera* camera, float aspect, tynima_vec3 point,
+                                         float* ndc_x, float* ndc_y, float* depth) {
+    const tynima_quat inverse = {-camera->rotation.x, -camera->rotation.y, -camera->rotation.z,
+                                 camera->rotation.w};
+    const tynima_vec3 view = tynima_quat_rotate(inverse, tynima_vec3_sub(point, camera->position));
+    if (view.z >= -1e-6f) {
+        return false;
+    }
+    const float tan_half_y = tanf(0.5f * camera->fov_y);
+    if (ndc_x) *ndc_x = view.x / (-view.z * tan_half_y * aspect);
+    if (ndc_y) *ndc_y = view.y / (-view.z * tan_half_y);
+    if (depth) *depth = -view.z;
+    return true;
 }
 
 #ifdef __cplusplus

@@ -53,8 +53,15 @@ struct Aabb {
     }
 
     // Slab test: does the segment origin + direction * t, t in [0, max_t],
-    // pass through the box? `direction` need not be unit length.
+    // pass through the box? `direction` need not be unit length. The second
+    // form also says where it enters (t of the first face crossed; 0 when
+    // the origin is inside).
     [[nodiscard]] bool intersects_ray(const Vec3& origin, const Vec3& direction, float max_t) const noexcept {
+        float t_enter = 0.0f;
+        return intersects_ray(origin, direction, max_t, t_enter);
+    }
+    [[nodiscard]] bool intersects_ray(const Vec3& origin, const Vec3& direction, float max_t,
+                                      float& t_enter) const noexcept {
         float t_near = 0.0f, t_far = max_t;
         const float o[3] = {origin.x, origin.y, origin.z};
         const float d[3] = {direction.x, direction.y, direction.z};
@@ -81,6 +88,7 @@ struct Aabb {
                 return false;
             }
         }
+        t_enter = t_near;
         return true;
     }
 

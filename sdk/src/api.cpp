@@ -477,6 +477,33 @@ uint32_t tynima_model_count(tynima_engine* engine) {
     return runtime != nullptr ? runtime->model_count() : 0;
 }
 
+bool tynima_model_bounds(tynima_engine* engine, uint32_t model, tynima_vec3* min, tynima_vec3* max) {
+    const Runtime* runtime = runtime_of(engine);
+    const tynima::render::Model* m = runtime != nullptr ? runtime->model(model) : nullptr;
+    if (m == nullptr || m->mesh.index_count == 0) {
+        return false;
+    }
+    if (min) *min = from_vec3(m->mesh.bounds_min);
+    if (max) *max = from_vec3(m->mesh.bounds_max);
+    return true;
+}
+
+bool tynima_pick(tynima_engine* engine, tynima_vec3 origin, tynima_vec3 direction, tynima_entity* out,
+                 float* distance) {
+    const Runtime* runtime = runtime_of(engine);
+    if (runtime == nullptr) {
+        return false;
+    }
+    float hit_distance = 0.0f;
+    const Entity entity = runtime->pick(to_vec3(origin), to_vec3(direction), hit_distance);
+    if (!entity) {
+        return false;
+    }
+    if (out) *out = from_entity(entity);
+    if (distance) *distance = hit_distance;
+    return true;
+}
+
 bool tynima_save_scene(tynima_engine* engine, const char* path) {
     Runtime* runtime = runtime_of(engine);
     if (runtime == nullptr || path == nullptr) {
