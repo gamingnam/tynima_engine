@@ -1,7 +1,6 @@
-# assets — runtime loading of cooked blobs, GPU upload, file-watch hot reload.
-# Until the cooker exists (Phase 5) this is also where glTF import and image
-# decoding live, so the sandbox can load sample models directly. Only
-# assets/ includes cgltf and stb_image.
+# assets — the runtime side of content: cooked model blobs read and uploaded
+# as they are, and the file watch that reloads one when it changes on disk.
+# Nothing here parses a source format; that is the cooker's (engine/cooker),
+# which a shipping build leaves out.
 tynima_add_module(NAME assets
-  DEPENDS core platform render scene
-  LINK    cgltf::cgltf stb::stb)
+  DEPENDS core platform rhi render)

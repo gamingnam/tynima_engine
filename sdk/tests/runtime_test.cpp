@@ -1,5 +1,8 @@
 #include <tynima.h>
 
+#include <tynima/assets/model_blob.h>
+#include <tynima/platform/file.h>
+#include <tynima/platform/time.h>
 #include <tynima/scene/components.h>
 #include <tynima/sdk/runtime.h>
 
@@ -397,4 +400,112 @@ TEST_CASE("a scene goes to a file and comes back through the public header") {
     CHECK(std::string(tynima_last_error()).find("cannot read") != std::string::npos);
     CHECK(api.entity_count(hosted.engine) == 4); // untouched
     std::remove(path.c_str());
+}
+
+namespace {
+
+// A triangle from the origin out to `scale` along x and y, as glTF text
+// with its buffer inline: the smallest source a cook needs.
+std::string triangle_gltf(const char* scale) {
+    const std::string s = scale;
+    return R"({"asset":{"version":"2.0"},"scene":0,"scenes":[{"nodes":[0]}],"nodes":[{"mesh":0}],)"
+           R"("meshes":[{"primitives":[{"attributes":{"POSITION":0}}]}],)"
+           R"("buffers":[{"byteLength":36,"uri":"data:application/octet-stream;base64,)" +
+           (s == "1" ? std::string("AAAAAAAAAAAAAAAAAACAPwAAAAAAAAAAAAAAAAAAgD8AAAAA")
+                     : std::string("AAAAAAAAAAAAAAAAAAAAQAAAAAAAAAAAAAAAAAAAAEAAAAAA")) +
+           R"("}],"bufferViews":[{"buffer":0,"byteOffset":0,"byteLength":36}],)"
+           R"("accessors":[{"bufferView":0,"componentType":5126,"count":3,"type":"VEC3",)"
+           R"("min":[0,0,0],"max":[)" +
+           s + "," + s + R"(,0]}]})";
+}
+
+std::string temp_dir() {
+    const char* dir = std::getenv("TMPDIR");
+    return std::string(dir != nullptr ? dir : "/tmp");
+}
+
+// Writes until the file's recorded time moves past what it was.
+void write_later(const std::string& path, const std::string& text) {
+    const std::uint64_t before = tynima::platform::file_write_time(path.c_str());
+    for (int attempt = 0; attempt < 1000; ++attempt) {
+        REQUIRE(tynima::platform::write_file(path.c_str(), text.data(), text.size()));
+        if (tynima::platform::file_write_time(path.c_str()) > before) {
+            return;
+        }
+        tynima::platform::sleep_ns(1'000'000);
+    }
+    FAIL("the file's write time never moved");
+}
+
+} // namespace
+
+TEST_CASE("a source model cooks on load, loads from its blob after, and reloads when either changes") {
+    const std::string dir = temp_dir() + "/tynima_runtime_model_test";
+    REQUIRE(tynima::platform::make_directories(dir.c_str()));
+    const std::string source = dir + "/tri.gltf";
+    const std::string cooked = dir + "/.cooked/tri.tymodel";
+    (void)tynima::platform::remove_file(cooked.c_str());
+    const std::string small = triangle_gltf("1");
+    REQUIRE(tynima::platform::write_file(source.c_str(), small.data(), small.size()));
+
+    sdk::Runtime runtime;
+    sdk::RuntimeDesc desc;
+    desc.headless = true;
+    desc.max_entities = 64;
+    desc.asset_poll_seconds = 0.0f; // every frame, and a change settles at once
+    REQUIRE(runtime.create(desc));
+    const std::uint32_t model = runtime.load_model(source.c_str());
+    REQUIRE(model == 0);
+    CHECK(tynima::assets::model_blob_version(cooked.c_str()) == tynima::assets::kModelBlobVersion);
+    CHECK(runtime.model(model)->mesh.index_count == 3);
+    CHECK(runtime.model(model)->mesh.bounds_max == Vec3{1.0f, 1.0f, 0.0f});
+    // The blob directly, as a shipping build would: the same shape at a new index.
+    CHECK(runtime.load_model(cooked.c_str()) == 1);
+    CHECK(runtime.model(1)->mesh.bounds_max == Vec3{1.0f, 1.0f, 0.0f});
+    // Neither a model nor a blob: refused.
+    CHECK(runtime.load_model((dir + "/tri.txt").c_str()) == sdk::Runtime::kNoModel);
+    CHECK(runtime.load_model("") == sdk::Runtime::kNoModel);
+    CHECK(runtime.model_count() == 2);
+
+    // Frames with nothing changed reload nothing.
+    for (int i = 0; i < 3; ++i) {
+        REQUIRE(runtime.begin_frame());
+        runtime.end_frame();
+    }
+    CHECK(runtime.stats().model_reloads == 0);
+
+    // The source grows: the next frames cook it again and load the new
+    // shape into the same index — and into the blob's slot too, since the
+    // blob changed underneath it.
+    write_later(source, triangle_gltf("2"));
+    for (int i = 0; i < 4 && runtime.stats().model_reloads < 2; ++i) {
+        REQUIRE(runtime.begin_frame());
+        runtime.end_frame();
+    }
+    CHECK(runtime.stats().model_reloads == 2);
+    CHECK(runtime.model(0)->mesh.bounds_max == Vec3{2.0f, 2.0f, 0.0f});
+    CHECK(runtime.model(1)->mesh.bounds_max == Vec3{2.0f, 2.0f, 0.0f});
+    CHECK(runtime.model_count() == 2);
+
+    // A source that no longer cooks keeps the model it had.
+    write_later(source, "not glTF");
+    for (int i = 0; i < 4; ++i) {
+        REQUIRE(runtime.begin_frame());
+        runtime.end_frame();
+    }
+    CHECK(runtime.stats().model_reloads == 2);
+    CHECK(runtime.model(0)->mesh.bounds_max == Vec3{2.0f, 2.0f, 0.0f});
+
+    // Cooking through the header, somewhere else.
+    REQUIRE(tynima::platform::write_file(source.c_str(), small.data(), small.size()));
+    const std::string elsewhere = dir + "/out/tri.tymodel";
+    REQUIRE_MESSAGE(tynima_cook_model(&runtime.context(), source.c_str(), elsewhere.c_str()),
+                    tynima_last_error());
+    CHECK(tynima::assets::model_blob_version(elsewhere.c_str()) == tynima::assets::kModelBlobVersion);
+    CHECK_FALSE(tynima_cook_model(&runtime.context(), (dir + "/none.glb").c_str(), elsewhere.c_str()));
+    CHECK_FALSE(tynima_cook_model(nullptr, source.c_str(), elsewhere.c_str()));
+
+    (void)tynima::platform::remove_file(elsewhere.c_str());
+    (void)tynima::platform::remove_file(cooked.c_str());
+    (void)tynima::platform::remove_file(source.c_str());
 }

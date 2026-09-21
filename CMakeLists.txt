@@ -54,6 +54,7 @@ add_subdirectory(engine/ui)
 add_subdirectory(engine/physics)
 add_subdirectory(engine/scene)
 add_subdirectory(engine/assets)
+add_subdirectory(engine/cooker)
 add_subdirectory(engine/script)
 
 # The public boundary. Everything above it talks to the engine through tynima.h.
@@ -65,3 +66,6 @@ endif()
 if(TYNIMA_BUILD_APPS)
   add_subdirectory(apps/sandbox)
 endif()
+
+# Command-line tools: the asset cooker.
+add_subdirectory(tools/cook)

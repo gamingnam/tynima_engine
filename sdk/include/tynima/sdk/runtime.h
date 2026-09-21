@@ -2,6 +2,7 @@
 
 #include <tynima.h>
 
+#include <tynima/assets/file_watch.h>
 #include <tynima/core/arena.h>
 #include <tynima/core/jobs.h>
 #include <tynima/core/log.h>
@@ -24,6 +25,7 @@
 #include <cstdint>
 #include <memory>
 #include <mutex>
+#include <string>
 #include <vector>
 
 // The runtime: everything a program needs to run the engine, in one object.
@@ -39,10 +41,11 @@
 // clock and the input — or a replay's, or a script's — and starts the UI
 // frame. The host then reads and changes the world, moves its camera and
 // draws its panels. end_frame() reloads the game module when its file has
-// changed, runs it, steps the physics at a fixed 60 Hz, updates the
-// transforms, and renders: the world's draws through the scene renderer
-// into HDR, the post stack from there to the window (or to the viewport
-// texture the host asked for), the UI over the top.
+// changed and any model whose file has, runs the module, steps the physics
+// at a fixed 60 Hz, updates the transforms, and renders: the world's draws
+// through the scene renderer into HDR, the post stack from there to the
+// window (or to the viewport texture the host asked for), the UI over the
+// top.
 namespace tynima::sdk {
 
 struct RuntimeDesc {
@@ -73,6 +76,12 @@ struct RuntimeDesc {
     // time, through the same door as a replay.
     platform::InputFrame (*scripted_input)(long frame_index, float dt, void* user) = nullptr;
     void* scripted_input_user = nullptr;
+
+    // Where a source model given to load_model() cooks to; null: a .cooked
+    // directory beside the source.
+    const char* cook_dir = nullptr;
+    // How often the models' files are looked at for a change, in seconds.
+    float asset_poll_seconds = 0.25f;
 };
 
 class Runtime {
@@ -137,7 +146,12 @@ public:
     // slot without one, so the indices are the same headless) and given the
     // index MeshRenderer::model refers to. Never freed until destroy().
     std::uint32_t add_model(const render::ModelData& data);
-    // Imports a glTF file and adds it. kNoModel with the error logged.
+    // A model from a file: a cooked blob (.tymodel), or a source (.gltf,
+    // .glb) cooked first — into cook_dir, unless a blob newer than it is
+    // there already — and loaded from the blob. kNoModel with the error
+    // logged. The file is watched from then on: when it changes (the blob,
+    // or the source, which is cooked again), the model is loaded again into
+    // the same index, and every entity drawing it shows the new one.
     static constexpr std::uint32_t kNoModel = TYNIMA_NO_MODEL;
     std::uint32_t load_model(const char* path);
     [[nodiscard]] std::uint32_t model_count() const noexcept {
@@ -190,6 +204,7 @@ public:
         float frame_ms = 0.0f;
         std::uint64_t heap_allocations = 0; // engine code's, in the last frame
         std::uint32_t game_reloads = 0;
+        std::uint32_t model_reloads = 0; // models loaded again after their file changed
     };
     [[nodiscard]] const Stats& stats() const noexcept { return stats_; }
 
@@ -197,6 +212,16 @@ private:
     struct LogRing;
     static constexpr rhi::TextureFormat kHdrFormat = rhi::TextureFormat::Rgba16Float;
 
+    // A model that came from a file, and so can come from it again.
+    struct ModelFile {
+        std::uint32_t index = 0;
+        std::string source; // empty when a blob was given directly
+        std::string cooked;
+        assets::FileWatch::Id source_watch = assets::FileWatch::kNone;
+        assets::FileWatch::Id cooked_watch = assets::FileWatch::kNone;
+    };
+    [[nodiscard]] bool load_model_file(ModelFile& file, render::Model& out);
+    void poll_models();
     void render_frame();
     void report_graph() noexcept;
     [[nodiscard]] bool ensure_viewport(std::uint32_t width, std::uint32_t height);
@@ -213,6 +238,8 @@ private:
     ui::ImGuiLayer ui_;
     render::FallbackTextures fallbacks_{};
     std::vector<render::Model> models_;
+    std::vector<ModelFile> model_files_;
+    assets::FileWatch model_watch_;
     std::unique_ptr<scene::World> world_;
     std::unique_ptr<physics::PhysicsWorld> physics_;
     std::unique_ptr<GameModule> game_;
@@ -237,6 +264,7 @@ private:
     bool platform_ours_ = false;
     bool reported_swapchain_ = false;
     bool game_reloaded_ = false;
+    bool models_reloaded_ = false;
     std::uint32_t last_culled_ = 0;
     long frame_index_ = 0;
     float dt_ = 0.0f;

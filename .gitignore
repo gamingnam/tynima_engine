@@ -13,3 +13,6 @@ compile_commands.json
 # the editor's remembered layout, and ImGui's own
 tynima-editor.ini
 imgui.ini
+
+# cooked assets, made again from their sources
+.cooked/

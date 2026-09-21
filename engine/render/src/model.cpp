@@ -22,6 +22,13 @@ bool upload_model(rhi::Device& device, const ModelData& data, const FallbackText
         out.textures.push_back(texture);
     }
 
+    resolve_materials(data.materials.data(), static_cast<std::uint32_t>(data.materials.size()), fallbacks,
+                      out);
+    return true;
+}
+
+void resolve_materials(const MaterialData* materials, std::uint32_t count, const FallbackTextures& fallbacks,
+                       Model& out) noexcept {
     auto texture_or = [&](std::int32_t index, rhi::TextureHandle fallback) -> rhi::TextureHandle {
         if (index >= 0 && static_cast<std::size_t>(index) < out.textures.size() && out.textures[index]) {
             return out.textures[index];
@@ -29,8 +36,10 @@ bool upload_model(rhi::Device& device, const ModelData& data, const FallbackText
         return fallback;
     };
 
-    out.materials.reserve(data.materials.size() + 1);
-    for (const MaterialData& m : data.materials) {
+    out.materials.clear();
+    out.materials.reserve(count + 1);
+    for (std::uint32_t i = 0; i < count; ++i) {
+        const MaterialData& m = materials[i];
         Material material;
         material.base_color_factor = m.base_color_factor;
         material.base_color = texture_or(m.base_color_image, fallbacks.white);
@@ -60,7 +69,6 @@ bool upload_model(rhi::Device& device, const ModelData& data, const FallbackText
             sub.material = 0;
         }
     }
-    return true;
 }
 
 void destroy_model(rhi::Device& device, Model& model) noexcept {

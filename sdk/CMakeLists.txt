@@ -3,4 +3,4 @@
 # module and the UI, a frame at a time) plus, later, the project CLI,
 # templates and codegen. The only thing the editor and games may see.
 tynima_add_module(NAME sdk
-  DEPENDS core platform rhi render ui physics scene assets script)
+  DEPENDS core platform rhi render ui physics scene assets cooker script)

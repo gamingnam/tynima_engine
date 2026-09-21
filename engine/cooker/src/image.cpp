@@ -1,4 +1,4 @@
-#include <tynima/assets/image.h>
+#include <tynima/cooker/image.h>
 
 #include <tynima/core/profile.h>
 
@@ -12,10 +12,10 @@
 #include <cstring>
 #include <vector>
 
-namespace tynima::assets {
+namespace tynima::cooker {
 
 bool decode_image(const void* bytes, std::size_t size, render::ImageData& out, std::string& error) {
-    TY_PROFILE_SCOPE_NAMED("assets::decode_image");
+    TY_PROFILE_SCOPE_NAMED("cooker::decode_image");
     if (bytes == nullptr || size == 0 || size > 0x7FFFFFFFu) {
         error = "empty or oversized image data";
         return false;
@@ -54,4 +54,4 @@ bool load_image_file(const char* path, render::ImageData& out, std::string& erro
     return decode_image(bytes.data(), bytes.size(), out, error);
 }
 
-} // namespace tynima::assets
+} // namespace tynima::cooker

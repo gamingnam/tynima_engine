@@ -12,9 +12,9 @@
 // primitives are imported; missing normals are computed, missing UVs are
 // zero. Materials come through as metallic-roughness parameters, and every
 // image the file references is decoded to RGBA8, tagged sRGB when a base
-// color or emissive slot uses it. Phase 5 moves this into the offline
-// cooker — a shipping build never parses glTF.
-namespace tynima::assets {
+// color or emissive slot uses it. The first step of cooking a model
+// (cook.h): a shipping build never parses glTF.
+namespace tynima::cooker {
 
 struct ImportOptions {
     // Decodes images in parallel when given; a file with several large
@@ -30,4 +30,4 @@ struct ImportOptions {
 [[nodiscard]] bool import_gltf_memory(const void* data, std::size_t size, render::ModelData& out, std::string& error,
                                       const ImportOptions& options = {});
 
-} // namespace tynima::assets
+} // namespace tynima::cooker

@@ -4,6 +4,7 @@
 // behind the same context.
 #include <tynima.h>
 
+#include <tynima/cooker/cook.h>
 #include <tynima/core/log.h>
 #include <tynima/physics/physics.h>
 #include <tynima/platform/platform.h>
@@ -477,6 +478,20 @@ uint32_t tynima_model_count(tynima_engine* engine) {
     return runtime != nullptr ? runtime->model_count() : 0;
 }
 
+bool tynima_cook_model(tynima_engine* engine, const char* source, const char* destination) {
+    Runtime* runtime = runtime_of(engine);
+    if (runtime == nullptr || source == nullptr || destination == nullptr) {
+        g_last_error = "tynima_cook_model: no engine, no source or no destination";
+        return false;
+    }
+    std::string error;
+    if (!tynima::cooker::cook_model_file(source, destination, {.jobs = &runtime->jobs()}, error)) {
+        g_last_error = error;
+        return false;
+    }
+    return true;
+}
+
 bool tynima_model_bounds(tynima_engine* engine, uint32_t model, tynima_vec3* min, tynima_vec3* max) {
     const Runtime* runtime = runtime_of(engine);
     const tynima::render::Model* m = runtime != nullptr ? runtime->model(model) : nullptr;
@@ -678,6 +693,7 @@ void tynima_get_stats(tynima_engine* engine, tynima_stats* out) {
     out->frame_ms = stats.frame_ms;
     out->heap_allocations = stats.heap_allocations;
     out->game_reloads = stats.game_reloads;
+    out->model_reloads = stats.model_reloads;
     if (tynima::rhi::Device* device = runtime->device()) {
         const tynima::rhi::Device::GpuStats gpu = device->gpu_stats();
         out->gpu_ms = static_cast<float>(gpu.frame_ms);

@@ -1,6 +1,6 @@
-#include <tynima/assets/gltf.h>
+#include <tynima/cooker/gltf.h>
 
-#include <tynima/assets/image.h>
+#include <tynima/cooker/image.h>
 #include <tynima/core/log.h>
 #include <tynima/core/profile.h>
 
@@ -13,7 +13,7 @@
 #include <initializer_list>
 #include <vector>
 
-namespace tynima::assets {
+namespace tynima::cooker {
 
 namespace {
 
@@ -350,7 +350,7 @@ bool import_parsed(cgltf_data* data, const char* path, render::ModelData& out, s
 } // namespace
 
 bool import_gltf_file(const char* path, render::ModelData& out, std::string& error, const ImportOptions& options) {
-    TY_PROFILE_SCOPE_NAMED("assets::import_gltf_file");
+    TY_PROFILE_SCOPE_NAMED("cooker::import_gltf_file");
     cgltf_options cgltf_opts{};
     cgltf_data* data = nullptr;
     const cgltf_result parsed = cgltf_parse_file(&cgltf_opts, path, &data);
@@ -363,7 +363,7 @@ bool import_gltf_file(const char* path, render::ModelData& out, std::string& err
 
 bool import_gltf_memory(const void* bytes, std::size_t size, render::ModelData& out, std::string& error,
                         const ImportOptions& options) {
-    TY_PROFILE_SCOPE_NAMED("assets::import_gltf_memory");
+    TY_PROFILE_SCOPE_NAMED("cooker::import_gltf_memory");
     cgltf_options cgltf_opts{};
     cgltf_data* data = nullptr;
     const cgltf_result parsed = cgltf_parse(&cgltf_opts, bytes, size, &data);
@@ -374,4 +374,4 @@ bool import_gltf_memory(const void* bytes, std::size_t size, render::ModelData& 
     return import_parsed(data, nullptr, out, error, options);
 }
 
-} // namespace tynima::assets
+} // namespace tynima::cooker

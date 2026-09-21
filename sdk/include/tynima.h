@@ -35,7 +35,7 @@
 extern "C" {
 #endif
 
-#define TYNIMA_API_VERSION 7u
+#define TYNIMA_API_VERSION 8u
 
 /* ---- engine version ---- */
 
@@ -400,12 +400,22 @@ uint64_t tynima_engine_frame_index(tynima_engine* engine);
 
 /* ---- models ---- */
 
-/* Loads a glTF file (.glb or .gltf), uploads it, and returns the index a
- * MeshRenderer's `model` refers to. TYNIMA_NO_MODEL on failure; the model
- * is kept, at whatever index, for the engine's lifetime. */
+/* Loads a model and returns the index a MeshRenderer's `model` refers to:
+ * a cooked model (.tymodel, what tynima-cook writes) as it is, or a glTF
+ * source (.glb, .gltf) cooked first into a .cooked directory beside it —
+ * unless a blob newer than it is there already — and loaded from that.
+ * TYNIMA_NO_MODEL on failure; the model is kept, at whatever index, for
+ * the engine's lifetime. Its file is watched from then on: when it changes
+ * (the blob, or the source, which is cooked again), the model is loaded
+ * again into the same index and every entity drawing it shows the new one;
+ * tynima_stats.model_reloads counts these. */
 #define TYNIMA_NO_MODEL 0xFFFFFFFFu
 uint32_t tynima_load_model(tynima_engine* engine, const char* path);
 uint32_t tynima_model_count(tynima_engine* engine);
+/* Cooks a glTF source into a .tymodel at `destination` (its directory made
+ * if missing), as tynima-cook would: the mesh in GPU order, every image
+ * with its mip chain. False with tynima_last_error(). */
+bool tynima_cook_model(tynima_engine* engine, const char* source, const char* destination);
 /* The box around a model's mesh, in the model's own space. False for an
  * index that is not a model, or one with nothing in it. */
 bool tynima_model_bounds(tynima_engine* engine, uint32_t model, tynima_vec3* min, tynima_vec3* max);
@@ -538,6 +548,7 @@ typedef struct tynima_stats {
     uint64_t graph_bytes_memoryless;
     uint64_t heap_allocations; /* engine code's, in the last frame: the rule says zero */
     uint32_t game_reloads;     /* how many times the game module was swapped */
+    uint32_t model_reloads;    /* how many times a model was loaded again after its file changed */
 } tynima_stats;
 void tynima_get_stats(tynima_engine* engine, tynima_stats* out);
 

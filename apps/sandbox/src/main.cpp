@@ -33,7 +33,6 @@
 // toggles shadows, K shows the lights per cluster, P toggles the point
 // lights, G bloom; T cycles the tonemapper, H the anti-aliasing, Y the
 // shading path; Escape quits.
-#include <tynima/assets/gltf.h>
 #include <tynima/core/log.h>
 #include <tynima/core/profile.h>
 #include <tynima/physics/character.h>
@@ -66,7 +65,6 @@
 namespace platform = tynima::platform;
 namespace rhi = tynima::rhi;
 namespace render = tynima::render;
-namespace assets = tynima::assets;
 namespace scene = tynima::scene;
 namespace physics = tynima::physics;
 namespace sdk = tynima::sdk;
@@ -108,11 +106,11 @@ float noise(std::uint32_t n, std::uint32_t salt) {
 
 // Every body is a box around the mesh's bounds, offset from the entity's
 // origin the way the mesh is; the entity's Transform is the body's pose.
-Pile populate_pile(scene::World& world, physics::PhysicsWorld& physics, const render::MeshData& mesh) {
+Pile populate_pile(scene::World& world, physics::PhysicsWorld& physics, const Aabb& mesh) {
     Pile pile;
-    const Vec3 size = mesh.bounds_max - mesh.bounds_min;
+    const Vec3 size = mesh.max - mesh.min;
     const Vec3 half_extents = size * 0.5f;
-    const Vec3 center = (mesh.bounds_min + mesh.bounds_max) * 0.5f;
+    const Vec3 center = (mesh.min + mesh.max) * 0.5f;
     const float spacing = std::max(size.x, size.z) * 1.4f;
     const float wave_height = size.y * 1.8f;
     const float half = static_cast<float>(Pile::kSide - 1) * 0.5f;
@@ -129,7 +127,7 @@ Pile populate_pile(scene::World& world, physics::PhysicsWorld& physics, const re
                 const float lift = noise(n, 3) * wave_height * 0.5f; // no two in a column arrive together
                 const Vec3 position{(static_cast<float>(x) - half) * spacing + shove_x,
                                     size.y * 2.0f + static_cast<float>(layer) * wave_height + lift -
-                                        mesh.bounds_min.y,
+                                        mesh.min.y,
                                     (static_cast<float>(z) - half) * spacing + shove_z};
                 // A tilt of up to ~30 degrees about a random horizontal axis, then a random yaw.
                 const float tilt_direction = noise(n, 4) * kTwoPi;
@@ -337,7 +335,7 @@ struct Rest {
 };
 
 Rest populate_rest(scene::World& world, physics::PhysicsWorld& physics, physics::BodyHandle character_body,
-                   const render::MeshData& bottle) {
+                   const Aabb& bottle) {
     Rest rest;
     rest.character_entity = world.create(
         scene::Name("character"), scene::Transform{.position = kCharacterStart}, scene::LocalToWorld{},
@@ -366,17 +364,17 @@ Rest populate_rest(scene::World& world, physics::PhysicsWorld& physics, physics:
     }
     {
         // Each bottle hangs from its top, off the bottom of the one above.
-        const Vec3 size = bottle.bounds_max - bottle.bounds_min;
-        const Vec3 center = (bottle.bounds_min + bottle.bounds_max) * 0.5f;
-        const Vec3 top{center.x, bottle.bounds_max.y, center.z};
-        const Vec3 bottom{center.x, bottle.bounds_min.y, center.z};
+        const Vec3 size = bottle.max - bottle.min;
+        const Vec3 center = (bottle.min + bottle.max) * 0.5f;
+        const Vec3 top{center.x, bottle.max.y, center.z};
+        const Vec3 bottom{center.x, bottle.min.y, center.z};
         physics::BodyHandle above;
         float hang = kChainTop.y;
         for (int i = 0; i < kChainLinks; ++i) {
             hang -= kChainGap;
             physics::BodyDesc body;
             body.shape = physics::Shape::box(size * 0.5f, center);
-            body.position = Vec3{kChainTop.x, hang - bottle.bounds_max.y, kChainTop.z};
+            body.position = Vec3{kChainTop.x, hang - bottle.max.y, kChainTop.z};
             body.mass = 0.6f;
             body.friction = 0.5f;
             const physics::BodyHandle handle = physics.create_body(body);
@@ -849,33 +847,22 @@ int main(int argc, char** argv) {
         (void)physics.create_body(floor);
     }
 
-    // The model loads on the CPU in every mode, so the headless run covers the importer too.
-    render::ModelData model_data;
-    std::string import_error;
-    const double import_start = platform::now_seconds();
-    const bool has_model =
-        assets::import_gltf_file(options.model.c_str(), model_data, import_error, {.jobs = &runtime.jobs()});
-    const render::MeshData& mesh_data = model_data.mesh;
+    // The model comes through the runtime, cooked on the way in when its
+    // blob is missing or stale, in every mode: the headless run covers the
+    // cooker and the blob reader too. Its bounds are known without a GPU.
+    const bool has_model = runtime.load_model(options.model.c_str()) == kModelBottle;
+    Aabb bottle_bounds;
     if (has_model) {
-        const Vec3 size = mesh_data.bounds_max - mesh_data.bounds_min;
-        TY_LOG_INFO("model", "%s: %zu vertices, %zu triangles, %zu submeshes, %.3f x %.3f x %.3f m",
-                    options.model.c_str(), mesh_data.vertices.size(), mesh_data.indices.size() / 3,
-                    mesh_data.submeshes.size(), static_cast<double>(size.x), static_cast<double>(size.y),
-                    static_cast<double>(size.z));
-        TY_LOG_INFO("model", "%zu materials, %zu images decoded in %.2f s", model_data.materials.size(),
-                    model_data.images.size(), platform::now_seconds() - import_start);
-        for (const render::ImageData& image : model_data.images) {
-            TY_LOG_DEBUG("model", "image %ux%u%s", image.width, image.height, image.srgb ? " sRGB" : "");
-        }
+        const render::Mesh& bottle = runtime.model(kModelBottle)->mesh;
+        bottle_bounds = {bottle.bounds_min, bottle.bounds_max};
         // The runtime's model slots, in kModel* order.
-        (void)runtime.add_model(model_data);
         (void)runtime.add_model(make_floor_model());
         (void)runtime.add_model(make_plain_model(make_capsule_mesh(kCharacterRadius, kCharacterHalfHeight),
                                                  Vec4{0.20f, 0.45f, 0.85f, 1.0f}, 0.6f));
         (void)runtime.add_model(
             make_plain_model(make_box_mesh(kGateHalf), Vec4{0.55f, 0.36f, 0.20f, 1.0f}, 0.8f));
     } else {
-        TY_LOG_WARN("model", "%s - an empty sky, then", import_error.c_str());
+        TY_LOG_WARN("model", "no %s - an empty sky, then", options.model.c_str());
     }
     TY_LOG_INFO("controls", "right-drag looks, WASD/QE fly, Shift runs, R re-drops the pile, "
                             "L launches it, Escape quits");
@@ -897,8 +884,8 @@ int main(int argc, char** argv) {
         (void)world.create(scene::Name("floor"),
                            scene::Transform{.position = Vec3{0.0f, -kFloorHalfThickness, 0.0f}},
                            scene::LocalToWorld{}, scene::MeshRenderer{.model = kModelFloor});
-        pile = populate_pile(world, physics, mesh_data);
-        rest = populate_rest(world, physics, character.body(), mesh_data);
+        pile = populate_pile(world, physics, bottle_bounds);
+        rest = populate_rest(world, physics, character.body(), bottle_bounds);
         TY_LOG_INFO("scene", "%u entities in %u archetype(s), %u chunk(s); %u bodies, %u joints",
                     world.entity_count(), world.archetype_count(), world.chunk_count(), physics.body_count(),
                     physics.joint_count());

@@ -58,6 +58,23 @@ add_library(stb INTERFACE)
 target_include_directories(stb SYSTEM INTERFACE ${stb_SOURCE_DIR})
 add_library(stb::stb ALIAS stb)
 
+# meshoptimizer: the cooker's vertex cache, overdraw and fetch ordering —
+# the ordering the GPU reads a static mesh in — and its vertex welding.
+# Offline only: nothing in a shipping build links it.
+set(MESHOPT_BUILD_DEMO OFF CACHE BOOL "" FORCE)
+set(MESHOPT_BUILD_GLTFPACK OFF CACHE BOOL "" FORCE)
+set(MESHOPT_BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
+set(MESHOPT_INSTALL OFF CACHE BOOL "" FORCE)
+FetchContent_Declare(meshoptimizer
+  URL      https://github.com/zeux/meshoptimizer/archive/refs/tags/v1.2.tar.gz
+  URL_HASH SHA256=e40f71b809cdf3361b9a4def85fd44534e8733ce29d4b943c145b76859e4c2b4
+  EXCLUDE_FROM_ALL SYSTEM)
+FetchContent_MakeAvailable(meshoptimizer)
+set_target_properties(meshoptimizer PROPERTIES FOLDER "third_party")
+if(NOT TARGET meshoptimizer::meshoptimizer)
+  add_library(meshoptimizer::meshoptimizer ALIAS meshoptimizer)
+endif()
+
 # Jolt Physics: the reference the Phase 3 solver is measured against, behind
 # physics::PhysicsWorld. Built as plain CPU physics — no GPU compute back
 # ends, no object streams, no built-in profiler or debug renderer — and

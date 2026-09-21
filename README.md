@@ -18,7 +18,8 @@ past that declaration.
 | `editor/`         | `sdk` (and Dear ImGui's headers)     | The editor — a client of the SDK, no special privileges     |
 | `sdk/`            | everything below                     | `tynima.h` C ABI and the runtime behind its host half       |
 | `engine/script/`  | `core scene assets`                  | Lua / C# bindings generated from reflection                 |
-| `engine/assets/`  | `core platform render scene`         | Runtime loading of cooked blobs, GPU upload, hot reload     |
+| `engine/cooker/`  | `core platform render assets`        | Offline: glTF import, mesh ordering, mip chains, the cook   |
+| `engine/assets/`  | `core platform rhi render`           | Runtime loading of cooked blobs, GPU upload, file watching  |
 | `engine/scene/`   | `core render physics`                | Archetype ECS, transforms, the systems that drive the rest  |
 | `engine/physics/` | `core`                               | Rigid bodies behind `PhysicsWorld`: Jolt now, ours next     |
 | `engine/ui/`      | `core platform rhi`                  | Dear ImGui, fed by `platform` and drawn through `rhi`       |
@@ -27,12 +28,14 @@ past that declaration.
 | `engine/platform/`| `core`                               | Window, input, filesystem, time, threads (wraps SDL3)       |
 | `engine/core/`    | —                                    | Allocators, containers, math, jobs, logging, reflection     |
 | `apps/sandbox/`   | any engine module                    | Engine developer's playground — a test bed, not a template  |
+| `tools/cook/`     | `core platform assets cooker`        | `tynima-cook`: the asset cooker's command line              |
 | `apps/sandbox/game/` | `tynima.h` only (headers of sdk/scene/physics/core) | The sandbox's hot-reloadable game module    |
 
 Transitive dependencies don't count: if a file includes `tynima/rhi/...`, its
 module must declare `rhi`. Nothing may depend on an app, and `editor` may depend
 on `sdk` alone. Third-party headers have one home each: SDL3 in `platform`
-and `rhi`, Jolt in `physics`, Dear ImGui in `ui` and the editor.
+and `rhi`, Jolt in `physics`, cgltf, stb and meshoptimizer in `cooker`, Dear
+ImGui in `ui` and the editor.
 
 ## Build
 
@@ -47,10 +50,12 @@ cmake --build --preset macos-debug
 ctest --preset macos-debug
 ./build/macos-debug/apps/sandbox/tynima-sandbox
 ./build/macos-debug/editor/tynima-editor --model build/macos-debug/assets/WaterBottle.glb
+./build/macos-debug/tools/cook/tynima-cook build/macos-debug/assets/ -o cooked/
 ```
 
 The sandbox loads a glTF model (a CC0 Khronos sample, downloaded into
-`build/<preset>/assets/` at configure time) with its base color texture,
+`build/<preset>/assets/` at configure time, cooked beside itself on the first
+run — see [Cooked assets](#cooked-assets-and-hot-reload)) with its base color texture,
 draws it with a reverse-Z depth buffer through SDL3 GPU with its Metal shaders
 compiled at runtime — sRGB textures sampled through sRGB formats, lighting in
 linear into a 16-bit float target, bloomed, anti-aliased and tonemapped onto
@@ -282,6 +287,43 @@ physics, the frame arena and the heap rule, replay and record — now lives
 there, and the sandbox is a client of it that keeps its own scene, its keys
 and its reports. The golden replays under `apps/sandbox/replays/` still end on
 the same hashes, so the move changed nothing about the simulation.
+
+### Cooked assets and hot reload
+
+A shipping build never parses glTF or decodes a PNG. The cooker
+([`engine/cooker`](engine/cooker)) does that once, offline, and writes a
+*cooked model* (`.tymodel`, [`engine/assets/include/tynima/assets/model_blob.h`](engine/assets/include/tynima/assets/model_blob.h)):
+the vertex buffer in the one format the pipelines read, 32-bit indices, the
+submeshes and materials, and every texture with its whole mip chain, RGBA8
+as the device samples it. Loading a blob is reading the file and a copy per
+buffer — the water bottle, 8.9 MB of glTF that took over a second to import,
+loads in 30 ms from its 90 MB blob, and in a Debug build at that. The bytes
+between: the mesh goes through meshoptimizer (identical vertices welded,
+each submesh's triangles ordered for the post-transform cache and then
+against overdraw, the vertices ordered for fetch), and the mip levels are
+box-filtered in linear light through a table, so an sRGB texture's distant
+levels are not darker than its near ones and the bytes are the same on every
+platform. The reader checks every count, offset and index against the file
+before it copies anything, so a truncated or edited blob is a message, not a
+GPU reading past a buffer, and refuses a blob of another version.
+
+`tynima-cook` ([`tools/cook`](tools/cook)) cooks files or whole directories
+(`-o` for where; by default a `.cooked/` directory beside each source, which
+`.gitignore` knows), leaves alone a blob newer than its source, and with
+`--watch` keeps going. The runtime does the same on its own: `tynima_load_model`
+takes a `.tymodel` as it is, or a `.gltf`/`.glb` that it cooks first — unless
+its blob is already newer — so the editor's `--model WaterBottle.glb` works as
+before, cooking on the first run and loading the blob on every run after.
+Either way the file is watched (an `assets::FileWatch`: a stat per file every
+quarter second, reported once the write time has held still for another — an
+exporter writing a file in pieces is not read in pieces), and when it changes
+the model is loaded again into the same index: every entity drawing it shows
+the new one, and `tynima_stats.model_reloads` counts it. Export from Blender
+over the file, or run `tynima-cook` into the blob the editor has open, and it
+changes in the viewport without a restart — the other half of the game
+module's reload. What the format leaves room for next is a block-compressed
+texture format (BC7): the same chain at a quarter of the bytes, which needs
+an encoder in the cooker and the format in both backends.
 
 ### The UI
 
@@ -688,8 +730,9 @@ python3 tools/check_layering.py --graph  # the declared graph, as Mermaid
 ```
 
 Third-party headers have one home each: SDL3 in `platform` and `rhi`, Tracy in
-`core`, cgltf and stb in `assets`, Jolt in `physics`. Everything else reaches
-them through that module's own API.
+`core`, cgltf, stb and meshoptimizer in `cooker`, Jolt in `physics`, Dear ImGui
+in `ui` and the editor. Everything else reaches them through that module's own
+API.
 
 ## Adding a module
 
@@ -707,4 +750,5 @@ depended on before it has code. Tests under `tests/` become
 MIT — see [LICENSE](LICENSE). Sample content downloaded at configure time
 (Khronos glTF-Sample-Assets) is CC0. Third-party code fetched by the build
 keeps its own license: SDL3 (zlib), doctest (MIT), Tracy (BSD-3), cgltf (MIT),
-stb (MIT / public domain), Jolt Physics (MIT).
+stb (MIT / public domain), meshoptimizer (MIT), Jolt Physics (MIT), Dear ImGui
+(MIT).

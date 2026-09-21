@@ -1,6 +1,7 @@
 #include <tynima/sdk/runtime.h>
 
-#include <tynima/assets/gltf.h>
+#include <tynima/assets/model_blob.h>
+#include <tynima/cooker/cook.h>
 #include <tynima/core/assert.h>
 #include <tynima/core/memory.h>
 #include <tynima/core/profile.h>
@@ -172,6 +173,7 @@ bool Runtime::create(const RuntimeDesc& desc) {
             TY_LOG_ERROR("game", "%s - the scene will not move", game_->last_error());
         }
     }
+    model_watch_ = assets::FileWatch(static_cast<double>(desc.asset_poll_seconds));
     events_.reserve(64); // a frame's worth; growing later would count as a frame allocation
     last_time_ = platform::now_seconds();
     last_report_ = last_time_;
@@ -203,6 +205,8 @@ void Runtime::destroy() noexcept {
         device_->destroy_texture(viewport_);
     }
     models_.clear();
+    model_files_.clear();
+    model_watch_ = assets::FileWatch();
     viewport_ = {};
     viewport_width_ = viewport_height_ = 0;
     device_.reset();
@@ -295,6 +299,8 @@ void Runtime::end_frame() {
     if (game_reloaded_) {
         ++stats_.game_reloads;
     }
+    models_reloaded_ = false;
+    poll_models(); // so do these, and they are drawn this frame
     {
         TY_PROFILE_SCOPE_NAMED("systems");
         if (game_ != nullptr) {
@@ -337,7 +343,7 @@ void Runtime::end_frame() {
                     static_cast<unsigned long long>(engine_allocations),
                     static_cast<unsigned long long>(external_allocations));
     }
-    if (frame_index_ >= 10 && engine_allocations > 0 && !game_reloaded_) {
+    if (frame_index_ >= 10 && engine_allocations > 0 && !game_reloaded_ && !models_reloaded_) {
         TY_LOG_ERROR("heap", "frame %ld: engine code made %llu heap allocation(s)", frame_index_,
                      static_cast<unsigned long long>(engine_allocations));
         TY_ASSERT(engine_allocations == 0, "a frame allocated on the heap from engine code");
@@ -548,21 +554,110 @@ std::uint32_t Runtime::add_model(const render::ModelData& data) {
 }
 
 std::uint32_t Runtime::load_model(const char* path) {
-    render::ModelData data;
-    std::string error;
-    const double start = platform::now_seconds();
-    if (!assets::import_gltf_file(path, data, error, {.jobs = jobs_.get()})) {
-        TY_LOG_ERROR("model", "%s: %s", path != nullptr ? path : "(null)", error.c_str());
+    if (path == nullptr || path[0] == '\0') {
+        TY_LOG_ERROR("model", "no path to load");
         return kNoModel;
     }
-    const Vec3 size = data.mesh.bounds_max - data.mesh.bounds_min;
+    ModelFile file;
+    file.index = static_cast<std::uint32_t>(models_.size());
+    if (cooker::is_cooked_model(path)) {
+        file.cooked = path;
+    } else if (cooker::is_model_source(path)) {
+        file.source = path;
+    } else {
+        TY_LOG_ERROR("model", "%s: not a model (.gltf, .glb) nor a cooked one (%s)", path,
+                     assets::kModelBlobExtension);
+        return kNoModel;
+    }
+    render::Model model;
+    if (!load_model_file(file, model)) {
+        return kNoModel;
+    }
+    models_.push_back(std::move(model));
+    // Watched from now: the file as it is at this moment is the baseline.
+    if (!file.source.empty()) {
+        file.source_watch = model_watch_.watch(file.source.c_str());
+    }
+    file.cooked_watch = model_watch_.watch(file.cooked.c_str());
+    model_files_.push_back(std::move(file));
+    return model_files_.back().index;
+}
+
+// Cooks the source when the blob is missing or older, loads the blob, and
+// uploads it — into `out`, leaving the model already in its slot alone
+// until this has succeeded, so a broken save keeps the last good one.
+bool Runtime::load_model_file(ModelFile& file, render::Model& out) {
+    TY_PROFILE_SCOPE_NAMED("sdk::load_model_file");
+    const double start = platform::now_seconds();
+    const char* path = !file.source.empty() ? file.source.c_str() : file.cooked.c_str();
+    std::string error;
+    bool cooked_now = false;
+    if (!file.source.empty() &&
+        !cooker::ensure_cooked(file.source.c_str(), desc_.cook_dir, {.jobs = jobs_.get()}, file.cooked, error,
+                               &cooked_now)) {
+        TY_LOG_ERROR("model", "%s: %s", path, error.c_str());
+        return false;
+    }
+    const double cooked_at = platform::now_seconds();
+    assets::CookedModel cooked;
+    if (!assets::load_model_blob_file(file.cooked.c_str(), cooked, error)) {
+        TY_LOG_ERROR("model", "%s: %s", file.cooked.c_str(), error.c_str());
+        return false;
+    }
+    out = render::Model{};
+    if (device_ != nullptr && fallbacks_.white) {
+        if (!assets::upload_cooked_model(*device_, cooked, fallbacks_, out)) {
+            TY_LOG_ERROR("model", "%s: upload failed: %s", path, platform::last_error());
+            render::destroy_model(*device_, out);
+            out = render::Model{};
+            return false;
+        }
+    } else {
+        // No GPU: nothing to draw with, but the shape is still known — what
+        // picking and bounds need, headless or not.
+        out.mesh.index_count = static_cast<std::uint32_t>(cooked.mesh.indices.size());
+        out.mesh.bounds_min = cooked.mesh.bounds_min;
+        out.mesh.bounds_max = cooked.mesh.bounds_max;
+    }
+    const Vec3 size = cooked.mesh.bounds_max - cooked.mesh.bounds_min;
+    const double now = platform::now_seconds();
     TY_LOG_INFO("model",
                 "%s: %zu vertices, %zu triangles, %zu submeshes, %zu materials, %zu images, "
-                "%.3f x %.3f x %.3f m, in %.2f s",
-                path, data.mesh.vertices.size(), data.mesh.indices.size() / 3, data.mesh.submeshes.size(),
-                data.materials.size(), data.images.size(), static_cast<double>(size.x),
-                static_cast<double>(size.y), static_cast<double>(size.z), platform::now_seconds() - start);
-    return add_model(data);
+                "%.3f x %.3f x %.3f m; %s in %.2f s",
+                path, cooked.mesh.vertices.size(), cooked.mesh.indices.size() / 3,
+                cooked.mesh.submeshes.size(), cooked.materials.size(), cooked.images.size(),
+                static_cast<double>(size.x), static_cast<double>(size.y), static_cast<double>(size.z),
+                cooked_now ? "cooked and loaded" : "loaded from the blob", now - start);
+    if (cooked_now) {
+        TY_LOG_DEBUG("model", "%s: cooked to %s in %.2f s", path, file.cooked.c_str(), cooked_at - start);
+    }
+    return true;
+}
+
+void Runtime::poll_models() {
+    assets::FileWatch::Id changed[16];
+    const std::uint32_t count = model_watch_.poll(platform::now_seconds(), changed, 16);
+    for (std::uint32_t c = 0; c < count; ++c) {
+        for (ModelFile& file : model_files_) {
+            if (file.source_watch != changed[c] && file.cooked_watch != changed[c]) {
+                continue;
+            }
+            models_reloaded_ = true; // allocates: this frame is exempt from the heap rule
+            render::Model fresh;
+            if (load_model_file(file, fresh)) {
+                if (device_ != nullptr) {
+                    render::destroy_model(*device_, models_[file.index]);
+                }
+                models_[file.index] = std::move(fresh);
+                ++stats_.model_reloads;
+                TY_LOG_INFO("model", "reloaded %s into model %u",
+                            !file.source.empty() ? file.source.c_str() : file.cooked.c_str(), file.index);
+            }
+            // What was just cooked is not news; what changed underneath, once, is done.
+            model_watch_.acknowledge(file.cooked_watch);
+            break;
+        }
+    }
 }
 
 void Runtime::set_lights(const render::PointLight* lights, std::uint32_t count) noexcept {

@@ -1390,7 +1390,8 @@ void Editor::draw_stats() {
     ImGui::Separator();
     ImGui::Text("%u entities in %u archetypes", stats.entities, stats.archetypes);
     ImGui::Text("%u bodies, %u awake", stats.bodies, stats.bodies_awake);
-    ImGui::Text("%u models, %u game module reloads", tynima_model_count(engine), stats.game_reloads);
+    ImGui::Text("%u models, %u reloaded; %u game module reloads", tynima_model_count(engine),
+                stats.model_reloads, stats.game_reloads);
     ImGui::Separator();
     ImGui::Text("frame graph: %u passes (%u culled), %u transients never leave the tile", stats.graph_passes,
                 stats.graph_culled, stats.graph_memoryless);

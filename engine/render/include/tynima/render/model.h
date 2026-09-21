@@ -85,4 +85,12 @@ void destroy_fallback_textures(rhi::Device& device, FallbackTextures& textures) 
                                 Model& out) noexcept;
 void destroy_model(rhi::Device& device, Model& model) noexcept;
 
+// Fills out.materials from `materials`, each image index resolved against
+// out.textures (a missing or failed one falls back), adds the one plain
+// material a model with none is drawn with, and clamps every submesh to a
+// material that exists. The second half of an upload, shared with the
+// cooked-model loader in assets/.
+void resolve_materials(const MaterialData* materials, std::uint32_t count, const FallbackTextures& fallbacks,
+                       Model& out) noexcept;
+
 } // namespace tynima::render
