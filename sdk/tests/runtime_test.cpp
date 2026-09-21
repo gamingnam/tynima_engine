@@ -2,7 +2,9 @@
 
 #include <tynima/assets/model_blob.h>
 #include <tynima/platform/file.h>
+#include <tynima/platform/platform.h>
 #include <tynima/platform/time.h>
+#include <tynima/render/shapes.h>
 #include <tynima/scene/components.h>
 #include <tynima/sdk/runtime.h>
 
@@ -508,4 +510,51 @@ TEST_CASE("a source model cooks on load, loads from its blob after, and reloads 
     (void)tynima::platform::remove_file(elsewhere.c_str());
     (void)tynima::platform::remove_file(cooked.c_str());
     (void)tynima::platform::remove_file(source.c_str());
+}
+
+TEST_CASE("an offscreen runtime draws into a texture and reads it back, or says it has no GPU") {
+    sdk::Runtime runtime;
+    sdk::RuntimeDesc desc;
+    desc.offscreen = true;
+    desc.width = 64;
+    desc.height = 36;
+    desc.gpu_debug = false;
+    desc.max_entities = 64;
+    REQUIRE_MESSAGE(runtime.create(desc), tynima::platform::last_error()); // with or without a device
+    CHECK(runtime.window() != nullptr);
+    std::uint8_t pixels[64 * 36 * 4] = {};
+    if (runtime.device() == nullptr) {
+        MESSAGE("no GPU device here: offscreen drawing not exercised");
+        CHECK(runtime.scene_texture(64, 36) == 0);
+        CHECK_FALSE(runtime.read_scene_texture(pixels, sizeof pixels));
+        return;
+    }
+    // A cube in front of the camera, lit; three frames, then the picture.
+    tynima::render::ModelData cube = tynima::render::plain_model(tynima::render::box_mesh(Vec3{0.5f}),
+                                                                 Vec4{0.8f, 0.3f, 0.2f, 1.0f}, 0.5f);
+    const std::uint32_t model = runtime.add_model(cube);
+    (void)runtime.world().create(scene::Transform{.position = Vec3{0.0f, 0.0f, -2.0f}}, scene::LocalToWorld{},
+                                 scene::MeshRenderer{.model = model});
+    runtime.post().settings.anti_aliasing = tynima::render::AntiAliasing::None;
+    runtime.sun.direction = normalize(Vec3{0.3f, 0.8f, 0.6f}); // on the face the camera sees
+    for (int frame = 0; frame < 3; ++frame) {
+        REQUIRE(runtime.begin_frame());
+        CHECK(runtime.scene_texture(64, 36) != 0);
+        runtime.end_frame();
+    }
+    CHECK(runtime.scene_texture_width() == 64);
+    CHECK(runtime.scene_texture_height() == 36);
+    REQUIRE(runtime.read_scene_texture(pixels, sizeof pixels));
+    CHECK_FALSE(runtime.read_scene_texture(pixels, 16)); // not the texture's size
+    // The middle pixel is the cube (warm: red well over blue), a corner the
+    // sky (cool: blue over red), and the two are not the same colour; alpha is one.
+    const std::uint8_t* middle = pixels + (std::size_t{18} * 64 + 32) * 4;
+    const std::uint8_t* corner = pixels;
+    CHECK(middle[3] == 255);
+    CHECK(corner[3] == 255);
+    CHECK(middle[0] > middle[2] + 20);
+    CHECK(corner[2] > corner[0]);
+    CHECK(middle[2] != corner[2]);
+    MESSAGE("middle ", int{middle[0]}, " ", int{middle[1]}, " ", int{middle[2]}, ", corner ", int{corner[0]},
+            " ", int{corner[1]}, " ", int{corner[2]});
 }

@@ -13,6 +13,7 @@ struct WindowDesc {
     int height = 720;  // points
     bool resizable = true;
     bool high_pixel_density = true; // ask for a Retina/HiDPI backbuffer
+    bool hidden = false;            // never shown: a tool that draws to a file, not a screen
 };
 
 // One OS window. Owns the handle; destroying the object closes the window.

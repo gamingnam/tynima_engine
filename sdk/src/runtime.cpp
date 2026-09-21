@@ -15,6 +15,7 @@
 #include <cstdio>
 #include <cstring>
 #include <string>
+#include <utility>
 
 namespace tynima::sdk {
 
@@ -82,11 +83,20 @@ bool Runtime::create(const RuntimeDesc& desc) {
     TY_LOG_INFO("runtime", "engine %s, log level %s", core::version_string(),
                 core::log_level_name(core::log_level()));
     platform_ours_ = !platform::is_initialized();
-    if (!platform::init({.headless = desc.headless})) {
+    bool platform_up = platform::init({.headless = desc.headless});
+    if (!platform_up && desc.offscreen && platform_ours_) {
+        // No display to speak of: the dummy driver will do for a window
+        // nobody sees, and the native GPU backend does not need one.
+        TY_LOG_INFO("platform", "no display (%s): drawing offscreen without one", platform::last_error());
+        platform::shutdown();
+        platform_up = platform::init({.headless = true});
+    }
+    if (!platform_up) {
         TY_LOG_ERROR("platform", "init failed: %s", platform::last_error());
         return false;
     }
-    window_ = platform::Window::create({.title = desc.title, .width = desc.width, .height = desc.height});
+    window_ = platform::Window::create(
+        {.title = desc.title, .width = desc.width, .height = desc.height, .hidden = desc.offscreen});
     if (window_ == nullptr) {
         TY_LOG_ERROR("window", "creation failed: %s", platform::last_error());
         return false;
@@ -132,7 +142,9 @@ bool Runtime::create(const RuntimeDesc& desc) {
                         rhi::backend_name(device_->backend()), device_->backend_name(),
                         rhi::shader_format_name(device_->shader_format()),
                         rhi::texture_format_name(device_->preferred_depth_format()));
-            if (!device_->attach_window(*window_)) {
+            if (desc.offscreen) {
+                TY_LOG_INFO("gpu", "offscreen: nothing is presented");
+            } else if (!device_->attach_window(*window_)) {
                 TY_LOG_ERROR("gpu", "cannot present to this window: %s", platform::last_error());
                 device_.reset();
             } else {
@@ -250,7 +262,7 @@ bool Runtime::begin_frame() {
         const platform::InputFrame& frame = desc_.replay->frames[static_cast<std::size_t>(frame_index_)];
         platform::apply_frame(frame, input_);
         dt_ = frame.dt;
-    } else if (desc_.headless) {
+    } else if (desc_.headless || desc_.offscreen) {
         dt_ = 1.0f / 60.0f;
         if (desc_.scripted_input != nullptr) {
             platform::apply_frame(desc_.scripted_input(frame_index_, dt_, desc_.scripted_input_user), input_);
@@ -398,6 +410,27 @@ std::uint64_t Runtime::scene_texture(std::uint32_t width, std::uint32_t height) 
     return ui::ImGuiLayer::texture_id(viewport_);
 }
 
+bool Runtime::read_scene_texture(std::uint8_t* rgba, std::size_t size) noexcept {
+    if (device_ == nullptr || !viewport_ || rgba == nullptr ||
+        size != std::size_t{viewport_width_} * viewport_height_ * 4) {
+        return false;
+    }
+    if (!device_->download_texture(viewport_, rgba, static_cast<std::uint32_t>(size))) {
+        TY_LOG_ERROR("gpu", "reading the viewport back failed: %s", platform::last_error());
+        return false;
+    }
+    // The texture is in the swapchain's format, which is BGRA on every
+    // backend so far; a PNG wants RGBA. Either way the bytes are sRGB: the
+    // post stack encoded them, or the hardware did.
+    const rhi::TextureFormat format = device_->swapchain_format();
+    if (format == rhi::TextureFormat::Bgra8Unorm || format == rhi::TextureFormat::Bgra8Srgb) {
+        for (std::size_t i = 0; i + 3 < size; i += 4) {
+            std::swap(rgba[i], rgba[i + 2]);
+        }
+    }
+    return true;
+}
+
 // The frame as a graph: the scene's passes into an HDR transient with a
 // depth transient beside it, the post stack from there to the window or
 // the viewport texture, and the UI over the swapchain.
@@ -409,21 +442,27 @@ void Runtime::render_frame() {
         quitting_ = true;
         return;
     }
-    if (frame->has_swapchain_image()) {
-        if (!reported_swapchain_) {
+    // Something to draw to: the window's image, or offscreen the viewport
+    // texture alone (no window, so no UI over it).
+    const bool to_viewport = viewport_requested_ && static_cast<bool>(viewport_);
+    const bool has_image = frame->has_swapchain_image();
+    if (has_image || (desc_.offscreen && to_viewport)) {
+        if (has_image && !reported_swapchain_) {
             TY_LOG_INFO("swap", "%ux%u pixels", frame->width(), frame->height());
             reported_swapchain_ = true;
         }
         render::FrameGraph& graph = *graph_;
-        const bool to_viewport = viewport_requested_ && static_cast<bool>(viewport_);
         const std::uint32_t width = to_viewport ? viewport_width_ : frame->width();
         const std::uint32_t height = to_viewport ? viewport_height_ : frame->height();
         const float aspect = static_cast<float>(width) / static_cast<float>(height);
 
         graph.begin();
-        render::GraphTexture swapchain = graph.import(
-            "swapchain", frame->swapchain_texture(),
-            {.format = device_->swapchain_format(), .width = frame->width(), .height = frame->height()});
+        render::GraphTexture swapchain;
+        if (has_image) {
+            swapchain = graph.import(
+                "swapchain", frame->swapchain_texture(),
+                {.format = device_->swapchain_format(), .width = frame->width(), .height = frame->height()});
+        }
         render::GraphTexture hdr =
             graph.create("hdr", {.format = kHdrFormat, .width = width, .height = height});
         render::GraphTexture depth = graph.create(
@@ -475,7 +514,7 @@ void Runtime::render_frame() {
         }
         // The UI over the top: over the picture, or over a cleared window
         // when the picture went to the viewport texture (which the UI shows).
-        if (to_viewport || (ui_.can_draw() && ui_.has_draw_data())) {
+        if (has_image && (to_viewport || (ui_.can_draw() && ui_.has_draw_data()))) {
             graph.add_pass(
                 "ui",
                 [&](render::PassBuilder& b) {

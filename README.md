@@ -29,6 +29,7 @@ past that declaration.
 | `engine/core/`    | —                                    | Allocators, containers, math, jobs, logging, reflection     |
 | `apps/sandbox/`   | any engine module                    | Engine developer's playground — a test bed, not a template  |
 | `tools/cook/`     | `core platform assets cooker`        | `tynima-cook`: the asset cooker's command line              |
+| `tools/golden/`   | `core platform render scene cooker sdk` | `tynima-golden`: the renderer's golden image tests       |
 | `apps/sandbox/game/` | `tynima.h` only (headers of sdk/scene/physics/core) | The sandbox's hot-reloadable game module    |
 
 Transitive dependencies don't count: if a file includes `tynima/rhi/...`, its
@@ -51,6 +52,7 @@ ctest --preset macos-debug
 ./build/macos-debug/apps/sandbox/tynima-sandbox
 ./build/macos-debug/editor/tynima-editor --model build/macos-debug/assets/WaterBottle.glb
 ./build/macos-debug/tools/cook/tynima-cook build/macos-debug/assets/ -o cooked/
+./build/macos-debug/tools/golden/tynima-golden          # the renderer's golden image tests
 ```
 
 The sandbox loads a glTF model (a CC0 Khronos sample, downloaded into
@@ -324,6 +326,31 @@ changes in the viewport without a restart — the other half of the game
 module's reload. What the format leaves room for next is a block-compressed
 texture format (BC7): the same chain at a quarter of the bytes, which needs
 an encoder in the cooker and the format in both backends.
+
+### Golden images
+
+The renderer's regression tests are pictures. `tynima-golden`
+([`tools/golden`](tools/golden)) builds each of its scenes through the
+runtime — the shapes through the forward, fused and split paths, a data view,
+the clustered point lights, TAA and FXAA, and the water bottle near to far
+when the sample is there — draws it offscreen for a few frames (a
+`RuntimeDesc::offscreen` runtime: a GPU but no window, the picture read back
+from the viewport texture) and compares the 480×270 result with the golden
+kept under [`tools/golden/goldens/`](tools/golden/goldens). The comparison is
+perceptual ([`engine/cooker/include/tynima/cooker/image_diff.h`](engine/cooker/include/tynima/cooker/image_diff.h)):
+each pixel of both images goes to OKLab, where distance is close to how
+different two colours look; a pixel differs when that distance is over 0.02,
+about the least a person notices, unless a pixel within one of it in the other
+image is close enough — an edge a GPU rasterised half a pixel over is not a
+regression, a region of wrong colour is. A scene passes when fewer than half
+a percent of its pixels differ and the mean distance stays under 0.004, so
+another GPU's rounding passes and a broken pass fails. Every render lands in
+`build/<preset>/golden/`, and a failure leaves a strip beside it: golden,
+render and a red heatmap of where they part. `ctest` runs it where a GPU is
+(and skips it where none is, as in a sandbox or on the Windows runner until
+shaders exist for it); CI keeps the renders as an artifact. After a deliberate
+change to the picture, `tynima-golden --update` writes new goldens — look at
+them before committing, since they are the definition of right.
 
 ### The UI
 

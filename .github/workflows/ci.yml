@@ -33,3 +33,12 @@ jobs:
         run: cmake --build --preset ${{ matrix.preset }}
       - name: Test
         run: ctest --preset ${{ matrix.preset }}
+      # The golden image renders, and the golden | render | heatmap strips
+      # of any that differed: what to look at when that test fails here.
+      - name: Golden renders
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: golden-${{ matrix.os }}
+          path: build/${{ matrix.preset }}/golden/
+          if-no-files-found: ignore

@@ -53,6 +53,13 @@ struct RuntimeDesc {
     int width = 1280; // points
     int height = 720;
     bool headless = false; // no window, no GPU, a fixed sixtieth of a second a frame
+    // A GPU but no window: nothing is shown or presented, and the scene is
+    // drawn only into the texture scene_texture() asks for, to be read back
+    // with read_scene_texture() — a tool that renders to a file. A fixed
+    // sixtieth of a second a frame, like headless. The platform starts with
+    // a display when there is one and on the dummy driver when not; the
+    // native backend draws either way, SDL GPU needs the display.
+    bool offscreen = false;
     rhi::Backend backend = rhi::Backend::Auto;
     bool gpu_debug =
 #ifndef NDEBUG
@@ -186,6 +193,13 @@ public:
     // of the window, and returns it as ImGui names it (ui::ImGuiLayer::texture_id).
     // 0 without a device. The window is cleared behind the UI instead.
     std::uint64_t scene_texture(std::uint32_t width, std::uint32_t height);
+    // The last picture drawn into that texture, as width x height x 4 bytes
+    // of display-encoded (sRGB) RGBA, rows top to bottom — a PNG's bytes.
+    // Waits for the GPU. False without a device or a texture, or when `size`
+    // is not the texture's.
+    [[nodiscard]] bool read_scene_texture(std::uint8_t* rgba, std::size_t size) noexcept;
+    [[nodiscard]] std::uint32_t scene_texture_width() const noexcept { return viewport_width_; }
+    [[nodiscard]] std::uint32_t scene_texture_height() const noexcept { return viewport_height_; }
 
     // ---- the record ----
 

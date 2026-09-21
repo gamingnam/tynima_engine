@@ -20,6 +20,9 @@ std::unique_ptr<Window> Window::create(const WindowDesc& desc) {
     if (desc.high_pixel_density) {
         flags |= SDL_WINDOW_HIGH_PIXEL_DENSITY;
     }
+    if (desc.hidden) {
+        flags |= SDL_WINDOW_HIDDEN;
+    }
     SDL_Window* handle = SDL_CreateWindow(desc.title, desc.width, desc.height, flags);
     if (handle == nullptr) {
         return nullptr;
