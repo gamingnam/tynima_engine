@@ -4,6 +4,7 @@
 #include <tynima/platform/file.h>
 #include <tynima/platform/time.h>
 #include <tynima/scene/components.h>
+#include <tynima/scene/systems.h>
 #include <tynima/script/vm.h>
 #include <tynima/sdk/reflect.h>
 #include <tynima/sdk/runtime.h>
@@ -100,6 +101,10 @@ TEST_CASE("a Lua script is a game module: it builds a world, runs every frame, a
 
     // The script built the world through the same table a C module gets.
     CHECK(runtime.world().entity_count() == 2);
+    // And what it built is drawable: an entity with a Transform and a mesh
+    // has the LocalToWorld the renderer collects, without the script saying so.
+    tynima::render::DrawItem draws[8];
+    CHECK(scene::collect_draws(runtime.world(), runtime.model(0), runtime.model_count(), draws, 8) == 2);
     CHECK(runtime.model_count() == 2);
     CHECK(runtime.physics().body_count() == 2);
     CHECK(runtime.sun.intensity == 4.0f);
@@ -153,6 +158,17 @@ TEST_CASE("a Lua script is a game module: it builds a world, runs every frame, a
     CHECK(out == "true\ttrue\t2"); // the world it built is still there
     REQUIRE(vm->eval("return state.frames >= 130", out));
     CHECK(out == "true");
+
+    // Naming LocalToWorld keeps the script's own: the rule fills a gap, it
+    // does not overrule. An entity with no Transform gets nothing either way,
+    // and neither is drawn — one has no mesh, the other no transform.
+    REQUIRE(vm->eval("local ty = require('tynima'); "
+                     "ty.entity{ Name = {text = 'no transform'} }; "
+                     "ty.entity{ Transform = {position = {1, 1, 1}}, LocalToWorld = {} }; "
+                     "return ty.entity_count()",
+                     out));
+    CHECK(out == "4");
+    CHECK(scene::collect_draws(runtime.world(), runtime.model(0), runtime.model_count(), draws, 8) == 2);
 
     (void)tynima::platform::remove_file(path.c_str());
 }

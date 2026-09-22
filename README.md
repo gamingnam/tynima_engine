@@ -449,6 +449,11 @@ knocks them over with Space). Save the file and it reloads within a quarter
 second, with the world it built still standing — the same file watch the
 cooked models use, and no compiler in the loop at all.
 
+An entity built from a script gets its `LocalToWorld` without asking: it is
+where the engine keeps the matrix it works out from a `Transform` and
+whatever parent it has, and what the renderer draws from, so leaving it out
+is never what a script meant. Naming it keeps the script's own.
+
 The part that is "generated from reflection" is components. The six the
 engine declares are real C structs, so `ty.get(e, "Transform").position.y = 3`
 is a store into the world's own memory. Anything else — a component a game

@@ -769,16 +769,23 @@ int main(int argc, char** argv) {
                                 Vec4{0.20f, 0.45f, 0.85f, 1.0f}, 0.6f));
         (void)runtime.add_model(
             render::plain_model(render::box_mesh(kGateHalf), Vec4{0.55f, 0.36f, 0.20f, 1.0f}, 0.8f));
-    } else {
+    } else if (options.script.empty()) {
         TY_LOG_WARN("model", "no %s - an empty sky, then", options.model.c_str());
     }
-    TY_LOG_INFO("controls", "right-drag looks, WASD/QE fly, Shift runs, R re-drops the pile, "
-                            "L launches it, Escape quits");
-    TY_LOG_INFO("controls", "F follows the character: then WASD walk it, Space jumps, Shift runs");
-    TY_LOG_INFO("controls", "1/2/3 unlit / Blinn-Phong / Cook-Torrance, N/M/O/V/B debug views, C shows the "
-                            "shadow cascades, K the lights per cluster; X toggles shadows, P the point "
-                            "lights, G bloom; T cycles the tonemapper, H the anti-aliasing, Y the shading "
-                            "path; arrows move the sun");
+    // The sandbox's own keys are the sandbox's scene; with a script the keys
+    // are whatever the script reads, so saying otherwise would be a lie.
+    if (options.script.empty()) {
+        TY_LOG_INFO("controls", "right-drag looks, WASD/QE fly, Shift runs, R re-drops the pile, "
+                                "L launches it, Escape quits");
+        TY_LOG_INFO("controls", "F follows the character: then WASD walk it, Space jumps, Shift runs");
+        TY_LOG_INFO("controls",
+                    "1/2/3 unlit / Blinn-Phong / Cook-Torrance, N/M/O/V/B debug views, C shows the "
+                    "shadow cascades, K the lights per cluster; X toggles shadows, P the point "
+                    "lights, G bloom; T cycles the tonemapper, H the anti-aliasing, Y the shading "
+                    "path; arrows move the sun");
+    } else {
+        TY_LOG_INFO("controls", "the keys are %s's; save it and it reloads", options.script.c_str());
+    }
 
     // The scene: the floor and a pile of the model, every one a rigid body.
     // The character stands at the edge of the pile; the gate and the chain

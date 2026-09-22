@@ -298,8 +298,21 @@ ty.fill = fill
 --- An entity with the components named: ty.entity{ Transform = {...} }.
 --- Order does not matter; a component the world does not know is an error,
 --- so a typo is caught where it is written.
+---
+--- Anything with a Transform also gets a LocalToWorld, which is where the
+--- engine keeps the matrix it works out from that Transform and whatever
+--- parent it has — and what the renderer draws from. A script that wants
+--- to set one itself may name it; naming it is what turns this off.
 function ty.entity(components)
     components = components or {}
+    if components.Transform ~= nil and components.LocalToWorld == nil then
+        local copy = {}
+        for name, fields in pairs(components) do
+            copy[name] = fields
+        end
+        copy.LocalToWorld = {}
+        components = copy
+    end
     local ids, values, keep, count = {}, {}, {}, 0
     for name, fields in pairs(components) do
         local id = ty.component(name)
