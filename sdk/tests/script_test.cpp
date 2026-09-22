@@ -2,6 +2,7 @@
 
 #include <tynima/core/reflect.h>
 #include <tynima/platform/file.h>
+#include <tynima/platform/input_log.h>
 #include <tynima/platform/time.h>
 #include <tynima/scene/components.h>
 #include <tynima/scene/systems.h>
@@ -170,6 +171,68 @@ TEST_CASE("a Lua script is a game module: it builds a world, runs every frame, a
     CHECK(out == "4");
     CHECK(scene::collect_draws(runtime.world(), runtime.model(0), runtime.model_count(), draws, 8) == 2);
 
+    (void)tynima::platform::remove_file(path.c_str());
+}
+
+namespace {
+
+// A player holding W, as the platform would report it: what the sandbox's
+// scripted input does, in one key.
+tynima::platform::InputFrame hold_w(long, float dt, void*) {
+    tynima::platform::InputFrame frame;
+    frame.dt = dt;
+    frame.keys_down.set(static_cast<std::size_t>(tynima::platform::Key::W));
+    return frame;
+}
+
+} // namespace
+
+TEST_CASE("input reaches a script and the camera it moves") {
+    if (!tynima::script::Vm::available()) {
+        return;
+    }
+    const std::string dir = temp_dir();
+    REQUIRE(tynima::platform::make_directories(dir.c_str()));
+    const std::string path = dir + "/fly.lua";
+    write_script(path, R"(
+        local ty = require("tynima")
+        local game = {}
+        function game.load()
+            ty.set_camera{ position = {0, 2, 10}, rotation = ty.euler(0, 0, 0) }
+            held = 0
+        end
+        function game.update(dt)
+            if ty.key_down("W") then
+                held = held + 1
+                local camera = ty.camera()
+                -- Identity looks down -z, so W walks that way.
+                camera.position = ty.vec3(camera.position) + ty.vec3(0, 0, -6 * dt)
+            end
+        end
+        return game
+    )");
+
+    sdk::Runtime runtime;
+    sdk::RuntimeDesc desc;
+    desc.headless = true;
+    desc.max_entities = 16;
+    desc.script = path.c_str();
+    desc.scripted_input = hold_w;
+    REQUIRE(runtime.create(desc));
+    REQUIRE(runtime.script() != nullptr);
+    REQUIRE_MESSAGE(runtime.script()->loaded(), runtime.script()->last_error());
+    CHECK(runtime.camera.position.z == doctest::Approx(10.0f));
+
+    for (int frame = 0; frame < 30; ++frame) {
+        REQUIRE(runtime.begin_frame());
+        runtime.end_frame();
+    }
+    std::string out;
+    REQUIRE(runtime.script()->eval("return held", out));
+    CHECK(out == "30"); // the key was down on every frame the script saw
+    // Half a second at six metres a second: the camera has walked forward.
+    CHECK(runtime.camera.position.z == doctest::Approx(7.0f).epsilon(0.05));
+    CHECK(runtime.camera.position.y == doctest::Approx(2.0f));
     (void)tynima::platform::remove_file(path.c_str());
 }
 

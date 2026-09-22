@@ -443,11 +443,14 @@ end
 return game
 ```
 
-`tynima-sandbox --script apps/sandbox/scripts/pile.lua` runs one
-([that script](apps/sandbox/scripts/pile.lua) drops two dozen boxes and
-knocks them over with Space). Save the file and it reloads within a quarter
-second, with the world it built still standing — the same file watch the
-cooked models use, and no compiler in the loop at all.
+`tynima-sandbox --script apps/sandbox/scripts/pile.lua` runs one.
+[That script](apps/sandbox/scripts/pile.lua) drops two dozen boxes, circles
+them with a camera you can take over (right-drag to look, WASD/QE to fly,
+Shift to run, C to give it back), and scatters the pile with Space — a fly
+camera in twenty lines of Lua, reading the mouse and the keys through the
+same table. Save the file and it reloads within a quarter second, with the
+world it built still standing: the same file watch the cooked models use,
+and no compiler in the loop at all.
 
 An entity built from a script gets its `LocalToWorld` without asking: it is
 where the engine keeps the matrix it works out from a `Transform` and

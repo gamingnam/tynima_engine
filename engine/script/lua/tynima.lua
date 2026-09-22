@@ -487,6 +487,17 @@ function ty.camera()
     })
 end
 
+--- Sets any of the camera's parts at once: ty.set_camera{ position = ...,
+--- rotation = ..., fov_y = ... }. What is not named is left as it was.
+function ty.set_camera(values)
+    api.get_camera(engine, camera_buffer)
+    if values.position then camera_buffer[0].position = ty.vec3(values.position) end
+    if values.rotation then camera_buffer[0].rotation = values.rotation end
+    if values.fov_y then camera_buffer[0].fov_y = values.fov_y end
+    if values.near then camera_buffer[0].near = values.near end
+    api.set_camera(engine, camera_buffer)
+end
+
 --- Points the camera at something, from where it is.
 function ty.look_at(from, target, fov_y)
     from, target = ty.vec3(from), ty.vec3(target)
