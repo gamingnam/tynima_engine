@@ -23,6 +23,16 @@
  *   5  reflection: a component's fields, read by tools and described by modules
  *   6  a component's defaults; scenes saved and loaded as text
  *   7  picking, a model's bounds, and the camera's rays and projection inline
+ *   8  models cook on load and reload when their file changes
+ *   9  a game's own half: the camera, the lighting, models from shapes,
+ *      physics bodies and ray casts, all through the table a module gets
+ *
+ * The rule that keeps this ABI: the table only ever grows at the end, and
+ * no declaration in it ever changes. A module built against an older
+ * version loads into a newer engine and calls the entries it knows; a
+ * module built against a newer one is refused, since the entries it wants
+ * are not there. sdk/src/abi.cpp pins every layout this file promises, so
+ * a change that would break a built module fails the build instead.
  */
 #ifndef TYNIMA_H
 #define TYNIMA_H
@@ -35,7 +45,9 @@
 extern "C" {
 #endif
 
-#define TYNIMA_API_VERSION 8u
+#define TYNIMA_API_VERSION 9u
+/* The oldest a game module may have been built against and still load. */
+#define TYNIMA_API_VERSION_MIN 1u
 
 /* ---- engine version ---- */
 
@@ -68,6 +80,98 @@ typedef struct tynima_quat {
 typedef struct tynima_mat4 {
     float m[16];
 } tynima_mat4;
+
+/* ---- a little math, inline, for hosts and modules written in C ---- */
+
+static inline tynima_vec3 tynima_vec3_make(float x, float y, float z) {
+    tynima_vec3 v = {x, y, z};
+    return v;
+}
+static inline tynima_vec3 tynima_vec3_add(tynima_vec3 a, tynima_vec3 b) {
+    return tynima_vec3_make(a.x + b.x, a.y + b.y, a.z + b.z);
+}
+static inline tynima_vec3 tynima_vec3_sub(tynima_vec3 a, tynima_vec3 b) {
+    return tynima_vec3_make(a.x - b.x, a.y - b.y, a.z - b.z);
+}
+static inline tynima_vec3 tynima_vec3_scale(tynima_vec3 v, float s) {
+    return tynima_vec3_make(v.x * s, v.y * s, v.z * s);
+}
+static inline float tynima_vec3_dot(tynima_vec3 a, tynima_vec3 b) {
+    return a.x * b.x + a.y * b.y + a.z * b.z;
+}
+static inline tynima_vec3 tynima_vec3_cross(tynima_vec3 a, tynima_vec3 b) {
+    return tynima_vec3_make(a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x);
+}
+static inline float tynima_vec3_length(tynima_vec3 v) {
+    return sqrtf(tynima_vec3_dot(v, v));
+}
+/* Zero stays zero. */
+static inline tynima_vec3 tynima_vec3_normalize(tynima_vec3 v) {
+    const float length = tynima_vec3_length(v);
+    return length > 0.0f ? tynima_vec3_scale(v, 1.0f / length) : v;
+}
+
+static inline tynima_quat tynima_quat_identity(void) {
+    tynima_quat q = {0.0f, 0.0f, 0.0f, 1.0f};
+    return q;
+}
+/* `axis` must be unit length; `angle` in radians, right-hand rule. */
+static inline tynima_quat tynima_quat_from_axis_angle(tynima_vec3 axis, float angle) {
+    const float s = sinf(0.5f * angle), c = cosf(0.5f * angle);
+    tynima_quat q = {axis.x * s, axis.y * s, axis.z * s, c};
+    return q;
+}
+/* The rotation that applies b first and then a, like the engine's Quat operator*. */
+static inline tynima_quat tynima_quat_mul(tynima_quat a, tynima_quat b) {
+    tynima_quat q = {
+        a.w * b.x + a.x * b.w + a.y * b.z - a.z * b.y, a.w * b.y - a.x * b.z + a.y * b.w + a.z * b.x,
+        a.w * b.z + a.x * b.y - a.y * b.x + a.z * b.w, a.w * b.w - a.x * b.x - a.y * b.y - a.z * b.z};
+    return q;
+}
+static inline tynima_quat tynima_quat_normalize(tynima_quat q) {
+    const float length = sqrtf(q.x * q.x + q.y * q.y + q.z * q.z + q.w * q.w);
+    if (length <= 0.0f) {
+        return tynima_quat_identity();
+    }
+    q.x /= length;
+    q.y /= length;
+    q.z /= length;
+    q.w /= length;
+    return q;
+}
+/* Rotates v by the unit quaternion q. */
+static inline tynima_vec3 tynima_quat_rotate(tynima_quat q, tynima_vec3 v) {
+    const tynima_vec3 u = tynima_vec3_make(q.x, q.y, q.z);
+    const tynima_vec3 t = tynima_vec3_scale(tynima_vec3_cross(u, v), 2.0f);
+    return tynima_vec3_add(tynima_vec3_add(v, tynima_vec3_scale(t, q.w)), tynima_vec3_cross(u, t));
+}
+/* Yaw about +y, then pitch about the resulting +x, then roll about the
+ * resulting +z: the order a camera or a character wants. Radians. */
+static inline tynima_quat tynima_quat_from_euler(float yaw, float pitch, float roll) {
+    const tynima_quat y = tynima_quat_from_axis_angle(tynima_vec3_make(0.0f, 1.0f, 0.0f), yaw);
+    const tynima_quat x = tynima_quat_from_axis_angle(tynima_vec3_make(1.0f, 0.0f, 0.0f), pitch);
+    const tynima_quat z = tynima_quat_from_axis_angle(tynima_vec3_make(0.0f, 0.0f, 1.0f), roll);
+    return tynima_quat_mul(tynima_quat_mul(y, x), z);
+}
+/* The inverse of the above, for a unit quaternion: pitch in [-pi/2, pi/2]. */
+static inline void tynima_quat_to_euler(tynima_quat q, float* yaw, float* pitch, float* roll) {
+    /* The rotated basis, then the angles read off it: forward tells yaw and pitch, up the roll. */
+    const tynima_vec3 f = tynima_quat_rotate(q, tynima_vec3_make(0.0f, 0.0f, -1.0f));
+    const tynima_vec3 u = tynima_quat_rotate(q, tynima_vec3_make(0.0f, 1.0f, 0.0f));
+    const float p = asinf(f.y < -1.0f ? -1.0f : (f.y > 1.0f ? 1.0f : f.y));
+    const float yw = atan2f(-f.x, -f.z);
+    /* Undo yaw and pitch from the up vector: what is left is the roll about forward. */
+    const tynima_quat unyaw_unpitch =
+        tynima_quat_mul(tynima_quat_from_axis_angle(tynima_vec3_make(1.0f, 0.0f, 0.0f), -p),
+                        tynima_quat_from_axis_angle(tynima_vec3_make(0.0f, 1.0f, 0.0f), -yw));
+    const tynima_vec3 u0 = tynima_quat_rotate(unyaw_unpitch, u);
+    if (yaw)
+        *yaw = yw;
+    if (pitch)
+        *pitch = p;
+    if (roll)
+        *roll = atan2f(-u0.x, u0.y);
+}
 
 /* ---- world ---- */
 
@@ -193,11 +297,28 @@ typedef struct tynima_rigid_body {
 
 /* ---- input ---- */
 
-/* Physical keys; the values match the engine's platform::Key exactly. */
+/* Physical keys — where the key is on the board, not what is printed on
+ * it: TYNIMA_KEY_A is the key left of S on a US layout wherever it is on
+ * yours. The values match the engine's platform::Key exactly, which
+ * sdk/src/api.cpp asserts name by name, and new keys are only ever
+ * appended, so a module built against an older header keeps its numbers. */
 typedef enum tynima_key {
-#define TYNIMA_KEY(name, scancode) TYNIMA_KEY_##name,
-#include <tynima/platform/keys.def>
-#undef TYNIMA_KEY
+    TYNIMA_KEY_Unknown, TYNIMA_KEY_A, TYNIMA_KEY_B, TYNIMA_KEY_C, TYNIMA_KEY_D, TYNIMA_KEY_E,
+    TYNIMA_KEY_F, TYNIMA_KEY_G, TYNIMA_KEY_H, TYNIMA_KEY_I, TYNIMA_KEY_J, TYNIMA_KEY_K, TYNIMA_KEY_L,
+    TYNIMA_KEY_M, TYNIMA_KEY_N, TYNIMA_KEY_O, TYNIMA_KEY_P, TYNIMA_KEY_Q, TYNIMA_KEY_R, TYNIMA_KEY_S,
+    TYNIMA_KEY_T, TYNIMA_KEY_U, TYNIMA_KEY_V, TYNIMA_KEY_W, TYNIMA_KEY_X, TYNIMA_KEY_Y, TYNIMA_KEY_Z,
+    TYNIMA_KEY_Digit0, TYNIMA_KEY_Digit1, TYNIMA_KEY_Digit2, TYNIMA_KEY_Digit3, TYNIMA_KEY_Digit4,
+    TYNIMA_KEY_Digit5, TYNIMA_KEY_Digit6, TYNIMA_KEY_Digit7, TYNIMA_KEY_Digit8, TYNIMA_KEY_Digit9,
+    TYNIMA_KEY_F1, TYNIMA_KEY_F2, TYNIMA_KEY_F3, TYNIMA_KEY_F4, TYNIMA_KEY_F5, TYNIMA_KEY_F6,
+    TYNIMA_KEY_F7, TYNIMA_KEY_F8, TYNIMA_KEY_F9, TYNIMA_KEY_F10, TYNIMA_KEY_F11, TYNIMA_KEY_F12,
+    TYNIMA_KEY_Escape, TYNIMA_KEY_Enter, TYNIMA_KEY_Tab, TYNIMA_KEY_Backspace, TYNIMA_KEY_Space,
+    TYNIMA_KEY_Minus, TYNIMA_KEY_Equals, TYNIMA_KEY_LeftBracket, TYNIMA_KEY_RightBracket,
+    TYNIMA_KEY_Backslash, TYNIMA_KEY_Semicolon, TYNIMA_KEY_Apostrophe, TYNIMA_KEY_Grave, TYNIMA_KEY_Comma,
+    TYNIMA_KEY_Period, TYNIMA_KEY_Slash, TYNIMA_KEY_CapsLock, TYNIMA_KEY_Insert, TYNIMA_KEY_Delete,
+    TYNIMA_KEY_Home, TYNIMA_KEY_End, TYNIMA_KEY_PageUp, TYNIMA_KEY_PageDown, TYNIMA_KEY_Left,
+    TYNIMA_KEY_Right, TYNIMA_KEY_Up, TYNIMA_KEY_Down, TYNIMA_KEY_LeftShift, TYNIMA_KEY_RightShift,
+    TYNIMA_KEY_LeftCtrl, TYNIMA_KEY_RightCtrl, TYNIMA_KEY_LeftAlt, TYNIMA_KEY_RightAlt,
+    TYNIMA_KEY_LeftSuper, TYNIMA_KEY_RightSuper,
     TYNIMA_KEY_COUNT
 } tynima_key;
 
@@ -223,6 +344,130 @@ typedef enum tynima_log_level {
     TYNIMA_LOG_ERROR,
     TYNIMA_LOG_FATAL
 } tynima_log_level;
+
+/* ---- what a game sets up: the view, the light, the shapes ----
+ *
+ * These are the engine's own, in C: the camera the scene is drawn from,
+ * the light it is lit by, and the shape a body collides with — which is
+ * also the shape a placeholder model is made of, so a scene can be built
+ * before there is any art. A game reaches them through the table below; a
+ * host, through the functions of the same names further down. */
+
+/* The camera the scene is drawn from. Identity rotation looks down -z; the
+ * projection is infinite, from `near` metres out. */
+typedef struct tynima_camera {
+    tynima_vec3 position;
+    tynima_quat rotation;
+    float fov_y; /* radians */
+    float near;  /* metres */
+} tynima_camera;
+
+/* The one directional light, the ambient term beside it, and the sky the
+ * frame is cleared to. Colours are linear radiance: above 1 is what the
+ * tonemapper is for. */
+typedef struct tynima_lighting {
+    tynima_vec3 sun_direction; /* towards the light, unit length */
+    float sun_intensity;
+    tynima_vec3 sun_color;
+    float ambient;
+    tynima_vec3 sky;
+} tynima_lighting;
+
+/* A point light: where, how far it reaches, and its colour. Beyond
+ * `radius` it contributes nothing. */
+#define TYNIMA_MAX_LIGHTS 256u
+typedef struct tynima_point_light {
+    tynima_vec3 position;
+    float radius; /* metres */
+    tynima_vec3 color;
+} tynima_point_light;
+
+/* A collision shape, at `center` in the body's own frame — so a mesh whose
+ * origin is at its base can still carry a box around its middle. */
+typedef enum tynima_shape_type {
+    TYNIMA_SHAPE_BOX,
+    TYNIMA_SHAPE_SPHERE,
+    TYNIMA_SHAPE_CAPSULE
+} tynima_shape_type;
+typedef struct tynima_shape {
+    tynima_shape_type type;
+    tynima_vec3 half_extents; /* box */
+    float radius;             /* sphere, capsule */
+    float half_height;        /* capsule: half the straight part */
+    tynima_vec3 center;
+} tynima_shape;
+static inline tynima_shape tynima_shape_box(tynima_vec3 half_extents) {
+    tynima_shape s;
+    s.type = TYNIMA_SHAPE_BOX;
+    s.half_extents = half_extents;
+    s.radius = 0.5f;
+    s.half_height = 0.5f;
+    s.center = tynima_vec3_make(0.0f, 0.0f, 0.0f);
+    return s;
+}
+static inline tynima_shape tynima_shape_sphere(float radius) {
+    tynima_shape s = tynima_shape_box(tynima_vec3_make(0.5f, 0.5f, 0.5f));
+    s.type = TYNIMA_SHAPE_SPHERE;
+    s.radius = radius;
+    return s;
+}
+static inline tynima_shape tynima_shape_capsule(float radius, float half_height) {
+    tynima_shape s = tynima_shape_sphere(radius);
+    s.type = TYNIMA_SHAPE_CAPSULE;
+    s.half_height = half_height;
+    return s;
+}
+
+/* How a body moves: the floor never, a platform when told, everything else
+ * because the simulation says so. */
+typedef enum tynima_motion {
+    TYNIMA_MOTION_STATIC,
+    TYNIMA_MOTION_KINEMATIC, /* moved by hand; pushes dynamic bodies, is not pushed */
+    TYNIMA_MOTION_DYNAMIC
+} tynima_motion;
+
+typedef struct tynima_body_desc {
+    tynima_shape shape;
+    tynima_vec3 position;
+    tynima_quat rotation;
+    tynima_motion motion;
+    float mass;        /* kg; 0 = from the shape's volume at the density of water */
+    float friction;    /* 0.5 is a sensible start */
+    float restitution; /* 0 no bounce, 1 all of it back */
+    tynima_vec3 linear_velocity;
+    tynima_vec3 angular_velocity;
+    bool start_active;   /* false: asleep until something touches it */
+    bool lock_rotation;  /* never turns: a character capsule, a puck */
+    uint64_t user_data;  /* the game's own, e.g. an entity packed into 64 bits */
+} tynima_body_desc;
+/* A body's description with everything at its default: a dynamic box of
+ * half a metre at the origin. */
+static inline tynima_body_desc tynima_body_desc_make(tynima_shape shape, tynima_vec3 position) {
+    tynima_body_desc d;
+    d.shape = shape;
+    d.position = position;
+    d.rotation = tynima_quat_identity();
+    d.motion = TYNIMA_MOTION_DYNAMIC;
+    d.mass = 0.0f;
+    d.friction = 0.5f;
+    d.restitution = 0.0f;
+    d.linear_velocity = tynima_vec3_make(0.0f, 0.0f, 0.0f);
+    d.angular_velocity = tynima_vec3_make(0.0f, 0.0f, 0.0f);
+    d.start_active = true;
+    d.lock_rotation = false;
+    d.user_data = 0;
+    return d;
+}
+
+/* What a ray met: the body, where, the surface's normal there, and how far
+ * along the ray it is. */
+typedef struct tynima_ray_hit {
+    tynima_body body;
+    tynima_vec3 position;
+    tynima_vec3 normal;
+    float distance;
+    uint64_t user_data; /* the body's */
+} tynima_ray_hit;
 
 /* ---- the API a game module receives ---- */
 
@@ -326,6 +571,47 @@ typedef struct tynima_api {
      * the caller registered its defaults; the first ones given stand. */
     const void* (*component_defaults)(tynima_engine* engine, tynima_component_id id);
     bool (*set_component_defaults)(tynima_engine* engine, tynima_component_id id, const void* defaults);
+
+    /* ---- version 9: the half a game needs and only a host had ---- */
+
+    /* Ends the run: the host's next frame is its last. */
+    void (*quit)(tynima_engine* engine);
+
+    /* The camera and the light, read and written between frames. */
+    void (*get_camera)(tynima_engine* engine, tynima_camera* out);
+    void (*set_camera)(tynima_engine* engine, const tynima_camera* camera);
+    void (*get_lighting)(tynima_engine* engine, tynima_lighting* out);
+    void (*set_lighting)(tynima_engine* engine, const tynima_lighting* lighting);
+    /* This frame's point lights, copied; at most TYNIMA_MAX_LIGHTS. Set them
+     * again whenever they move — the engine keeps the last set. */
+    void (*set_point_lights)(tynima_engine* engine, const tynima_point_light* lights, uint32_t count);
+
+    /* Models. A file (a cooked .tymodel, or a .gltf/.glb cooked on the way
+     * in), or a shape with one plain material — a box, a sphere, a capsule
+     * to build a scene out of before there is art. Both answer with the
+     * index a MeshRenderer's `model` refers to, TYNIMA_NO_MODEL on failure. */
+    uint32_t (*load_model)(tynima_engine* engine, const char* path);
+    uint32_t (*shape_model)(tynima_engine* engine, const tynima_shape* shape, tynima_vec4 color,
+                            float roughness);
+
+    /* Bodies. A body is the physics world's; an entity refers to one through
+     * its RigidBody component, and its Transform follows the body each frame. */
+    tynima_body (*create_body)(tynima_engine* engine, const tynima_body_desc* desc);
+    bool (*destroy_body)(tynima_engine* engine, tynima_body body);
+    /* Where the body is now, and how fast; false for a stale handle. */
+    bool (*body_transform)(tynima_engine* engine, tynima_body body, tynima_vec3* position,
+                           tynima_quat* rotation);
+    bool (*body_velocity)(tynima_engine* engine, tynima_body body, tynima_vec3* linear,
+                          tynima_vec3* angular);
+    /* The nearest body along a ray (origin, unit direction), within
+     * `max_distance` metres. False when it meets nothing. */
+    bool (*cast_ray)(tynima_engine* engine, tynima_vec3 origin, tynima_vec3 direction, float max_distance,
+                     tynima_ray_hit* out);
+
+    /* The window, in points — the units the mouse is in. 0 x 0 headless. */
+    void (*window_size)(tynima_engine* engine, uint32_t* width, uint32_t* height);
+    /* Hides the cursor and reports unbounded motion: mouse look. */
+    void (*set_relative_mouse)(tynima_engine* engine, bool enabled);
 } tynima_api;
 
 /* ---- what a game module exports ---- */
@@ -444,16 +730,12 @@ void tynima_clear_scene(tynima_engine* engine);
 
 /* ---- the view ---- */
 
-/* The camera the scene is drawn from. Identity rotation looks down -z; the
- * projection is infinite, from `near` metres out. */
-typedef struct tynima_camera {
-    tynima_vec3 position;
-    tynima_quat rotation;
-    float fov_y; /* radians */
-    float near;  /* metres */
-} tynima_camera;
+/* The same camera and light a game sets through the table (tynima_camera,
+ * tynima_lighting above), for the host that owns the window. */
 void tynima_get_camera(tynima_engine* engine, tynima_camera* out);
 void tynima_set_camera(tynima_engine* engine, const tynima_camera* camera);
+void tynima_get_lighting(tynima_engine* engine, tynima_lighting* out);
+void tynima_set_lighting(tynima_engine* engine, const tynima_lighting* lighting);
 
 /* How the scene is drawn. The paths and views match the engine's
  * render::ShadingPath and render::DebugView; the names come from
@@ -551,98 +833,6 @@ typedef struct tynima_stats {
     uint32_t model_reloads;    /* how many times a model was loaded again after its file changed */
 } tynima_stats;
 void tynima_get_stats(tynima_engine* engine, tynima_stats* out);
-
-/* ---- a little math, inline, for hosts and modules written in C ---- */
-
-static inline tynima_vec3 tynima_vec3_make(float x, float y, float z) {
-    tynima_vec3 v = {x, y, z};
-    return v;
-}
-static inline tynima_vec3 tynima_vec3_add(tynima_vec3 a, tynima_vec3 b) {
-    return tynima_vec3_make(a.x + b.x, a.y + b.y, a.z + b.z);
-}
-static inline tynima_vec3 tynima_vec3_sub(tynima_vec3 a, tynima_vec3 b) {
-    return tynima_vec3_make(a.x - b.x, a.y - b.y, a.z - b.z);
-}
-static inline tynima_vec3 tynima_vec3_scale(tynima_vec3 v, float s) {
-    return tynima_vec3_make(v.x * s, v.y * s, v.z * s);
-}
-static inline float tynima_vec3_dot(tynima_vec3 a, tynima_vec3 b) {
-    return a.x * b.x + a.y * b.y + a.z * b.z;
-}
-static inline tynima_vec3 tynima_vec3_cross(tynima_vec3 a, tynima_vec3 b) {
-    return tynima_vec3_make(a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x);
-}
-static inline float tynima_vec3_length(tynima_vec3 v) {
-    return sqrtf(tynima_vec3_dot(v, v));
-}
-/* Zero stays zero. */
-static inline tynima_vec3 tynima_vec3_normalize(tynima_vec3 v) {
-    const float length = tynima_vec3_length(v);
-    return length > 0.0f ? tynima_vec3_scale(v, 1.0f / length) : v;
-}
-
-static inline tynima_quat tynima_quat_identity(void) {
-    tynima_quat q = {0.0f, 0.0f, 0.0f, 1.0f};
-    return q;
-}
-/* `axis` must be unit length; `angle` in radians, right-hand rule. */
-static inline tynima_quat tynima_quat_from_axis_angle(tynima_vec3 axis, float angle) {
-    const float s = sinf(0.5f * angle), c = cosf(0.5f * angle);
-    tynima_quat q = {axis.x * s, axis.y * s, axis.z * s, c};
-    return q;
-}
-/* The rotation that applies b first and then a, like the engine's Quat operator*. */
-static inline tynima_quat tynima_quat_mul(tynima_quat a, tynima_quat b) {
-    tynima_quat q = {
-        a.w * b.x + a.x * b.w + a.y * b.z - a.z * b.y, a.w * b.y - a.x * b.z + a.y * b.w + a.z * b.x,
-        a.w * b.z + a.x * b.y - a.y * b.x + a.z * b.w, a.w * b.w - a.x * b.x - a.y * b.y - a.z * b.z};
-    return q;
-}
-static inline tynima_quat tynima_quat_normalize(tynima_quat q) {
-    const float length = sqrtf(q.x * q.x + q.y * q.y + q.z * q.z + q.w * q.w);
-    if (length <= 0.0f) {
-        return tynima_quat_identity();
-    }
-    q.x /= length;
-    q.y /= length;
-    q.z /= length;
-    q.w /= length;
-    return q;
-}
-/* Rotates v by the unit quaternion q. */
-static inline tynima_vec3 tynima_quat_rotate(tynima_quat q, tynima_vec3 v) {
-    const tynima_vec3 u = tynima_vec3_make(q.x, q.y, q.z);
-    const tynima_vec3 t = tynima_vec3_scale(tynima_vec3_cross(u, v), 2.0f);
-    return tynima_vec3_add(tynima_vec3_add(v, tynima_vec3_scale(t, q.w)), tynima_vec3_cross(u, t));
-}
-/* Yaw about +y, then pitch about the resulting +x, then roll about the
- * resulting +z: the order a camera or a character wants. Radians. */
-static inline tynima_quat tynima_quat_from_euler(float yaw, float pitch, float roll) {
-    const tynima_quat y = tynima_quat_from_axis_angle(tynima_vec3_make(0.0f, 1.0f, 0.0f), yaw);
-    const tynima_quat x = tynima_quat_from_axis_angle(tynima_vec3_make(1.0f, 0.0f, 0.0f), pitch);
-    const tynima_quat z = tynima_quat_from_axis_angle(tynima_vec3_make(0.0f, 0.0f, 1.0f), roll);
-    return tynima_quat_mul(tynima_quat_mul(y, x), z);
-}
-/* The inverse of the above, for a unit quaternion: pitch in [-pi/2, pi/2]. */
-static inline void tynima_quat_to_euler(tynima_quat q, float* yaw, float* pitch, float* roll) {
-    /* The rotated basis, then the angles read off it: forward tells yaw and pitch, up the roll. */
-    const tynima_vec3 f = tynima_quat_rotate(q, tynima_vec3_make(0.0f, 0.0f, -1.0f));
-    const tynima_vec3 u = tynima_quat_rotate(q, tynima_vec3_make(0.0f, 1.0f, 0.0f));
-    const float p = asinf(f.y < -1.0f ? -1.0f : (f.y > 1.0f ? 1.0f : f.y));
-    const float yw = atan2f(-f.x, -f.z);
-    /* Undo yaw and pitch from the up vector: what is left is the roll about forward. */
-    const tynima_quat unyaw_unpitch =
-        tynima_quat_mul(tynima_quat_from_axis_angle(tynima_vec3_make(1.0f, 0.0f, 0.0f), -p),
-                        tynima_quat_from_axis_angle(tynima_vec3_make(0.0f, 1.0f, 0.0f), -yw));
-    const tynima_vec3 u0 = tynima_quat_rotate(unyaw_unpitch, u);
-    if (yaw)
-        *yaw = yw;
-    if (pitch)
-        *pitch = p;
-    if (roll)
-        *roll = atan2f(-u0.x, u0.y);
-}
 
 /* ---- the camera, inline: the same projection the engine draws with ----
  *

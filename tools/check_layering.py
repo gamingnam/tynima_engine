@@ -16,7 +16,10 @@ checks every C/C++ source under the module against four rules:
   2. Declared dependencies point down the layer order (LAYERS below).
      Apps under apps/ sit on top; nothing may depend on an app.
   3. `editor` may depend on `sdk` and nothing else — the editor is a client
-     of the public API with no special privileges.
+     of the public API with no special privileges — and it may include only
+     `tynima.h` out of that: PUBLIC_API_ONLY below names the modules held to
+     that, and reaching for <tynima/sdk/runtime.h> or any other engine header
+     from one of them is what this rule exists to catch.
   4. Every source file must live inside a declared module.
   5. Third-party headers with a designated home stay there: SDL3, Tracy,
      cgltf, stb, meshoptimizer, Jolt and Dear ImGui may be included only by
@@ -42,6 +45,12 @@ LAYERS = ["core", "platform", "rhi", "render", "ui", "physics", "scene", "assets
 
 # Directories that contain modules or apps (relative to the repo root).
 SCAN_ROOTS = ["engine", "sdk", "editor", "apps", "tools"]
+
+# Clients of the public API: `tynima.h` is the only engine header they may
+# include. The editor is one by design — it is the forcing function that
+# keeps the C ABI complete, so anything it cannot do through tynima.h is a
+# hole in tynima.h, not a reason to reach past it. Game templates join it.
+PUBLIC_API_ONLY = {"editor"}
 
 SOURCE_SUFFIXES = {".h", ".hpp", ".inl", ".c", ".cc", ".cpp", ".cxx", ".m", ".mm"}
 
@@ -169,6 +178,12 @@ def check_sources(root: Path, modules: dict[str, Module]) -> list[Violation]:
                     violations.append(Violation(path, line, f"'{module.name}' includes {prefix.rstrip('/')} directly; only {homes} may — use that module's wrapper instead"))
             for match in INCLUDE_RE.finditer(text):
                 included = "sdk" if match.group(1) == "tynima.h" else match.group(2)
+                if module.name in PUBLIC_API_ONLY and match.group(1) != "tynima.h":
+                    line = text.count("\n", 0, match.start()) + 1
+                    violations.append(
+                        Violation(path, line, f"'{module.name}' is a client of the public API: it may include <tynima.h> and nothing else under tynima/, but includes <{match.group(1)}>")
+                    )
+                    continue
                 if included in allowed:
                     continue
                 line = text.count("\n", 0, match.start()) + 1

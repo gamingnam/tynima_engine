@@ -8,12 +8,15 @@
 #include <tynima/core/log.h>
 #include <tynima/physics/physics.h>
 #include <tynima/platform/platform.h>
+#include <tynima/platform/window.h>
+#include <tynima/render/shapes.h>
 #include <tynima/scene/components.h>
 #include <tynima/scene/scene_file.h>
 #include <tynima/scene/world.h>
 #include <tynima/sdk/game_module.h>
 #include <tynima/sdk/runtime.h>
 
+#include <algorithm>
 #include <cstddef>
 #include <cstring>
 #include <memory>
@@ -29,10 +32,15 @@ using tynima::sdk::Runtime;
 
 static_assert(sizeof(tynima_entity) == sizeof(Entity), "tynima_entity mirrors scene::Entity");
 static_assert(sizeof(tynima_body) == sizeof(BodyHandle), "tynima_body mirrors physics::BodyHandle");
+// tynima.h carries its own copy of the key list, so a game needs that file
+// and nothing else; this checks the copy against the engine's, key by key.
 static_assert(static_cast<int>(TYNIMA_KEY_COUNT) == static_cast<int>(tynima::platform::Key::Count),
               "tynima_key mirrors platform::Key");
-static_assert(static_cast<int>(TYNIMA_KEY_Escape) == static_cast<int>(tynima::platform::Key::Escape));
-static_assert(static_cast<int>(TYNIMA_KEY_RightSuper) == static_cast<int>(tynima::platform::Key::RightSuper));
+#define TYNIMA_KEY(name, scancode)                                                                           \
+    static_assert(static_cast<int>(TYNIMA_KEY_##name) == static_cast<int>(tynima::platform::Key::name),      \
+                  "tynima.h's key list has drifted from platform/keys.def");
+#include <tynima/platform/keys.def>
+#undef TYNIMA_KEY
 static_assert(static_cast<int>(TYNIMA_MOUSE_BUTTON_COUNT) ==
                   static_cast<int>(tynima::platform::MouseButton::Count),
               "tynima_mouse_button mirrors platform::MouseButton");
@@ -105,6 +113,11 @@ tynima::platform::MouseButton to_button(tynima_mouse_button button) noexcept {
 }
 BodyHandle to_body(tynima_body body) noexcept {
     return BodyHandle{body.index, body.generation};
+}
+// The runtime behind a context, when a host made one; null for an engine a
+// game module was handed by something that is not the runtime (a test).
+Runtime* runtime_of(tynima_engine* engine) noexcept {
+    return engine != nullptr ? engine->runtime : nullptr;
 }
 tynima::math::Vec3 to_vec3(tynima_vec3 v) noexcept {
     return tynima::math::Vec3{v.x, v.y, v.z};
@@ -328,6 +341,229 @@ void api_body_set_velocity(tynima_engine* engine, tynima_body body, tynima_vec3 
     }
 }
 
+// ---- version 9: what only a host could do, now in the table too ----
+
+void api_quit(tynima_engine* engine) {
+    if (Runtime* runtime = runtime_of(engine); runtime != nullptr) {
+        runtime->quit();
+    }
+}
+
+void api_get_camera(tynima_engine* engine, tynima_camera* out) {
+    const Runtime* runtime = runtime_of(engine);
+    if (runtime == nullptr || out == nullptr) {
+        return;
+    }
+    out->position = from_vec3(runtime->camera.position);
+    out->rotation = from_quat(runtime->camera.rotation);
+    out->fov_y = runtime->camera.fov_y;
+    out->near = runtime->camera.near;
+}
+
+void api_set_camera(tynima_engine* engine, const tynima_camera* camera) {
+    Runtime* runtime = runtime_of(engine);
+    if (runtime == nullptr || camera == nullptr) {
+        return;
+    }
+    runtime->camera.position = to_vec3(camera->position);
+    runtime->camera.rotation = tynima::math::normalize(to_quat(camera->rotation));
+    if (camera->fov_y > 0.0f) {
+        runtime->camera.fov_y = camera->fov_y;
+    }
+    if (camera->near > 0.0f) {
+        runtime->camera.near = camera->near;
+    }
+}
+
+void api_get_lighting(tynima_engine* engine, tynima_lighting* out) {
+    const Runtime* runtime = runtime_of(engine);
+    if (runtime == nullptr || out == nullptr) {
+        return;
+    }
+    out->sun_direction = from_vec3(runtime->sun.direction);
+    out->sun_intensity = runtime->sun.intensity;
+    out->sun_color = from_vec3(runtime->sun.color);
+    out->ambient = runtime->sun.ambient;
+    out->sky = from_vec3(runtime->sky);
+}
+
+void api_set_lighting(tynima_engine* engine, const tynima_lighting* lighting) {
+    Runtime* runtime = runtime_of(engine);
+    if (runtime == nullptr || lighting == nullptr) {
+        return;
+    }
+    const tynima::math::Vec3 direction = to_vec3(lighting->sun_direction);
+    // A sun pointing nowhere would light nothing and divide by zero in the
+    // shadow pass; keep the one that is there.
+    if (tynima::math::length(direction) > 1e-6f) {
+        runtime->sun.direction = tynima::math::normalize(direction);
+    }
+    runtime->sun.intensity = lighting->sun_intensity;
+    runtime->sun.color = to_vec3(lighting->sun_color);
+    runtime->sun.ambient = lighting->ambient;
+    runtime->sky = to_vec3(lighting->sky);
+}
+
+void api_set_point_lights(tynima_engine* engine, const tynima_point_light* lights, uint32_t count) {
+    Runtime* runtime = runtime_of(engine);
+    if (runtime == nullptr) {
+        return;
+    }
+    if (lights == nullptr || count == 0) {
+        runtime->set_lights(nullptr, 0);
+        return;
+    }
+    count = std::min(count, TYNIMA_MAX_LIGHTS);
+    tynima::render::PointLight converted[TYNIMA_MAX_LIGHTS];
+    for (uint32_t i = 0; i < count; ++i) {
+        converted[i].position_radius = {lights[i].position.x, lights[i].position.y, lights[i].position.z,
+                                        lights[i].radius};
+        converted[i].color = {lights[i].color.x, lights[i].color.y, lights[i].color.z, 0.0f};
+    }
+    runtime->set_lights(converted, count);
+}
+
+uint32_t api_load_model(tynima_engine* engine, const char* path) {
+    Runtime* runtime = runtime_of(engine);
+    return runtime != nullptr && path != nullptr ? runtime->load_model(path) : TYNIMA_NO_MODEL;
+}
+
+uint32_t api_shape_model(tynima_engine* engine, const tynima_shape* shape, tynima_vec4 color,
+                         float roughness) {
+    Runtime* runtime = runtime_of(engine);
+    if (runtime == nullptr || shape == nullptr) {
+        return TYNIMA_NO_MODEL;
+    }
+    tynima::render::MeshData mesh;
+    switch (shape->type) {
+    case TYNIMA_SHAPE_BOX:
+        mesh = tynima::render::box_mesh(to_vec3(shape->half_extents));
+        break;
+    case TYNIMA_SHAPE_SPHERE:
+        mesh = tynima::render::capsule_mesh(shape->radius, 0.0f);
+        break;
+    case TYNIMA_SHAPE_CAPSULE:
+        mesh = tynima::render::capsule_mesh(shape->radius, shape->half_height);
+        break;
+    default:
+        return TYNIMA_NO_MODEL;
+    }
+    // The shape's centre is where it sits in the body's frame; the mesh is
+    // built about the origin, so move it there.
+    const tynima::math::Vec3 center = to_vec3(shape->center);
+    if (tynima::math::length(center) > 0.0f) {
+        for (tynima::render::Vertex& vertex : mesh.vertices) {
+            vertex.position = vertex.position + center;
+        }
+        mesh.compute_bounds();
+    }
+    const tynima::math::Vec4 base{color.x, color.y, color.z, color.w};
+    return runtime->add_model(tynima::render::plain_model(std::move(mesh), base, roughness));
+}
+
+tynima::physics::Shape to_shape(const tynima_shape& shape) noexcept {
+    switch (shape.type) {
+    case TYNIMA_SHAPE_SPHERE:
+        return tynima::physics::Shape::sphere(shape.radius, to_vec3(shape.center));
+    case TYNIMA_SHAPE_CAPSULE:
+        return tynima::physics::Shape::capsule(shape.radius, shape.half_height, to_vec3(shape.center));
+    case TYNIMA_SHAPE_BOX:
+    default:
+        return tynima::physics::Shape::box(to_vec3(shape.half_extents), to_vec3(shape.center));
+    }
+}
+
+tynima_body api_create_body(tynima_engine* engine, const tynima_body_desc* desc) {
+    if (engine == nullptr || engine->physics == nullptr || desc == nullptr) {
+        return tynima_body{0, 0};
+    }
+    tynima::physics::BodyDesc body;
+    body.shape = to_shape(desc->shape);
+    body.position = to_vec3(desc->position);
+    body.rotation = tynima::math::normalize(to_quat(desc->rotation));
+    body.motion = static_cast<tynima::physics::MotionType>(desc->motion);
+    body.mass = desc->mass;
+    body.friction = desc->friction;
+    body.restitution = desc->restitution;
+    body.linear_velocity = to_vec3(desc->linear_velocity);
+    body.angular_velocity = to_vec3(desc->angular_velocity);
+    body.start_active = desc->start_active;
+    body.lock_rotation = desc->lock_rotation;
+    body.user_data = desc->user_data;
+    const BodyHandle handle = engine->physics->create_body(body);
+    return tynima_body{handle.index, handle.generation};
+}
+
+bool api_destroy_body(tynima_engine* engine, tynima_body body) {
+    return engine->physics != nullptr && engine->physics->destroy_body(to_body(body));
+}
+
+bool api_body_transform(tynima_engine* engine, tynima_body body, tynima_vec3* position,
+                        tynima_quat* rotation) {
+    if (engine->physics == nullptr || !engine->physics->valid(to_body(body))) {
+        return false;
+    }
+    const tynima::physics::BodyState state = engine->physics->body_state(to_body(body));
+    if (position != nullptr) {
+        *position = from_vec3(state.position);
+    }
+    if (rotation != nullptr) {
+        *rotation = from_quat(state.rotation);
+    }
+    return true;
+}
+
+bool api_body_velocity(tynima_engine* engine, tynima_body body, tynima_vec3* linear, tynima_vec3* angular) {
+    if (engine->physics == nullptr || !engine->physics->valid(to_body(body))) {
+        return false;
+    }
+    const tynima::physics::BodyState state = engine->physics->body_state(to_body(body));
+    if (linear != nullptr) {
+        *linear = from_vec3(state.linear_velocity);
+    }
+    if (angular != nullptr) {
+        *angular = from_vec3(state.angular_velocity);
+    }
+    return true;
+}
+
+bool api_cast_ray(tynima_engine* engine, tynima_vec3 origin, tynima_vec3 direction, float max_distance,
+                  tynima_ray_hit* out) {
+    if (engine->physics == nullptr) {
+        return false;
+    }
+    tynima::physics::RayHit hit;
+    if (!engine->physics->cast_ray(to_vec3(origin), to_vec3(direction), max_distance, hit)) {
+        return false;
+    }
+    if (out != nullptr) {
+        out->body = tynima_body{hit.body.index, hit.body.generation};
+        out->position = from_vec3(hit.point);
+        out->normal = from_vec3(hit.normal);
+        out->distance = hit.fraction * max_distance;
+        out->user_data = engine->physics->valid(hit.body) ? engine->physics->user_data(hit.body) : 0;
+    }
+    return true;
+}
+
+void api_window_size(tynima_engine* engine, uint32_t* width, uint32_t* height) {
+    Runtime* runtime = runtime_of(engine);
+    tynima::platform::Window* window = runtime != nullptr ? runtime->window() : nullptr;
+    if (width != nullptr) {
+        *width = window != nullptr ? static_cast<uint32_t>(window->width()) : 0;
+    }
+    if (height != nullptr) {
+        *height = window != nullptr ? static_cast<uint32_t>(window->height()) : 0;
+    }
+}
+
+void api_set_relative_mouse(tynima_engine* engine, bool enabled) {
+    Runtime* runtime = runtime_of(engine);
+    if (runtime != nullptr && runtime->window() != nullptr) {
+        runtime->window()->set_relative_mouse_mode(enabled);
+    }
+}
+
 const tynima_api kApi{
     TYNIMA_API_VERSION,
     api_register_component,
@@ -363,15 +599,26 @@ const tynima_api kApi{
     api_describe_component,
     api_component_defaults,
     api_set_component_defaults,
+    api_quit,
+    api_get_camera,
+    api_set_camera,
+    api_get_lighting,
+    api_set_lighting,
+    api_set_point_lights,
+    api_load_model,
+    api_shape_model,
+    api_create_body,
+    api_destroy_body,
+    api_body_transform,
+    api_body_velocity,
+    api_cast_ray,
+    api_window_size,
+    api_set_relative_mouse,
 };
 
 // ---- hosting ----
 
 std::string g_last_error;
-
-Runtime* runtime_of(tynima_engine* engine) noexcept {
-    return engine != nullptr ? engine->runtime : nullptr;
-}
 
 } // namespace
 
@@ -498,8 +745,10 @@ bool tynima_model_bounds(tynima_engine* engine, uint32_t model, tynima_vec3* min
     if (m == nullptr || m->mesh.index_count == 0) {
         return false;
     }
-    if (min) *min = from_vec3(m->mesh.bounds_min);
-    if (max) *max = from_vec3(m->mesh.bounds_max);
+    if (min)
+        *min = from_vec3(m->mesh.bounds_min);
+    if (max)
+        *max = from_vec3(m->mesh.bounds_max);
     return true;
 }
 
@@ -514,8 +763,10 @@ bool tynima_pick(tynima_engine* engine, tynima_vec3 origin, tynima_vec3 directio
     if (!entity) {
         return false;
     }
-    if (out) *out = from_entity(entity);
-    if (distance) *distance = hit_distance;
+    if (out)
+        *out = from_entity(entity);
+    if (distance)
+        *distance = hit_distance;
     return true;
 }
 
@@ -553,30 +804,22 @@ void tynima_clear_scene(tynima_engine* engine) {
     }
 }
 
+// The host's half of the view and the light is the table's, under another
+// name: one implementation, so the two can never drift apart.
 void tynima_get_camera(tynima_engine* engine, tynima_camera* out) {
-    const Runtime* runtime = runtime_of(engine);
-    if (runtime == nullptr || out == nullptr) {
-        return;
-    }
-    out->position = from_vec3(runtime->camera.position);
-    out->rotation = from_quat(runtime->camera.rotation);
-    out->fov_y = runtime->camera.fov_y;
-    out->near = runtime->camera.near;
+    api_get_camera(engine, out);
 }
 
 void tynima_set_camera(tynima_engine* engine, const tynima_camera* camera) {
-    Runtime* runtime = runtime_of(engine);
-    if (runtime == nullptr || camera == nullptr) {
-        return;
-    }
-    runtime->camera.position = to_vec3(camera->position);
-    runtime->camera.rotation = tynima::math::normalize(to_quat(camera->rotation));
-    if (camera->fov_y > 0.0f) {
-        runtime->camera.fov_y = camera->fov_y;
-    }
-    if (camera->near > 0.0f) {
-        runtime->camera.near = camera->near;
-    }
+    api_set_camera(engine, camera);
+}
+
+void tynima_get_lighting(tynima_engine* engine, tynima_lighting* out) {
+    api_get_lighting(engine, out);
+}
+
+void tynima_set_lighting(tynima_engine* engine, const tynima_lighting* lighting) {
+    api_set_lighting(engine, lighting);
 }
 
 void tynima_get_render_settings(tynima_engine* engine, tynima_render_settings* out) {

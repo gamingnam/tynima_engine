@@ -530,8 +530,8 @@ TEST_CASE("an offscreen runtime draws into a texture and reads it back, or says 
         return;
     }
     // A cube in front of the camera, lit; three frames, then the picture.
-    tynima::render::ModelData cube = tynima::render::plain_model(tynima::render::box_mesh(Vec3{0.5f}),
-                                                                 Vec4{0.8f, 0.3f, 0.2f, 1.0f}, 0.5f);
+    tynima::render::ModelData cube =
+        tynima::render::plain_model(tynima::render::box_mesh(Vec3{0.5f}), Vec4{0.8f, 0.3f, 0.2f, 1.0f}, 0.5f);
     const std::uint32_t model = runtime.add_model(cube);
     (void)runtime.world().create(scene::Transform{.position = Vec3{0.0f, 0.0f, -2.0f}}, scene::LocalToWorld{},
                                  scene::MeshRenderer{.model = model});
@@ -557,4 +557,145 @@ TEST_CASE("an offscreen runtime draws into a texture and reads it back, or says 
     CHECK(middle[2] != corner[2]);
     MESSAGE("middle ", int{middle[0]}, " ", int{middle[1]}, " ", int{middle[2]}, ", corner ", int{corner[0]},
             " ", int{corner[1]}, " ", int{corner[2]});
+}
+
+TEST_CASE("a game builds its world through the table alone: models, bodies, lights, a ray, the camera") {
+    sdk::Runtime runtime;
+    sdk::RuntimeDesc desc;
+    desc.headless = true;
+    desc.max_entities = 64;
+    desc.max_bodies = 32;
+    REQUIRE(runtime.create(desc));
+    tynima_engine* engine = &runtime.context();
+    const tynima_api& api = *tynima_engine_api(engine);
+    REQUIRE(api.version == TYNIMA_API_VERSION);
+
+    // Models from shapes: no file, no cooker, nothing on disk.
+    const tynima_shape ground_shape = tynima_shape_box(tynima_vec3_make(8.0f, 0.5f, 8.0f));
+    const tynima_shape ball_shape = tynima_shape_sphere(0.5f);
+    const std::uint32_t ground_model =
+        api.shape_model(engine, &ground_shape, tynima_vec4{0.4f, 0.4f, 0.4f, 1.0f}, 0.9f);
+    const std::uint32_t ball_model =
+        api.shape_model(engine, &ball_shape, tynima_vec4{0.8f, 0.2f, 0.2f, 1.0f}, 0.3f);
+    REQUIRE(ground_model == 0);
+    REQUIRE(ball_model == 1);
+    tynima_vec3 lo{}, hi{};
+    REQUIRE(tynima_model_bounds(engine, ball_model, &lo, &hi));
+    CHECK(hi.y == doctest::Approx(0.5f));
+    const tynima_shape bad{static_cast<tynima_shape_type>(99), {}, 1.0f, 1.0f, {}};
+    CHECK(api.shape_model(engine, &bad, tynima_vec4{1, 1, 1, 1}, 0.5f) == TYNIMA_NO_MODEL);
+    CHECK(api.load_model(engine, "/no/such/model.glb") == TYNIMA_NO_MODEL);
+
+    // Bodies: a floor that never moves and a ball that falls onto it.
+    tynima_body_desc floor_desc = tynima_body_desc_make(ground_shape, tynima_vec3_make(0.0f, -0.5f, 0.0f));
+    floor_desc.motion = TYNIMA_MOTION_STATIC;
+    floor_desc.user_data = 7;
+    const tynima_body floor = api.create_body(engine, &floor_desc);
+    tynima_body_desc ball_desc = tynima_body_desc_make(ball_shape, tynima_vec3_make(0.0f, 4.0f, 0.0f));
+    ball_desc.mass = 2.0f;
+    ball_desc.user_data = 11;
+    const tynima_body ball = api.create_body(engine, &ball_desc);
+    REQUIRE(floor.generation != 0);
+    REQUIRE(ball.generation != 0);
+
+    // An entity that draws the ball and follows its body.
+    const tynima_component_id transform_id = api.find_component(engine, TYNIMA_COMPONENT_TRANSFORM);
+    const tynima_component_id renderer_id = api.find_component(engine, TYNIMA_COMPONENT_MESH_RENDERER);
+    const tynima_component_id body_id = api.find_component(engine, TYNIMA_COMPONENT_RIGID_BODY);
+    tynima_transform transform{};
+    transform.position = ball_desc.position;
+    transform.rotation = tynima_quat_identity();
+    transform.scale = tynima_vec3_make(1.0f, 1.0f, 1.0f);
+    const tynima_mesh_renderer renderer{ball_model, true};
+    tynima_rigid_body rigid{};
+    rigid.body = ball;
+    const tynima_component_id ids[3] = {transform_id, renderer_id, body_id};
+    const void* values[3] = {&transform, &renderer, &rigid};
+    const tynima_entity entity = api.create_entity(engine, ids, values, 3);
+    REQUIRE(api.entity_alive(engine, entity));
+
+    // The light and the camera, from the module's side.
+    tynima_lighting lighting{};
+    api.get_lighting(engine, &lighting);
+    CHECK(lighting.sun_intensity > 0.0f);
+    lighting.sun_direction = tynima_vec3_normalize(tynima_vec3_make(0.3f, 1.0f, 0.2f));
+    lighting.sun_intensity = 4.0f;
+    lighting.sky = tynima_vec3_make(0.2f, 0.3f, 0.4f);
+    api.set_lighting(engine, &lighting);
+    tynima_lighting read_back{};
+    api.get_lighting(engine, &read_back);
+    CHECK(read_back.sun_intensity == 4.0f);
+    CHECK(read_back.sky.z == doctest::Approx(0.4f));
+    CHECK(read_back.sun_direction.y == doctest::Approx(lighting.sun_direction.y));
+    // A sun pointing nowhere is refused; the one that was there stays.
+    tynima_lighting nowhere = lighting;
+    nowhere.sun_direction = tynima_vec3_make(0.0f, 0.0f, 0.0f);
+    api.set_lighting(engine, &nowhere);
+    api.get_lighting(engine, &read_back);
+    CHECK(read_back.sun_direction.y == doctest::Approx(lighting.sun_direction.y));
+
+    tynima_point_light lights[2];
+    lights[0].position = tynima_vec3_make(0.0f, 2.0f, 0.0f);
+    lights[0].radius = 6.0f;
+    lights[0].color = tynima_vec3_make(2.0f, 1.0f, 0.5f);
+    lights[1] = lights[0];
+    api.set_point_lights(engine, lights, 2);
+    api.set_point_lights(engine, nullptr, 0);    // and off again
+    api.set_point_lights(engine, lights, 9999u); // clamped to TYNIMA_MAX_LIGHTS, not a crash
+
+    tynima_camera camera{};
+    api.get_camera(engine, &camera);
+    camera.position = tynima_vec3_make(0.0f, 3.0f, 8.0f);
+    camera.fov_y = 1.1f;
+    api.set_camera(engine, &camera);
+    api.get_camera(engine, &camera);
+    CHECK(camera.position.z == 8.0f);
+    CHECK(camera.fov_y == doctest::Approx(1.1f));
+
+    // A ray down the world's y axis meets the ball first, then the floor.
+    tynima_ray_hit hit{};
+    REQUIRE(api.cast_ray(engine, tynima_vec3_make(0.0f, 10.0f, 0.0f), tynima_vec3_make(0.0f, -1.0f, 0.0f),
+                         20.0f, &hit));
+    CHECK(hit.user_data == 11);
+    CHECK(hit.distance == doctest::Approx(5.5f).epsilon(0.05));
+    CHECK(hit.normal.y > 0.9f);
+    CHECK_FALSE(api.cast_ray(engine, tynima_vec3_make(50.0f, 10.0f, 0.0f),
+                             tynima_vec3_make(0.0f, -1.0f, 0.0f), 20.0f, &hit));
+
+    // Frames: the ball falls, its body says so, and the entity's transform follows.
+    for (int frame = 0; frame < 40; ++frame) {
+        REQUIRE(runtime.begin_frame());
+        runtime.end_frame();
+    }
+    tynima_vec3 position{};
+    REQUIRE(api.body_transform(engine, ball, &position, nullptr));
+    CHECK(position.y < 4.0f);
+    tynima_vec3 velocity{};
+    REQUIRE(api.body_velocity(engine, ball, &velocity, nullptr));
+    CHECK(velocity.y < 0.0f);
+    const auto* moved = static_cast<const tynima_transform*>(api.get_component(engine, entity, transform_id));
+    REQUIRE(moved != nullptr);
+    CHECK(moved->position.y == doctest::Approx(position.y).epsilon(0.05));
+    // The floor is where it was put: a static body does not move.
+    REQUIRE(api.body_transform(engine, floor, &position, nullptr));
+    CHECK(position.y == doctest::Approx(-0.5f));
+
+    // Destroyed, and then it is nobody: no transform, no velocity, no ray hit.
+    CHECK(api.destroy_body(engine, ball));
+    CHECK_FALSE(api.destroy_body(engine, ball));
+    CHECK_FALSE(api.body_transform(engine, ball, &position, nullptr));
+    CHECK_FALSE(api.body_velocity(engine, ball, &velocity, nullptr));
+    REQUIRE(api.cast_ray(engine, tynima_vec3_make(0.0f, 10.0f, 0.0f), tynima_vec3_make(0.0f, -1.0f, 0.0f),
+                         20.0f, &hit));
+    CHECK(hit.user_data == 7); // the floor, now that the ball is gone
+
+    // The window, and the quit a game's menu calls.
+    std::uint32_t width = 99, height = 99;
+    api.window_size(engine, &width, &height);
+    CHECK(width == 1280); // a headless window still has a size
+    CHECK(height == 720);
+    api.set_relative_mouse(engine, true); // no window server here: harmless
+    api.set_relative_mouse(engine, false);
+    api.quit(engine);
+    CHECK_FALSE(runtime.begin_frame());
 }

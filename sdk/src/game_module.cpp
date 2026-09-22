@@ -1,9 +1,8 @@
-#include <tynima/sdk/game_module.h>
-
 #include <tynima/core/log.h>
 #include <tynima/core/profile.h>
 #include <tynima/platform/file.h>
 #include <tynima/platform/time.h>
+#include <tynima/sdk/game_module.h>
 
 #include <utility>
 
@@ -89,12 +88,23 @@ bool GameModule::open_library() {
         return false;
     }
     const tynima_game* game = entry();
-    if (game == nullptr || game->api_version != TYNIMA_API_VERSION) {
+    // The table only ever grows at the end (sdk/src/abi.cpp), so an older
+    // module works with a newer engine: it calls the entries it knows and
+    // the ones it has never heard of sit past them. The other way round
+    // cannot work — the module would call entries this engine does not have.
+    if (game == nullptr || game->api_version < TYNIMA_API_VERSION_MIN ||
+        game->api_version > TYNIMA_API_VERSION) {
         error_ = "the game module was built against API version " +
-                 std::to_string(game != nullptr ? game->api_version : 0u) + ", the engine speaks " +
-                 std::to_string(TYNIMA_API_VERSION);
+                 std::to_string(game != nullptr ? game->api_version : 0u) + "; this engine speaks " +
+                 std::to_string(TYNIMA_API_VERSION_MIN) + " to " + std::to_string(TYNIMA_API_VERSION) +
+                 (game != nullptr && game->api_version > TYNIMA_API_VERSION ? " — rebuild the engine"
+                                                                            : " — rebuild the module");
         close_library();
         return false;
+    }
+    if (game->api_version < TYNIMA_API_VERSION) {
+        TY_LOG_INFO("game", "%s speaks API version %u; this engine is at %u", path_.c_str(),
+                    game->api_version, TYNIMA_API_VERSION);
     }
     game_ = game;
     loaded_write_time_ = write_time;

@@ -49,12 +49,15 @@ function(tynima_add_module)
   endforeach()
 
   if(TYNIMA_BUILD_TESTS)
-    file(GLOB_RECURSE test_sources CONFIGURE_DEPENDS ${dir}/tests/*.cpp)
+    # C sources under tests/ are built as C11: how the sdk checks that
+    # tynima.h is the C header it claims to be, compiled by a C compiler.
+    file(GLOB_RECURSE test_sources CONFIGURE_DEPENDS ${dir}/tests/*.cpp ${dir}/tests/*.c)
     if(test_sources)
       add_executable(${target}_tests ${test_sources})
       target_link_libraries(${target}_tests PRIVATE tynima::${ARG_NAME} doctest::doctest_with_main)
       tynima_apply_warnings(${target}_tests)
-      set_target_properties(${target}_tests PROPERTIES FOLDER "tests")
+      set_target_properties(${target}_tests PROPERTIES FOLDER "tests" C_STANDARD 11 C_STANDARD_REQUIRED ON
+                                                       C_EXTENSIONS OFF)
       add_test(NAME ${ARG_NAME} COMMAND ${target}_tests)
     endif()
   endif()

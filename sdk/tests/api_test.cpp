@@ -1,11 +1,14 @@
-#include <doctest/doctest.h>
 #include <tynima.h>
+
 #include <tynima/physics/physics.h>
 #include <tynima/platform/input.h>
 #include <tynima/scene/components.h>
 #include <tynima/scene/world.h>
 #include <tynima/sdk/game_module.h>
 
+#include <doctest/doctest.h>
+
+#include <cstddef>
 #include <cstdint>
 
 namespace scene = tynima::scene;
@@ -46,8 +49,8 @@ TEST_CASE("the C API drives the World, and agrees with the C++ API by name") {
     CHECK(world.get<Pos>(scene::Entity{e.index, e.generation})->y == 20); // the very same storage
 
     // add / remove through the API
-    const tynima_component_id transform =
-        api.register_component(&engine, scene::Transform::kName, sizeof(scene::Transform), alignof(scene::Transform));
+    const tynima_component_id transform = api.register_component(
+        &engine, scene::Transform::kName, sizeof(scene::Transform), alignof(scene::Transform));
     const scene::Transform t{.position = {5, 6, 7}};
     CHECK(api.add_component(&engine, e, transform, &t));
     CHECK_FALSE(api.add_component(&engine, e, transform, &t));
@@ -137,4 +140,45 @@ TEST_CASE("a missing game module fails to load with a reason") {
     CHECK_FALSE(module.poll(engine));
     module.update(engine, 0.016f); // harmless when nothing is loaded
     module.unload(engine);
+}
+
+// What sdk/tests/c_abi.c, compiled as C11, reports back about the header.
+extern "C" {
+int tynima_c_abi_api_version(void);
+int tynima_c_abi_table_entries(void);
+int tynima_c_abi_math(void);
+int tynima_c_abi_structs(void);
+const tynima_game* tynima_c_abi_game(void);
+}
+
+TEST_CASE("the header is C: a C11 translation unit sees the same ABI and the same answers") {
+    // The same numbers on both sides of the language boundary.
+    CHECK(tynima_c_abi_api_version() == static_cast<int>(TYNIMA_API_VERSION));
+    CHECK(tynima_c_abi_table_entries() == static_cast<int>(sizeof(tynima_api) / sizeof(void*)) - 1);
+    // The inline math and the value types, used the way a game in C uses them.
+    CHECK(tynima_c_abi_math());
+    CHECK(tynima_c_abi_structs());
+    // A game module's entry point, filled in by C, read by the engine's loader.
+    const tynima_game* game = tynima_c_abi_game();
+    REQUIRE(game != nullptr);
+    CHECK(game->api_version == TYNIMA_API_VERSION);
+    CHECK(game->load != nullptr);
+    CHECK(game->update != nullptr);
+    CHECK(game->unload == nullptr); // a module need not want every one
+}
+
+TEST_CASE("the ABI's promises: the table only grows at the end, and older modules still load") {
+    const tynima_api& api = tynima::sdk::api();
+    CHECK(api.version == TYNIMA_API_VERSION);
+    // Every entry is filled in: a null one is a module calling nothing.
+    const void* const* entries = reinterpret_cast<const void* const*>(&api);
+    const std::size_t count = sizeof(tynima_api) / sizeof(void*);
+    for (std::size_t i = 1; i < count; ++i) {
+        CHECK_MESSAGE(entries[i] != nullptr, "table entry ", i, " is null");
+    }
+    // The entries a version 6 module knows sit where they always did: its
+    // header ended at set_component_defaults, entry 33 of the table.
+    CHECK(offsetof(tynima_api, set_component_defaults) == sizeof(void*) * 33);
+    CHECK(offsetof(tynima_api, quit) == sizeof(void*) * 34);
+    CHECK(TYNIMA_API_VERSION_MIN <= TYNIMA_API_VERSION);
 }

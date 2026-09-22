@@ -281,6 +281,44 @@ The built-in components are declared as C structs (`tynima_transform`, ...)
 whose layouts the engine checks against its own when it is built, and a few
 inline vector and quaternion helpers keep a C host from needing a math library.
 
+### The ABI, and the audit that keeps it
+
+Phase 6 starts by settling what that header promises. Three things came out
+of reading it as a stranger would.
+
+It was not self-contained: it included `<tynima/platform/keys.def>` for the
+key list, so a game outside this tree could not compile the one file it is
+supposed to need. The list is inlined now, and `sdk/src/api.cpp` asserts it
+against the engine's own, key by key, so the copy cannot drift.
+
+It had no way to say no to a module built against an older version: the
+loader demanded an exact match, which would break every existing game on
+each release even though the table only ever grows at the end. A module now
+loads when its version is between `TYNIMA_API_VERSION_MIN` and the engine's
+own, and is refused with which of the two to rebuild when it is not.
+
+And nothing enforced the promises. [`sdk/src/abi.cpp`](sdk/src/abi.cpp) is a
+file of nothing but `static_assert`: the size of the table, the offset of the
+first entry of every version's block, the size and every field offset of
+every struct that crosses the boundary, and that `tynima_game` — which the
+engine reads out of a module built against an older header — never grows.
+Inserting a function into the middle of the table fails the build with the
+number that changed, instead of shipping and reading the wrong entry.
+`sdk/tests/c_abi.c` compiles the header as C11 with warnings as errors,
+twice in one translation unit, and uses it the way a game in C would; a test
+checks its answers against the C++ side's.
+
+The other half of the audit is the editor. It is a client of `tynima.h` and
+nothing else, and `tools/check_layering.py` now enforces exactly that
+(`PUBLIC_API_ONLY`) rather than merely that it depends on `sdk` — so a panel
+that wants something the header lacks is a hole in the header. Reading the
+editor and the sandbox side by side turned up what a game could not do at
+all: move the camera, light the scene, make a model without an asset file,
+create a physics body, cast a ray, size the window, or quit. All of that was
+host-only C++. Version 9 of the table adds it, as one block at the end, and
+a test builds a whole scene — ground, a falling ball, lights, a ray that
+finds it — through the table alone, which is what a game module gets.
+
 Behind the C functions is `sdk::Runtime` ([`sdk/include/tynima/sdk/runtime.h`](sdk/include/tynima/sdk/runtime.h)),
 the same object the sandbox drives directly: everything `apps/sandbox`'s
 `main()` did by hand through Phase 4 — the window, the device, the frame
