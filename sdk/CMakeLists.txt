@@ -4,3 +4,4 @@
 # templates and codegen. The only thing the editor and games may see.
 tynima_add_module(NAME sdk
   DEPENDS core platform rhi render ui physics scene assets cooker script)
+# A script's Lua is the engine's own until a game ships its own copy.

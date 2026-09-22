@@ -1,5 +1,3 @@
-#include <tynima/sdk/runtime.h>
-
 #include <tynima/assets/model_blob.h>
 #include <tynima/cooker/cook.h>
 #include <tynima/core/assert.h>
@@ -10,6 +8,7 @@
 #include <tynima/platform/time.h>
 #include <tynima/scene/components.h>
 #include <tynima/scene/systems.h>
+#include <tynima/sdk/runtime.h>
 
 #include <algorithm>
 #include <cstdio>
@@ -186,6 +185,19 @@ bool Runtime::create(const RuntimeDesc& desc) {
         }
     }
     model_watch_ = assets::FileWatch(static_cast<double>(desc.asset_poll_seconds));
+    if (desc.script != nullptr && desc.script[0] != '\0') {
+        script_ = script::Vm::create({.lua_path = desc.lua_path,
+                                      .api = &api(),
+                                      .engine = &context_,
+                                      .poll_seconds = desc.asset_poll_seconds});
+        if (script_ == nullptr) {
+            TY_LOG_ERROR("lua", "%s", script::Vm::last_create_error());
+        } else if (!script_->load(desc.script)) {
+            TY_LOG_ERROR("lua", "%s", script_->last_error());
+        } else {
+            TY_LOG_INFO("lua", "running %s", desc.script);
+        }
+    }
     events_.reserve(64); // a frame's worth; growing later would count as a frame allocation
     last_time_ = platform::now_seconds();
     last_report_ = last_time_;
@@ -199,6 +211,10 @@ void Runtime::destroy() noexcept {
     if (frame_open_) {
         ui_.end_frame(*window_);
         frame_open_ = false;
+    }
+    if (script_ != nullptr) {
+        script_->unload();
+        script_.reset();
     }
     if (game_ != nullptr) {
         game_->unload(context_);
@@ -313,10 +329,18 @@ void Runtime::end_frame() {
     }
     models_reloaded_ = false;
     poll_models(); // so do these, and they are drawn this frame
+    script_reloaded_ = false;
+    if (script_ != nullptr && script_->poll()) {
+        script_reloaded_ = true;
+        ++stats_.script_reloads;
+    }
     {
         TY_PROFILE_SCOPE_NAMED("systems");
         if (game_ != nullptr) {
             game_->update(context_, dt_);
+        }
+        if (script_ != nullptr) {
+            script_->update(dt_);
         }
         // Physics runs at a fixed 60 Hz whatever the frame rate: the frame's
         // time accumulates into whole steps, and what is drawn is blended
@@ -355,7 +379,10 @@ void Runtime::end_frame() {
                     static_cast<unsigned long long>(engine_allocations),
                     static_cast<unsigned long long>(external_allocations));
     }
-    if (frame_index_ >= 10 && engine_allocations > 0 && !game_reloaded_ && !models_reloaded_) {
+    // A script allocates as it runs — that is what a VM does — so the rule
+    // is about engine code, and a frame with a script in it is exempt.
+    if (frame_index_ >= 10 && engine_allocations > 0 && !game_reloaded_ && !models_reloaded_ &&
+        script_ == nullptr) {
         TY_LOG_ERROR("heap", "frame %ld: engine code made %llu heap allocation(s)", frame_index_,
                      static_cast<unsigned long long>(engine_allocations));
         TY_ASSERT(engine_allocations == 0, "a frame allocated on the heap from engine code");
@@ -500,13 +527,13 @@ void Runtime::render_frame() {
         }
         // The post stack's last pass produces the picture: the UI reads or
         // loads that version, which is what puts the UI pass after it.
-        target = post_.add_passes(graph, hdr, depth, target,
-                                  {.width = width,
-                                   .height = height,
-                                   .encode_srgb = !device_->swapchain_is_linear(),
-                                   .view_projection = camera.view_projection(aspect),
-                                   .view_projection_jittered =
-                                       camera.view_projection(aspect, scene_frame.jitter)});
+        target = post_.add_passes(
+            graph, hdr, depth, target,
+            {.width = width,
+             .height = height,
+             .encode_srgb = !device_->swapchain_is_linear(),
+             .view_projection = camera.view_projection(aspect),
+             .view_projection_jittered = camera.view_projection(aspect, scene_frame.jitter)});
         post_.settings.tonemap = tonemap;
         post_.settings.bloom = bloom;
         if (!to_viewport) {

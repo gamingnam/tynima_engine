@@ -22,12 +22,18 @@ endif()
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 set_property(GLOBAL PROPERTY USE_FOLDERS ON)
 
+include(CMakeDependentOption)
 option(TYNIMA_BUILD_TESTS        "Build unit tests (doctest)"             ON)
 option(TYNIMA_BUILD_EDITOR       "Build the editor"                       ON)
 option(TYNIMA_BUILD_APPS         "Build apps/ (the sandbox)"              ON)
 option(TYNIMA_FETCH_SDL3         "Fetch and build SDL3 with FetchContent" ON)
 option(TYNIMA_WARNINGS_AS_ERRORS "Treat compiler warnings as errors"      OFF)
 option(TYNIMA_PROFILE            "Compile in Tracy instrumentation"       ON)
+# LuaJIT is built by its own Makefile, which needs make and a GCC-style
+# driver; that is every platform here but MSVC, which builds it with
+# msvcbuild.bat instead (Phase 6, task 6). Without it, engine/script builds
+# and every entry point says there is no VM.
+cmake_dependent_option(TYNIMA_LUA "Embed LuaJIT for game scripts" ON "NOT MSVC" OFF)
 
 if(TYNIMA_BUILD_TESTS)
   enable_testing()

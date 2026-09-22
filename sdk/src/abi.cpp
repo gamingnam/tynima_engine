@@ -42,7 +42,9 @@ constexpr std::size_t kEntriesV6 = 2;  // a component's defaults
 constexpr std::size_t kEntriesV9 = 15; // the camera, the light, models, bodies, rays, the window
 constexpr std::size_t kEntries = kEntriesV1 + kEntriesV4 + kEntriesV5 + kEntriesV6 + kEntriesV9;
 
-static_assert(TYNIMA_API_VERSION == 9u, "a new version means a new block of entries below");
+// Version 10 added no entries: it says the engine runs Lua against this
+// same table, which is a promise about the engine, not about the table.
+static_assert(TYNIMA_API_VERSION == 10u, "a new version means a new block of entries below");
 static_assert(TYNIMA_API_VERSION_MIN <= TYNIMA_API_VERSION);
 static_assert(sizeof(tynima_api) == kEntry * (kEntries + 1), "the table grew or shrank somewhere");
 static_assert(offsetof(tynima_api, version) == 0, "the version word is what a module reads first");
@@ -127,7 +129,7 @@ static_assert(sizeof(tynima_component_info) == 16 && offsetof(tynima_component_i
 // against one version and run against another reads them the same way.
 static_assert(sizeof(tynima_log_entry) == 24 + TYNIMA_LOG_CATEGORY_MAX + TYNIMA_LOG_MESSAGE_MAX);
 static_assert(sizeof(tynima_render_settings) == 24);
-static_assert(sizeof(tynima_stats) == 80);
+static_assert(sizeof(tynima_stats) == 88);
 static_assert(sizeof(tynima_engine_desc) == 56);
 
 // The enumerations a module passes by value: their ranges are ABI too.

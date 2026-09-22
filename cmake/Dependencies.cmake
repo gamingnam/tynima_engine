@@ -75,6 +75,45 @@ if(NOT TARGET meshoptimizer::meshoptimizer)
   add_library(meshoptimizer::meshoptimizer ALIAS meshoptimizer)
 endif()
 
+# LuaJIT: the VM game scripts run in, and the reason scripts need no
+# bindings written by hand — its FFI calls C through the same tynima_api
+# table a C game module gets, JIT-compiled, from declarations generated out
+# of tynima.h (tools/gen_lua.py).
+#
+# It has no CMake build of its own, and reimplementing its two-stage one
+# (minilua, then dynasm, then buildvm, then the library) is a good way to
+# get it subtly wrong. So it is fetched like everything else, pinned by
+# hash, and built by the Makefile its authors maintain; what CMake keeps is
+# the target that depends on the resulting library.
+if(TYNIMA_LUA)
+  FetchContent_Declare(luajit
+    URL      https://github.com/LuaJIT/LuaJIT/archive/c6ffc141a8762b41703f9287d63d93622a13dd8f.tar.gz
+    URL_HASH SHA256=6e5fec07750add912e7c3eae0c194d24cd6d023714e1f04a0298a5b4819e4457
+    EXCLUDE_FROM_ALL SYSTEM)
+  FetchContent_MakeAvailable(luajit) # no CMakeLists inside: this only unpacks it
+  set(luajit_library "${luajit_SOURCE_DIR}/src/libluajit.a")
+  # LuaJIT's Makefile builds in its own source tree, so the build directory
+  # is read-only to it; that is why it is fetched per build directory.
+  add_custom_command(OUTPUT "${luajit_library}"
+    COMMAND ${CMAKE_COMMAND} -E env
+            "MACOSX_DEPLOYMENT_TARGET=${CMAKE_OSX_DEPLOYMENT_TARGET}"
+            make -C "${luajit_SOURCE_DIR}" -j 4 amalg
+    WORKING_DIRECTORY "${luajit_SOURCE_DIR}"
+    COMMENT "Building LuaJIT with its own Makefile"
+    VERBATIM)
+  add_custom_target(luajit_build DEPENDS "${luajit_library}")
+  add_library(luajit INTERFACE)
+  add_dependencies(luajit luajit_build)
+  target_include_directories(luajit SYSTEM INTERFACE "${luajit_SOURCE_DIR}/src")
+  target_link_libraries(luajit INTERFACE "${luajit_library}")
+  if(APPLE AND CMAKE_SYSTEM_PROCESSOR STREQUAL "x86_64")
+    # 64-bit Intel Macs: LuaJIT's allocator needs the low 4 GB, which the
+    # default page-zero size hides. Apple Silicon is GC64 and needs nothing.
+    target_link_options(luajit INTERFACE LINKER:-pagezero_size,10000 LINKER:-image_base,100000000)
+  endif()
+  add_library(luajit::luajit ALIAS luajit)
+endif()
+
 # Jolt Physics: the reference the Phase 3 solver is measured against, behind
 # physics::PhysicsWorld. Built as plain CPU physics — no GPU compute back
 # ends, no object streams, no built-in profiler or debug renderer — and

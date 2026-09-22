@@ -17,7 +17,7 @@ past that declaration.
 | ----------------- | ------------------------------------ | ----------------------------------------------------------- |
 | `editor/`         | `sdk` (and Dear ImGui's headers)     | The editor — a client of the SDK, no special privileges     |
 | `sdk/`            | everything below                     | `tynima.h` C ABI and the runtime behind its host half       |
-| `engine/script/`  | `core scene assets`                  | Lua / C# bindings generated from reflection                 |
+| `engine/script/`  | `core platform scene assets`         | LuaJIT: the VM a game's scripts run in                      |
 | `engine/cooker/`  | `core platform render assets`        | Offline: glTF import, mesh ordering, mip chains, the cook   |
 | `engine/assets/`  | `core platform rhi render`           | Runtime loading of cooked blobs, GPU upload, file watching  |
 | `engine/scene/`   | `core render physics`                | Archetype ECS, transforms, the systems that drive the rest  |
@@ -53,6 +53,7 @@ ctest --preset macos-debug
 ./build/macos-debug/editor/tynima-editor --model build/macos-debug/assets/WaterBottle.glb
 ./build/macos-debug/tools/cook/tynima-cook build/macos-debug/assets/ -o cooked/
 ./build/macos-debug/tools/golden/tynima-golden          # the renderer's golden image tests
+./build/macos-debug/apps/sandbox/tynima-sandbox --script apps/sandbox/scripts/pile.lua
 ```
 
 The sandbox loads a glTF model (a CC0 Khronos sample, downloaded into
@@ -403,6 +404,66 @@ atlas, growing as glyphs are used) and the layer creates, updates and frees
 them through the device. The UI is one more pass in the frame graph, over the
 picture — or over a cleared window when the picture went to the editor's
 viewport texture, which ImGui then shows like any image.
+
+## Games in Lua
+
+A script is a game module written in Lua, and it reaches the engine the
+same way a C one does: through the `tynima_api` table. LuaJIT's FFI calls C
+from declarations rather than from bindings, so there are no bindings to
+write — [`tools/gen_lua.py`](tools/gen_lua.py) turns
+[`sdk/include/tynima.h`](sdk/include/tynima.h) into
+[`engine/script/lua/tynima_ffi.lua`](engine/script/lua/tynima_ffi.lua), every
+typedef, enum and the table itself, and a test regenerates it and fails when
+it has drifted from the header. The calls are JIT-compiled; there is no
+marshalling layer in between, and the sizes LuaJIT computes are the ones
+[`sdk/src/abi.cpp`](sdk/src/abi.cpp) pins for the C compiler.
+
+[`engine/script/lua/tynima.lua`](engine/script/lua/tynima.lua) is the half
+written for people: vectors with operators, entities by component name,
+shapes that make both a body and the model that draws it, the camera, the
+light, rays. A whole game:
+
+```lua
+local ty = require("tynima")
+local game = {}
+
+function game.load()
+  local shape = ty.box(0.5)
+  local model = ty.shape_model(shape, {0.8, 0.3, 0.2})
+  local body = ty.body{ shape = shape, position = {0, 4, 0}, mass = 2 }
+  game.crate = ty.entity{ Transform = {position = {0, 4, 0}},
+                          MeshRenderer = {model = model}, RigidBody = {body = body} }
+  ty.look_at({6, 4, 8}, {0, 1, 0})
+end
+
+function game.update(dt)
+  if ty.key_pressed("Space") then ty.impulse(ty.get(game.crate, "RigidBody").body, ty.vec3(0, 8, 0)) end
+end
+
+return game
+```
+
+`tynima-sandbox --script apps/sandbox/scripts/pile.lua` runs one
+([that script](apps/sandbox/scripts/pile.lua) drops two dozen boxes and
+knocks them over with Space). Save the file and it reloads within a quarter
+second, with the world it built still standing — the same file watch the
+cooked models use, and no compiler in the loop at all.
+
+The part that is "generated from reflection" is components. The six the
+engine declares are real C structs, so `ty.get(e, "Transform").position.y = 3`
+is a store into the world's own memory. Anything else — a component a game
+module defined in C++ and described through `TY_REFLECT` — has no
+declaration for the FFI to read, so the script builds one: it asks the
+engine for the component's fields, writes a packed C struct with each field
+at its own offset and the gaps between them filled, `ffi.cdef`s it, and
+checks that what it built is the size the engine says. A script can then
+read and write a component that did not exist when the script was written.
+
+LuaJIT is fetched and built by its own Makefile
+([`cmake/Dependencies.cmake`](cmake/Dependencies.cmake)), which is every
+platform here but MSVC — `TYNIMA_LUA` is off there until Phase 6's Windows
+task, and without it the engine builds and `script::Vm::create()` says there
+is no VM.
 
 ## Game modules and hot reload
 
@@ -816,4 +877,4 @@ MIT — see [LICENSE](LICENSE). Sample content downloaded at configure time
 (Khronos glTF-Sample-Assets) is CC0. Third-party code fetched by the build
 keeps its own license: SDL3 (zlib), doctest (MIT), Tracy (BSD-3), cgltf (MIT),
 stb (MIT / public domain), meshoptimizer (MIT), Jolt Physics (MIT), Dear ImGui
-(MIT).
+(MIT), LuaJIT (MIT).

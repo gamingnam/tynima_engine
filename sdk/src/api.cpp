@@ -937,6 +937,7 @@ void tynima_get_stats(tynima_engine* engine, tynima_stats* out) {
     out->heap_allocations = stats.heap_allocations;
     out->game_reloads = stats.game_reloads;
     out->model_reloads = stats.model_reloads;
+    out->script_reloads = stats.script_reloads;
     if (tynima::rhi::Device* device = runtime->device()) {
         const tynima::rhi::Device::GpuStats gpu = device->gpu_stats();
         out->gpu_ms = static_cast<float>(gpu.frame_ms);

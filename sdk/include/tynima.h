@@ -26,6 +26,8 @@
  *   8  models cook on load and reload when their file changes
  *   9  a game's own half: the camera, the lighting, models from shapes,
  *      physics bodies and ray casts, all through the table a module gets
+ *  10  no new entries: the engine can run Lua scripts against this table
+ *      (engine/script), and tynima_stats counts how often one reloaded
  *
  * The rule that keeps this ABI: the table only ever grows at the end, and
  * no declaration in it ever changes. A module built against an older
@@ -45,7 +47,7 @@
 extern "C" {
 #endif
 
-#define TYNIMA_API_VERSION 9u
+#define TYNIMA_API_VERSION 10u
 /* The oldest a game module may have been built against and still load. */
 #define TYNIMA_API_VERSION_MIN 1u
 
@@ -831,6 +833,7 @@ typedef struct tynima_stats {
     uint64_t heap_allocations; /* engine code's, in the last frame: the rule says zero */
     uint32_t game_reloads;     /* how many times the game module was swapped */
     uint32_t model_reloads;    /* how many times a model was loaded again after its file changed */
+    uint32_t script_reloads;   /* how many times a Lua script was loaded again after its file changed */
 } tynima_stats;
 void tynima_get_stats(tynima_engine* engine, tynima_stats* out);
 

@@ -19,6 +19,7 @@
 #include <tynima/render/scene_renderer.h>
 #include <tynima/rhi/device.h>
 #include <tynima/scene/world.h>
+#include <tynima/script/vm.h>
 #include <tynima/sdk/game_module.h>
 #include <tynima/ui/imgui_layer.h>
 
@@ -41,7 +42,8 @@
 // clock and the input — or a replay's, or a script's — and starts the UI
 // frame. The host then reads and changes the world, moves its camera and
 // draws its panels. end_frame() reloads the game module when its file has
-// changed and any model whose file has, runs the module, steps the physics
+// changed, the script when its file has, and any model whose file has, runs
+// the module and the script, steps the physics
 // at a fixed 60 Hz, updates the transforms, and renders: the world's draws
 // through the scene renderer into HDR, the post stack from there to the
 // window (or to the viewport texture the host asked for), the UI over the
@@ -71,7 +73,11 @@ struct RuntimeDesc {
     std::uint32_t max_entities = 65536;
     std::uint32_t max_bodies = 4096;
     const char* game_module = nullptr; // a shared library to load and hot-reload, or null
-    long max_frames = -1;              // begin_frame() returns false past this many; -1: never
+    // A Lua script to run beside it (or instead of it), reloaded when its
+    // file changes. It gets the same table the module does.
+    const char* script = nullptr;
+    const char* lua_path = nullptr; // where tynima.lua lives; null: the built-in one
+    long max_frames = -1;           // begin_frame() returns false past this many; -1: never
 
     // Time and input from a log instead of the clock and the keyboard: the
     // run is the recorded one, frame for frame. Sets max_frames to its length.
@@ -87,7 +93,8 @@ struct RuntimeDesc {
     // Where a source model given to load_model() cooks to; null: a .cooked
     // directory beside the source.
     const char* cook_dir = nullptr;
-    // How often the models' files are looked at for a change, in seconds.
+    // How often the files behind the models and the script are looked at
+    // for a change, in seconds.
     float asset_poll_seconds = 0.25f;
 };
 
@@ -136,6 +143,7 @@ public:
     [[nodiscard]] const render::PostStack& post() const noexcept { return post_; }
     [[nodiscard]] const render::FrameGraph& graph() const noexcept { return *graph_; }
     [[nodiscard]] GameModule* game() noexcept { return game_.get(); }
+    [[nodiscard]] script::Vm* script() noexcept { return script_.get(); }
     [[nodiscard]] tynima_engine& context() noexcept { return context_; }
     [[nodiscard]] const physics::FixedStepper& stepper() const noexcept { return stepper_; }
     [[nodiscard]] const RuntimeDesc& desc() const noexcept { return desc_; }
@@ -218,7 +226,8 @@ public:
         float frame_ms = 0.0f;
         std::uint64_t heap_allocations = 0; // engine code's, in the last frame
         std::uint32_t game_reloads = 0;
-        std::uint32_t model_reloads = 0; // models loaded again after their file changed
+        std::uint32_t model_reloads = 0;  // models loaded again after their file changed
+        std::uint32_t script_reloads = 0; // scripts loaded again after their file changed
     };
     [[nodiscard]] const Stats& stats() const noexcept { return stats_; }
 
@@ -257,6 +266,7 @@ private:
     std::unique_ptr<scene::World> world_;
     std::unique_ptr<physics::PhysicsWorld> physics_;
     std::unique_ptr<GameModule> game_;
+    std::unique_ptr<script::Vm> script_;
     tynima_engine context_{};
     std::unique_ptr<core::Arena> frame_arena_;
     platform::Input input_;
@@ -279,6 +289,7 @@ private:
     bool reported_swapchain_ = false;
     bool game_reloaded_ = false;
     bool models_reloaded_ = false;
+    bool script_reloaded_ = false;
     std::uint32_t last_culled_ = 0;
     long frame_index_ = 0;
     float dt_ = 0.0f;

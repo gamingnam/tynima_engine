@@ -47,8 +47,8 @@
 #include <tynima/render/mesh.h>
 #include <tynima/render/model.h>
 #include <tynima/render/post.h>
-#include <tynima/render/shapes.h>
 #include <tynima/render/scene_renderer.h>
+#include <tynima/render/shapes.h>
 #include <tynima/rhi/device.h>
 #include <tynima/scene/components.h>
 #include <tynima/scene/scene_file.h>
@@ -328,9 +328,10 @@ struct Options {
     bool jolt = false; // the reference physics instead of the engine's own
     rhi::Backend rhi = rhi::Backend::Auto;
     render::ShadingPath shading = render::ShadingPath::Forward;
-    std::string record; // write the input log here at exit
-    std::string replay; // play this input log instead of live input and time
+    std::string record;     // write the input log here at exit
+    std::string replay;     // play this input log instead of live input and time
     std::string save_scene; // write the scene here at exit
+    std::string script;     // a Lua game to run instead of the sandbox's own scene
 };
 
 // Exit codes past the usual 0 and 1.
@@ -347,6 +348,8 @@ Options parse_options(int argc, char** argv) {
             options.max_frames = std::strtol(argv[++i], nullptr, 10);
         } else if (std::strcmp(argv[i], "--model") == 0 && i + 1 < argc) {
             options.model = argv[++i];
+        } else if (std::strcmp(argv[i], "--script") == 0 && i + 1 < argc) {
+            options.script = argv[++i];
         } else if (std::strcmp(argv[i], "--physics") == 0 && i + 1 < argc) {
             const char* which = argv[++i];
             options.jolt = std::strcmp(which, "jolt") == 0;
@@ -384,6 +387,7 @@ Options parse_options(int argc, char** argv) {
             options.save_scene = argv[++i];
         } else {
             std::fprintf(stderr, "usage: tynima-sandbox [--headless] [--frames N] [--model path.glb] "
+                                 "[--script game.lua] "
                                  "[--physics tynima|jolt] [--rhi sdl|metal] [--shading forward|fused|split] "
                                  "[--record log.tyrec | --replay log.tyrec] [--save-scene scene.toml]\n");
             std::exit(kExitUsage);
@@ -718,7 +722,11 @@ int main(int argc, char** argv) {
     desc.jolt = options.jolt;
     desc.max_entities = 4096;
     desc.max_bodies = 1024;
-    desc.game_module = TYNIMA_SANDBOX_GAME_MODULE;
+    // A script builds its own world, so the sandbox's scene stays out of
+    // its way: the game module, the pile and the character are the C++
+    // sandbox's, and --script is a game written in Lua instead.
+    desc.game_module = options.script.empty() ? TYNIMA_SANDBOX_GAME_MODULE : nullptr;
+    desc.script = options.script.empty() ? nullptr : options.script.c_str();
     desc.max_frames = options.max_frames;
     desc.replay = options.replay.empty() ? nullptr : &log;
     desc.record = !options.record.empty();
@@ -747,15 +755,18 @@ int main(int argc, char** argv) {
     // The model comes through the runtime, cooked on the way in when its
     // blob is missing or stale, in every mode: the headless run covers the
     // cooker and the blob reader too. Its bounds are known without a GPU.
-    const bool has_model = runtime.load_model(options.model.c_str()) == kModelBottle;
+    // A script builds its own scene; the sandbox's own is skipped then.
+    const bool has_model =
+        options.script.empty() && runtime.load_model(options.model.c_str()) == kModelBottle;
     Aabb bottle_bounds;
     if (has_model) {
         const render::Mesh& bottle = runtime.model(kModelBottle)->mesh;
         bottle_bounds = {bottle.bounds_min, bottle.bounds_max};
         // The runtime's model slots, in kModel* order.
         (void)runtime.add_model(make_floor_model());
-        (void)runtime.add_model(render::plain_model(
-            render::capsule_mesh(kCharacterRadius, kCharacterHalfHeight), Vec4{0.20f, 0.45f, 0.85f, 1.0f}, 0.6f));
+        (void)runtime.add_model(
+            render::plain_model(render::capsule_mesh(kCharacterRadius, kCharacterHalfHeight),
+                                Vec4{0.20f, 0.45f, 0.85f, 1.0f}, 0.6f));
         (void)runtime.add_model(
             render::plain_model(render::box_mesh(kGateHalf), Vec4{0.55f, 0.36f, 0.20f, 1.0f}, 0.8f));
     } else {
@@ -802,9 +813,16 @@ int main(int argc, char** argv) {
     runtime.set_before_step(CharacterStep::before_step, &character_step);
     render::PointLight lights[kLightCount];
 
+    // With a script, the game is the script's: the sandbox pumps frames and
+    // keeps out of the way of the camera, the keys and the scene.
+    const bool scripted = !options.script.empty();
     while (runtime.begin_frame()) {
         const platform::Input& input = runtime.input();
         const float dt = runtime.dt();
+        if (scripted) {
+            runtime.end_frame();
+            continue;
+        }
         report_edges(input);
         if (input.key_pressed(platform::Key::Escape)) {
             runtime.quit();

@@ -49,6 +49,12 @@ target_compile_definitions(tynima_sandbox PRIVATE TYNIMA_SANDBOX_ASSETS_DIR="${s
 #                  --record apps/sandbox/replays/pile_jolt.tyrec
 if(TYNIMA_BUILD_TESTS)
   add_test(NAME sandbox_headless COMMAND tynima_sandbox --headless --frames 30)
+  # The same loop with a game written in Lua instead of the sandbox's own
+  # scene: LuaJIT, the generated FFI declarations and the wrapper, end to end.
+  if(TYNIMA_LUA)
+    add_test(NAME sandbox_script
+      COMMAND tynima_sandbox --headless --frames 60 --script "${CMAKE_CURRENT_SOURCE_DIR}/scripts/pile.lua")
+  endif()
   foreach(log IN ITEMS pile pile_jolt)
     add_test(NAME sandbox_replay_${log}
       COMMAND tynima_sandbox --headless --replay "${CMAKE_CURRENT_SOURCE_DIR}/replays/${log}.tyrec")
