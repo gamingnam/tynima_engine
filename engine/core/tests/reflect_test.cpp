@@ -27,7 +27,7 @@ struct Probe {
     float weight = 1.0f;
     Vec3 position;
     Quat rotation;
-    char label[16] = "";
+    char label[16] = "probe";
     WidgetHandle widget;
     Plain other; // no traits: bytes
     std::uint64_t secret = 0;
@@ -75,13 +75,22 @@ TEST_CASE("a reflected struct lists its fields with their kinds, offsets and siz
         CHECK(f[i].offset + f[i].size <= sizeof(Probe));
         last_end = f[i].offset + f[i].size;
     }
-    // The defaults are a default-constructed instance.
+    // The defaults are a default-constructed instance. An array with
+    // something in it is checked twice over, because there are two ways to
+    // get it wrong and they are not the same bug: the compiler may compute
+    // the default wrongly, or compute it and emit the object it lives in
+    // with the array zeroed. The static_assert is the first, the string
+    // comparison below it the second.
+    static constexpr Probe computed{};
+    static_assert(computed.label[0] == 'p' && computed.weight == 1.0f,
+                  "a default-constructed Probe carries its declared defaults");
     REQUIRE(type.size == sizeof(Probe));
     REQUIRE(type.defaults != nullptr);
     const auto* defaults = static_cast<const Probe*>(type.defaults);
     CHECK(defaults->weight == 1.0f);
     CHECK(defaults->count == 0);
     CHECK(defaults->rotation.w == 1.0f);
+    CHECK(std::string(defaults->label) == "probe");
     CHECK(std::string(core::field_kind_name(core::FieldKind::Quat)) == "quat");
     CHECK(std::string(core::field_kind_name(core::FieldKind::Bytes)) == "bytes");
 }

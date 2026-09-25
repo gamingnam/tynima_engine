@@ -13,6 +13,7 @@
 
 #include <doctest/doctest.h>
 
+#include <algorithm>
 #include <cstdlib>
 #include <filesystem>
 #include <string>
@@ -29,7 +30,12 @@ namespace {
 
 // The fence the tutorial marks its whole program with: ```lua first-game.
 // Every other block on the page is a piece of it, out of context on purpose.
-std::string program_in(const std::string& markdown) {
+//
+// Carriage returns come off first: git hands a text file to Windows with
+// them in, and a fence looked for by "```lua first-game\n" is then never
+// found on the one platform where the file is spelled that way.
+std::string program_in(std::string markdown) {
+    markdown.erase(std::remove(markdown.begin(), markdown.end(), '\r'), markdown.end());
     const std::string open = "```lua first-game\n";
     const std::size_t begin = markdown.find(open);
     if (begin == std::string::npos) {
