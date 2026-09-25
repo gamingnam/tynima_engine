@@ -105,6 +105,21 @@ TEST_CASE("the engine's own Lua is there, and its vectors behave like vectors") 
                     out);
     CHECK(out == "(1.000, 3.000, 3.000)\t(2.000, 4.000, 6.000)\t2\t(-3.000, 0.000, 1.000)\t5");
 
+    // A vector is never equal to something that is not one. LuaJIT sends
+    // every comparison with cdata on either side through the metamethod,
+    // `v == nil` included, so a game that writes it must not fall over —
+    // and neither must the engine's own Lua, which asks it of its arguments.
+    REQUIRE(vm->eval(R"(
+        local ty = require('tynima')
+        local v = ty.vec3(1, 2, 3)
+        -- An axis given as a vector rather than a table: ty.quat asks
+        -- whether it was given one at all, which is that comparison.
+        local half_turn = ty.quat(ty.vec3(0, 1, 0), math.pi)
+        return v == nil, v == ty.vec3(1, 2, 3), v == ty.vec3(1, 2, 4), math.abs(half_turn.w) < 1e-6
+    )",
+                     out));
+    CHECK(out == "false\ttrue\tfalse\ttrue");
+
     // A rotation turns a vector the way the engine's would: half a turn
     // about y takes -z to +z, to the last place a float keeps.
     REQUIRE(vm->eval(R"(

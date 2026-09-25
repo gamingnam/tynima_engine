@@ -18,6 +18,7 @@
 #include <tynima/sdk/project.h>
 #include <tynima/sdk/runtime.h>
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -37,12 +38,33 @@ constexpr int kOk = 0;
 constexpr int kFailed = 1;
 constexpr int kUsage = 2;
 
+// The templates there are: the directories where `new` copies from. Read
+// rather than listed, so a template is added by adding a directory.
+std::string template_names() {
+    std::vector<std::string> names;
+    std::error_code ec;
+    for (const std::filesystem::directory_entry& entry :
+         std::filesystem::directory_iterator(TYNIMA_TEMPLATE_DIR, ec)) {
+        const std::string name = entry.path().filename().string();
+        // A hidden directory is an editor's or a tool's, not a template.
+        if (entry.is_directory(ec) && !name.empty() && name[0] != '.') {
+            names.push_back(name);
+        }
+    }
+    std::sort(names.begin(), names.end());
+    std::string out;
+    for (const std::string& name : names) {
+        out += (out.empty() ? "" : ", ") + name;
+    }
+    return out.empty() ? std::string("none: " TYNIMA_TEMPLATE_DIR " is not there") : out;
+}
+
 void print_usage() {
     std::puts("usage: tynima <command> [options]\n"
               "\n"
-              "  new <name>     a project that runs, out of a template\n"
-              "                   --template <t>  which one (basic)\n"
-              "                   --into <dir>    where to put it (default: ./<name>)\n"
+              "  new <name>     a project that runs, out of a template");
+    std::printf("                   --template <t>  which one (%s)\n", template_names().c_str());
+    std::puts("                   --into <dir>    where to put it (default: ./<name>)\n"
               "  run            play the project here\n"
               "                   --headless      no window and no GPU\n"
               "                   --frames <n>    stop after n frames\n"
@@ -158,8 +180,8 @@ int command_new(int argc, char** argv) {
 
     std::error_code ec;
     if (!std::filesystem::is_directory(source, ec)) {
-        std::fprintf(stderr, "tynima new: no template called '%s' in %s\n", which.c_str(),
-                     TYNIMA_TEMPLATE_DIR);
+        std::fprintf(stderr, "tynima new: no template called '%s'. There is %s, in %s\n", which.c_str(),
+                     template_names().c_str(), TYNIMA_TEMPLATE_DIR);
         return kUsage;
     }
     if (std::filesystem::exists(into, ec) && !std::filesystem::is_empty(into, ec)) {

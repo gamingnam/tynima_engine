@@ -25,4 +25,17 @@ if(TYNIMA_BUILD_TESTS AND TYNIMA_LUA)
   set_tests_properties(cli_run cli_cook PROPERTIES
     FIXTURES_REQUIRED cli_project
     WORKING_DIRECTORY "${cli_scratch}/demo")
+
+  # And once more with a template that is not the default: --template has to
+  # reach the directory it names, and what comes out of it has to run too.
+  set(cli_other "${CMAKE_BINARY_DIR}/cli-test-fps")
+  add_test(NAME cli_clean_template COMMAND "${CMAKE_COMMAND}" -E rm -rf "${cli_other}")
+  add_test(NAME cli_new_template
+    COMMAND tynima_cli new shooter --template fps --into "${cli_other}/shooter")
+  add_test(NAME cli_run_template COMMAND tynima_cli run --headless --frames 20)
+  set_tests_properties(cli_clean_template cli_new_template PROPERTIES FIXTURES_SETUP cli_template)
+  set_tests_properties(cli_new_template PROPERTIES DEPENDS cli_clean_template)
+  set_tests_properties(cli_run_template PROPERTIES
+    FIXTURES_REQUIRED cli_template
+    WORKING_DIRECTORY "${cli_other}/shooter")
 endif()

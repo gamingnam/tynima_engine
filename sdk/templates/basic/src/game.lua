@@ -3,13 +3,41 @@
 --     tynima run          play it
 --     tynima cook         cook the models under assets/ into cooked/
 --
--- Leave it running and save this file: the game reloads in a quarter of a
--- second, keeping the world it built. What `ty` offers is in
--- engine/script/lua/tynima.lua; what it rests on is sdk/include/tynima.h.
+-- Leave it running and save this file: a quarter of a second later the game
+-- is built again from what you wrote, in the window that never closed. What
+-- `ty` offers is in engine/script/lua/tynima.lua; what it rests on is
+-- sdk/include/tynima.h.
 local ty = require("tynima")
 
 local game = {}
 local state = {}
+
+-- Everything this script made, so that a reload can take it down again
+-- before building it anew. Without this, every save would leave one more
+-- floor and five more crates standing in the world.
+local made = { entities = {}, bodies = {} }
+
+local function entity(components)
+    local made_entity = ty.entity(components)
+    made.entities[#made.entities + 1] = made_entity
+    return made_entity
+end
+
+local function body(values)
+    local made_body = ty.body(values)
+    made.bodies[#made.bodies + 1] = made_body
+    return made_body
+end
+
+-- A crate at a point: a body that falls, and an entity that draws where it is.
+local function spawn(x, y, z)
+    return entity {
+        Name = { text = "crate" },
+        Transform = { position = { x, y, z } },
+        MeshRenderer = { model = state.model },
+        RigidBody = { body = body { shape = ty.box(0.5), position = { x, y, z }, mass = 1 } },
+    }
+end
 
 function game.load(reloaded)
     ty.log(reloaded and "{{name}} reloaded" or "{{name}} is starting")
@@ -17,12 +45,12 @@ function game.load(reloaded)
     -- A floor: one shape, used both as the thing that is drawn and as the
     -- thing that is collided with.
     local ground = ty.box(10, 0.5, 10)
-    ty.entity {
+    entity {
         Name = { text = "ground" },
         Transform = { position = { 0, -0.5, 0 } },
         MeshRenderer = { model = ty.shape_model(ground, { 0.40, 0.42, 0.45 }, 0.9) },
     }
-    state.ground = ty.body { shape = ground, position = { 0, -0.5, 0 }, motion = "static" }
+    body { shape = ground, position = { 0, -0.5, 0 }, motion = "static" }
 
     -- Something to look at, and to knock over.
     state.model = ty.shape_model(ty.box(0.5), { 0.85, 0.45, 0.25 }, 0.4)
@@ -36,15 +64,12 @@ function game.load(reloaded)
     ty.log("Space drops another crate, R starts over, Escape quits")
 end
 
--- A crate at a point: a body that falls, and an entity that draws where it is.
-function spawn(x, y, z)
-    local body = ty.body { shape = ty.box(0.5), position = { x, y, z }, mass = 1 }
-    return ty.entity {
-        Name = { text = "crate" },
-        Transform = { position = { x, y, z } },
-        MeshRenderer = { model = state.model },
-        RigidBody = { body = body },
-    }
+function game.unload()
+    -- Entities first: a crate's body is nothing to the world once the thing
+    -- that drew it is gone.
+    for _, e in ipairs(made.entities) do ty.destroy(e) end
+    for _, b in ipairs(made.bodies) do ty.destroy_body(b) end
+    made = { entities = {}, bodies = {} }
 end
 
 function game.update(dt)
@@ -54,15 +79,8 @@ function game.update(dt)
     end
 
     if ty.key_pressed("R") then
-        for _, entity in ipairs(state.crates) do
-            local rigid = ty.get(entity, "RigidBody")
-            if rigid then ty.destroy_body(rigid.body) end
-            ty.destroy(entity)
-        end
-        state.crates = {}
-        for i = 1, 5 do
-            state.crates[i] = spawn(0, 0.5 + (i - 1) * 1.2, 0)
-        end
+        game.unload()
+        game.load(false)
     end
 
     if ty.key_pressed("Escape") then

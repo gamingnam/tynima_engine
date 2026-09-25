@@ -1,0 +1,4 @@
+# What the tools make from what is checked in.
+cooked/
+build/
+.cooked/

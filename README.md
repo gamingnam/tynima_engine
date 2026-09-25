@@ -427,11 +427,29 @@ nothing.
 `tynima run` *is* the engine: the command hosts `sdk::Runtime` with the
 project's settings, so a game written in Lua needs no other binary and
 nothing compiled. `tynima new` copies a template from
-[`sdk/templates/`](sdk/templates) — `basic` today, the platformer and the
-first-person scene next — and writes the project file itself, so a template
-cannot fall behind the format. The whole of that is a CTest: make a project,
-cook it, run it headless. If `tynima new` ever produces something that does
-not run, the build says so.
+[`sdk/templates/`](sdk/templates) — `basic`, `platformer` or `fps`, and the
+command lists what is there rather than naming them in its help text — and
+writes the project file itself, so a template cannot fall behind the format.
+The whole of that is a CTest: make a project, cook it, run it headless. If
+`tynima new` ever produces something that does not run, the build says so.
+
+The two bigger templates are games rather than demonstrations.
+[`platformer`](sdk/templates/platformer/src/game.lua) is 2D because
+everything it makes sits on the z = 0 plane and the camera looks straight at
+it: one depth is one scale, so the picture is flat, and the scenery behind
+is at another — parallax for nothing. [`fps`](sdk/templates/fps/src/game.lua)
+is a capsule that never tips over, moved by the velocity the script asks
+for, with a gun that is a ray and an impulse and a mark on each body to say
+what it hit. Both drive the player themselves and leave the physics world
+everything else, which is how these games are actually written.
+
+Each of them is played by a test
+([`sdk/tests/template_test.cpp`](sdk/tests/template_test.cpp)) that holds
+the keys a player would and checks where that left them: run and jump, walk
+into a wall, shoot the ball two metres ahead. Each also destroys what it
+made in `unload()`, since a reload runs `load()` again on the world that is
+already standing — the test saves the file mid-game and counts the world
+either side of it.
 
 ## Games in Lua
 

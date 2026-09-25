@@ -78,7 +78,15 @@ ffi.metatype(vec3_t, {
         if type(b) == "number" then return vec3_t(a.x * b, a.y * b, a.z * b) end
         return vec3_t(a.x * b.x, a.y * b.y, a.z * b.z)
     end,
-    __eq = function(a, b) return a.x == b.x and a.y == b.y and a.z == b.z end,
+    -- LuaJIT routes a comparison through this whenever either side is
+    -- cdata, `v == nil` included — so it has to hold up against everything,
+    -- not only against another vector.
+    __eq = function(a, b)
+        if not ffi.istype(vec3_t, a) or not ffi.istype(vec3_t, b) then
+            return false
+        end
+        return a.x == b.x and a.y == b.y and a.z == b.z
+    end,
     __tostring = function(v) return string.format("(%.3f, %.3f, %.3f)", v.x, v.y, v.z) end,
     __index = {
         length = function(v) return sqrt(v.x * v.x + v.y * v.y + v.z * v.z) end,
