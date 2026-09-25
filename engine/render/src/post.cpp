@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <initializer_list>
 #include <string>
 
 namespace tynima::render {

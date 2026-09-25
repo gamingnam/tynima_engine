@@ -3,6 +3,11 @@
 #include <tynima/platform/input_log.h>
 
 #include <cstdio>
+// For the bitsets below: doctest prints both sides of a CHECK that fails,
+// and the MSVC standard library's operator<<(ostream&, const bitset&) needs
+// a complete basic_ostream where it is instantiated. libc++ has one by then
+// and MSVC does not, which is a red Windows build and a green macOS one.
+#include <ostream>
 #include <string>
 
 using namespace tynima::platform;

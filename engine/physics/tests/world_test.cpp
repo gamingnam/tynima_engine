@@ -9,6 +9,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstring>
+#include <initializer_list>
 #include <memory>
 #include <random>
 #include <string>

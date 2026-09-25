@@ -3,6 +3,7 @@
 #include <tynima/render/frame_graph.h>
 
 #include <cstring>
+#include <initializer_list>
 #include <string>
 
 using namespace tynima;

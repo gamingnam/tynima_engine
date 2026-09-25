@@ -3,6 +3,7 @@
 #include <tynima/physics/collision.h>
 #include <tynima/physics/physics.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdint>

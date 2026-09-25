@@ -3,8 +3,10 @@
 #include <tynima/render/camera.h>
 #include <tynima/render/clusters.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <initializer_list>
 #include <random>
 #include <string>
 #include <vector>

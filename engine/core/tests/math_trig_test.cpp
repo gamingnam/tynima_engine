@@ -1,8 +1,10 @@
 #include <doctest/doctest.h>
 #include <tynima/core/math.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <initializer_list>
 
 using namespace tynima::math;
 

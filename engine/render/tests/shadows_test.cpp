@@ -2,6 +2,7 @@
 #include <tynima/render/shadows.h>
 
 #include <cmath>
+#include <initializer_list>
 
 using namespace tynima;
 using namespace tynima::math;

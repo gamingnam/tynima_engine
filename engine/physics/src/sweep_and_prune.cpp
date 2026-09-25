@@ -13,6 +13,7 @@
 #include "broadphase_common.h"
 
 #include <algorithm>
+#include <initializer_list>
 
 namespace tynima::physics {
 

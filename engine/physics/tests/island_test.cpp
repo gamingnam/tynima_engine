@@ -5,8 +5,10 @@
 #include <tynima/physics/fixed_step.h>
 #include <tynima/physics/physics.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <initializer_list>
 #include <string>
 #include <vector>
 

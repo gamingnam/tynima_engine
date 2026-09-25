@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <initializer_list>
 
 namespace tynima::render {
 

@@ -2,6 +2,8 @@
 #include <tynima/render/camera.h>
 #include <tynima/render/mesh.h>
 
+#include <initializer_list>
+
 using namespace tynima;
 using namespace tynima::math;
 
