@@ -78,3 +78,14 @@ endif()
 add_subdirectory(tools/cli)
 add_subdirectory(tools/cook)
 add_subdirectory(tools/golden)
+
+# The reference pages are generated from the headers they document and
+# checked in, so reading them needs no Python; where there is one, a test
+# regenerates them and fails when they no longer match.
+if(TYNIMA_BUILD_TESTS)
+  find_program(TYNIMA_PYTHON NAMES python3 python)
+  if(TYNIMA_PYTHON)
+    add_test(NAME docs_current
+      COMMAND "${TYNIMA_PYTHON}" "${PROJECT_SOURCE_DIR}/tools/gen_docs.py" --check)
+  endif()
+endif()

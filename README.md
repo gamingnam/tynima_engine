@@ -7,6 +7,12 @@ and the editor are built on the same public surface.
 Personal project. The plan, phase by phase, lives in the
 [roadmap](https://claude.ai/code/artifact/2250a38b-e371-4824-a78b-5e0df0672165).
 
+To write a game with it, start at **[your first game in thirty
+minutes](docs/first-game.md)**; the reference for what a game may call is
+[the Lua API](docs/lua-api.md) and [the C API](docs/c-api.md), both
+generated from the files they document. The rest of this page is how the
+engine itself is built.
+
 ## Layout
 
 Dependencies point down only. Each module's `CMakeLists.txt` declares what it
@@ -450,6 +456,23 @@ into a wall, shoot the ball two metres ahead. Each also destroys what it
 made in `unload()`, since a reload runs `load()` again on the world that is
 already standing — the test saves the file mid-game and counts the world
 either side of it.
+
+## Documentation
+
+[`docs/`](docs) is three pages: the [tutorial](docs/first-game.md), and a
+reference for each public surface — [the Lua one](docs/lua-api.md) from
+`engine/script/lua/tynima.lua`, [the C one](docs/c-api.md) from
+`sdk/include/tynima.h`. The references are not written twice: both headers
+are already prose about themselves, so [`tools/gen_docs.py`](tools/gen_docs.py)
+renders them — every declaration with the comment that explains it, the
+`tynima_api` table one entry to a heading, and an index. They are checked in
+so that reading them needs no Python, and the `docs_current` test
+regenerates them and fails when they have drifted from the source.
+
+The tutorial is written by hand, since a generator cannot teach. What keeps
+it honest is that its final listing is a real program: `sdk/tests/tutorial_test.cpp`
+lifts it off the page, runs it headless with a key held down, and checks the
+paddle moved and the cubes it dropped were taken out of the world again.
 
 ## Games in Lua
 
