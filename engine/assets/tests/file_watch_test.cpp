@@ -70,11 +70,20 @@ TEST_CASE("a file watch reports a change once it has settled, and nothing else")
     CHECK(watch.poll(10.0, changed, 4) == 0); // moved again: the clock restarts
     CHECK(watch.poll(11.0, changed, 4) == 1);
 
-    // Gone is not a change; back and different is.
+    // Gone is not a change; coming back is — even wearing the write time it
+    // left with, which is what Windows hands a file when the delete and the
+    // write land in one tick of its clock, some 15 ms wide. The time is put
+    // back by hand here so that every platform tests the same thing.
+    std::error_code ec;
+    const std::filesystem::file_time_type was = std::filesystem::last_write_time(path, ec);
+    REQUIRE_FALSE(ec);
     REQUIRE(platform::remove_file(path.c_str()));
     CHECK(watch.poll(12.0, changed, 4) == 0);
     CHECK(watch.poll(13.0, changed, 4) == 0);
     touch(path, "five");
+    std::filesystem::last_write_time(path, was, ec); // as if no time had passed
+    REQUIRE_FALSE(ec);
+    REQUIRE(platform::file_write_time(path.c_str()) != 0);
     CHECK(watch.poll(14.0, changed, 4) == 0);
     CHECK(watch.poll(15.0, changed, 4) == 1);
 

@@ -52,7 +52,15 @@ std::uint32_t FileWatch::poll(double now, Id* changed, std::uint32_t capacity) n
         }
         const std::uint64_t time = platform::file_write_time(entry.path.c_str());
         if (time == 0) {
-            continue; // gone for the moment: an exporter between delete and write
+            // Gone — an exporter between its delete and its write. Nothing
+            // is reported while it is away, and what it left behind is
+            // forgotten: whatever comes back under this name is a new file
+            // even if it wears the same write time, which is what Windows
+            // hands it when the delete and the write land in one tick of
+            // its clock, some fifteen milliseconds wide.
+            entry.seen = entry.reported = 0;
+            entry.seen_since = now;
+            continue;
         }
         if (time != entry.seen) {
             entry.seen = time;

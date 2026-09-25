@@ -9,8 +9,9 @@
 // put for a whole further interval, is reported once. The settling matters:
 // an exporter or the cooker writes a file over some milliseconds, and a
 // reader that pounced on the first change would read half of one. A file
-// that is missing for a while is not a change; it is reported when it is
-// back and different.
+// that is missing is not a change while it is missing, and is reported once
+// it is back — whether or not its write time moved, since what returns
+// under a name need not be what left it.
 //
 // Asking rather than being told — no FSEvents, no inotify, no
 // ReadDirectoryChangesW — because a few hundred stats a quarter of a second
