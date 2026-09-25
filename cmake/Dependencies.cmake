@@ -91,16 +91,54 @@ if(TYNIMA_LUA)
     URL_HASH SHA256=6e5fec07750add912e7c3eae0c194d24cd6d023714e1f04a0298a5b4819e4457
     EXCLUDE_FROM_ALL SYSTEM)
   FetchContent_MakeAvailable(luajit) # no CMakeLists inside: this only unpacks it
-  set(luajit_library "${luajit_SOURCE_DIR}/src/libluajit.a")
-  # LuaJIT's Makefile builds in its own source tree, so the build directory
-  # is read-only to it; that is why it is fetched per build directory.
-  add_custom_command(OUTPUT "${luajit_library}"
-    COMMAND ${CMAKE_COMMAND} -E env
-            "MACOSX_DEPLOYMENT_TARGET=${CMAKE_OSX_DEPLOYMENT_TARGET}"
-            make -C "${luajit_SOURCE_DIR}" -j 4 amalg
-    WORKING_DIRECTORY "${luajit_SOURCE_DIR}"
-    COMMENT "Building LuaJIT with its own Makefile"
-    VERBATIM)
+  # Both builds are LuaJIT's own, and both build in its source tree rather
+  # than ours — which is why it is fetched per build directory.
+  if(MSVC)
+    # On Windows the script its authors maintain is src/msvcbuild.bat, and
+    # it refuses to run outside a Visual Studio environment (it wants
+    # INCLUDE set). Rather than hope the one that launched this build has
+    # one, the wrapper beside this file calls vcvarsall itself, found from
+    # the compiler CMake already located.
+    set(luajit_library "${luajit_SOURCE_DIR}/src/lua51.lib")
+    get_filename_component(luajit_msvc_bin "${CMAKE_CXX_COMPILER}" DIRECTORY)
+    # <VS>/VC/Tools/MSVC/<version>/bin/Host<arch>/<arch> back up to <VS>/VC.
+    get_filename_component(luajit_vc_root "${luajit_msvc_bin}/../../../../../.." ABSOLUTE)
+    set(luajit_vcvarsall "${luajit_vc_root}/Auxiliary/Build/vcvarsall.bat")
+    if(CMAKE_GENERATOR_PLATFORM MATCHES "^([Aa][Rr][Mm]64)$")
+      set(luajit_vc_arch x64_arm64)
+    elseif(CMAKE_SIZEOF_VOID_P EQUAL 4)
+      set(luajit_vc_arch x86)
+    else()
+      set(luajit_vc_arch x64)
+    endif()
+    file(TO_NATIVE_PATH "${luajit_SOURCE_DIR}/src" luajit_src_native)
+    file(TO_NATIVE_PATH "${luajit_vcvarsall}" luajit_vcvarsall_native)
+    set(luajit_script "${CMAKE_BINARY_DIR}/luajit_msvcbuild.bat")
+    configure_file("${CMAKE_CURRENT_LIST_DIR}/luajit_msvcbuild.bat.in" "${luajit_script}"
+      @ONLY NEWLINE_STYLE CRLF)
+    file(TO_NATIVE_PATH "${luajit_script}" luajit_script_native)
+    # One build directory builds LuaJIT once, with the runtime library of
+    # whichever configuration built it first; a second configuration in the
+    # same directory wants a build directory of its own.
+    #
+    # `cmd /c call "..."` rather than `cmd /c "..."`: where the rest of the
+    # line begins with a quote, cmd strips that quote and the last one on
+    # the line, which takes a path apart.
+    add_custom_command(OUTPUT "${luajit_library}"
+      COMMAND "${CMAKE_COMMAND}" -E env "CL=$<IF:$<CONFIG:Debug>,/MDd,/MD>"
+              cmd /c call "${luajit_script_native}"
+      COMMENT "Building LuaJIT with msvcbuild.bat"
+      VERBATIM)
+  else()
+    set(luajit_library "${luajit_SOURCE_DIR}/src/libluajit.a")
+    add_custom_command(OUTPUT "${luajit_library}"
+      COMMAND ${CMAKE_COMMAND} -E env
+              "MACOSX_DEPLOYMENT_TARGET=${CMAKE_OSX_DEPLOYMENT_TARGET}"
+              make -C "${luajit_SOURCE_DIR}" -j 4 amalg
+      WORKING_DIRECTORY "${luajit_SOURCE_DIR}"
+      COMMENT "Building LuaJIT with its own Makefile"
+      VERBATIM)
+  endif()
   add_custom_target(luajit_build DEPENDS "${luajit_library}")
   add_library(luajit INTERFACE)
   add_dependencies(luajit luajit_build)

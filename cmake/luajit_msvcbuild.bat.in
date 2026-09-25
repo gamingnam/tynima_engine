@@ -1,0 +1,26 @@
+@echo off
+rem Written from cmake/luajit_msvcbuild.bat.in by cmake/Dependencies.cmake.
+rem
+rem LuaJIT has no CMake build; on Windows the script its authors maintain is
+rem src/msvcbuild.bat, and it refuses to run outside a Visual Studio
+rem environment. Rather than hope the shell that launched this build has
+rem one, this calls vcvarsall itself, found from the compiler CMake located.
+rem
+rem CL comes in from the environment holding the runtime-library flag the
+rem rest of the build uses: cl reads %CL% as extra options, and the flag has
+rem to match, or linking the result into the engine fails on a
+rem runtime-library mismatch.
+setlocal
+if exist "@luajit_vcvarsall_native@" call "@luajit_vcvarsall_native@" @luajit_vc_arch@ >nul
+if not defined INCLUDE (
+  echo LuaJIT: no Visual Studio environment to build in
+  exit /b 1
+)
+cd /d "@luajit_src_native@" || exit /b 1
+call msvcbuild.bat amalg static
+rem msvcbuild.bat reports a failure by printing one, not in its exit code.
+if not exist lua51.lib (
+  echo LuaJIT: msvcbuild.bat produced no lua51.lib
+  exit /b 1
+)
+exit /b 0

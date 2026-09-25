@@ -96,9 +96,13 @@ GPU notes:
   headless mode. The `rhi` tests use the real driver where a display exists
   (they open a 320×240 window for a moment) and degrade to "failure is
   explained" where there is none.
-- Windows builds and runs the sandbox, but draws nothing until the shader
-  pipeline can produce DXIL/SPIR-V (SDL_shadercross) — the engine only carries
-  MSL source today, and the sandbox says so on stdout.
+- Windows builds and runs everything the tests cover, and draws nothing:
+  every shader in the engine is MSL source, so `SDL_CreateGPUDevice` is
+  asked for MSL and Direct3D 12 — which wants DXIL — is not a backend that
+  can take it. The log says exactly that, and the scene, post and UI layers
+  each refuse to build their pipelines rather than draw half a picture.
+  Cross-compiling the shaders (SDL_shadercross) is what is missing, and it
+  is the whole of what is missing.
 
 On Windows: `cmake --preset windows`, then `cmake --build --preset windows-debug`
 and `ctest --preset windows-debug`.
@@ -536,11 +540,15 @@ at its own offset and the gaps between them filled, `ffi.cdef`s it, and
 checks that what it built is the size the engine says. A script can then
 read and write a component that did not exist when the script was written.
 
-LuaJIT is fetched and built by its own Makefile
-([`cmake/Dependencies.cmake`](cmake/Dependencies.cmake)), which is every
-platform here but MSVC — `TYNIMA_LUA` is off there until Phase 6's Windows
-task, and without it the engine builds and `script::Vm::create()` says there
-is no VM.
+LuaJIT is fetched and built by the script its own authors maintain
+([`cmake/Dependencies.cmake`](cmake/Dependencies.cmake)): the Makefile where
+there is make and a GCC-style driver, `src/msvcbuild.bat` under MSVC, which
+wants a Visual Studio environment and so is run through a wrapper that calls
+`vcvarsall` itself and hands it the runtime-library flag the rest of the
+build uses. Reimplementing LuaJIT's two-stage build (minilua, dynasm,
+buildvm, then the library) in CMake is a good way to get it subtly wrong.
+With `TYNIMA_LUA` off the engine still builds and `script::Vm::create()`
+says there is no VM.
 
 ## Game modules and hot reload
 

@@ -708,12 +708,19 @@ SdlDevice::SdlDevice(void* device, const DeviceDesc& desc) noexcept
 
 std::unique_ptr<Device> create_sdl_device(const DeviceDesc& desc) {
     TY_EXTERNAL_ALLOCATIONS();
-    // The formats we can hand the backend today. SDL picks a backend that
-    // consumes at least one of them.
+    // The formats we can hand the backend today, which is one: every shader
+    // in this engine is MSL source. SDL picks a backend that takes at least
+    // one of them, so asking for MSL alone is asking for Metal — and on
+    // Windows and Linux that is no backend at all, which is the honest
+    // answer until the shaders are cross-compiled (SDL_shadercross) into
+    // the DXIL Direct3D 12 wants or the SPIR-V Vulkan does.
     SDL_GPUDevice* device = SDL_CreateGPUDevice(SDL_GPU_SHADERFORMAT_MSL, desc.debug, nullptr);
     if (device == nullptr) {
+        TY_LOG_ERROR("rhi", "no SDL GPU backend here takes the shaders this build has (MSL): %s",
+                     SDL_GetError());
         return nullptr;
     }
+    TY_LOG_INFO("rhi", "SDL GPU: %s", SDL_GetGPUDeviceDriver(device));
     return std::unique_ptr<Device>(new SdlDevice(device, desc));
 }
 
