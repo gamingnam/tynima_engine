@@ -14,6 +14,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <string>
 
 namespace scene = tynima::scene;
@@ -41,6 +42,23 @@ struct HostedEngine {
     ~HostedEngine() { tynima_engine_destroy(engine); }
 };
 
+// Where this machine puts temporary files. std::filesystem asks the OS —
+// TMPDIR where it is set, the user's Temp on Windows — rather than assuming
+// "/tmp", which on Windows names a directory on whatever drive the test
+// happens to run from and usually is not there at all.
+std::string temp_dir() {
+    std::error_code ec;
+    std::filesystem::path dir = std::filesystem::temp_directory_path(ec);
+    if (ec) {
+        dir = "/tmp";
+    }
+    // No trailing separator, so a caller may append one of its own.
+    std::string out = dir.lexically_normal().generic_string();
+    while (out.size() > 1 && out.back() == '/') {
+        out.pop_back();
+    }
+    return out;
+}
 } // namespace
 
 TEST_CASE("a hosted engine runs frames headless, keeps its clock, and stops when told") {
@@ -366,8 +384,7 @@ TEST_CASE("a scene goes to a file and comes back through the public header") {
     const void* crate_values[3] = {&crate_name, transform_defaults, &on_floor};
     (void)api.create_entity(hosted.engine, crate_ids, crate_values, 3);
 
-    const std::string path = std::string(std::getenv("TMPDIR") != nullptr ? std::getenv("TMPDIR") : "/tmp") +
-                             "/tynima_sdk_scene.toml";
+    const std::string path = temp_dir() + "/tynima_sdk_scene.toml";
     REQUIRE_MESSAGE(tynima_save_scene(hosted.engine, path.c_str()), tynima_last_error());
     tynima_clear_scene(hosted.engine);
     CHECK(api.entity_count(hosted.engine) == 0);
@@ -419,11 +436,6 @@ std::string triangle_gltf(const char* scale) {
            R"("accessors":[{"bufferView":0,"componentType":5126,"count":3,"type":"VEC3",)"
            R"("min":[0,0,0],"max":[)" +
            s + "," + s + R"(,0]}]})";
-}
-
-std::string temp_dir() {
-    const char* dir = std::getenv("TMPDIR");
-    return std::string(dir != nullptr ? dir : "/tmp");
 }
 
 // Writes until the file's recorded time moves past what it was.

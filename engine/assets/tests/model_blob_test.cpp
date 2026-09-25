@@ -6,6 +6,7 @@
 
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <initializer_list>
 #include <string>
 
@@ -14,9 +15,17 @@ using namespace tynima::math;
 
 namespace {
 
+// Where this machine puts temporary files. std::filesystem asks the OS —
+// TMPDIR where it is set, the user's Temp on Windows — rather than assuming
+// "/tmp", which on Windows names a directory on whatever drive the test
+// happens to run from and usually is not there at all.
 std::string temp_path(const char* name) {
-    const char* dir = std::getenv("TMPDIR");
-    return std::string(dir != nullptr ? dir : "/tmp") + "/" + name;
+    std::error_code ec;
+    std::filesystem::path dir = std::filesystem::temp_directory_path(ec);
+    if (ec) {
+        dir = "/tmp";
+    }
+    return (dir / name).lexically_normal().generic_string();
 }
 
 // A model with a little of everything: two submeshes over six vertices, two

@@ -12,13 +12,19 @@ namespace platform = tynima::platform;
 
 namespace {
 
-// Spelled the way the project reports it: TMPDIR ends in a slash on some
-// machines and not on others, and a project's paths are normalised.
+// Spelled the way the project reports it: a temporary directory ends in a
+// slash on some machines and not on others, and a project's paths are
+// normalised. std::filesystem asks the OS where that directory is, which on
+// Windows is an absolute path with a drive on it — "/tmp" there is neither,
+// and find_project, which makes what it is given absolute, would then
+// disagree with load_project about where the project's root is.
 std::string temp_dir() {
-    const char* dir = std::getenv("TMPDIR");
-    return std::filesystem::path(std::string(dir != nullptr ? dir : "/tmp") + "/tynima_project_test")
-        .lexically_normal()
-        .generic_string();
+    std::error_code ec;
+    std::filesystem::path dir = std::filesystem::temp_directory_path(ec);
+    if (ec) {
+        dir = "/tmp";
+    }
+    return (dir / "tynima_project_test").lexically_normal().generic_string();
 }
 
 void write(const std::string& path, const std::string& text) {

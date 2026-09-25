@@ -12,6 +12,7 @@
 #include <array>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <string>
 #include <vector>
 
@@ -22,9 +23,22 @@ using tynima::cooker::tests::kGltf;
 
 namespace {
 
+// Where this machine puts temporary files. std::filesystem asks the OS —
+// TMPDIR where it is set, the user's Temp on Windows — rather than assuming
+// "/tmp", which on Windows names a directory on whatever drive the test
+// happens to run from and usually is not there at all.
 std::string temp_dir() {
-    const char* dir = std::getenv("TMPDIR");
-    return std::string(dir != nullptr ? dir : "/tmp");
+    std::error_code ec;
+    std::filesystem::path dir = std::filesystem::temp_directory_path(ec);
+    if (ec) {
+        dir = "/tmp";
+    }
+    // No trailing separator, so a caller may append one of its own.
+    std::string out = dir.lexically_normal().generic_string();
+    while (out.size() > 1 && out.back() == '/') {
+        out.pop_back();
+    }
+    return out;
 }
 
 // The triangles of a mesh as position triples, sorted: what must survive any
@@ -237,7 +251,11 @@ TEST_CASE("a source file cooks to a blob beside it, and cooks again only when it
     CHECK_FALSE(
         cooker::cook_model_file((dir + "/missing.glb").c_str(), (dir + "/x.tymodel").c_str(), {}, error));
     CHECK_FALSE(error.empty());
-    CHECK_FALSE(cooker::cook_model_file(source.c_str(), "/no/such/dir/x.tymodel", {}, error));
+    // Inside a file rather than a directory: the one place no platform can
+    // make a directory. "/no/such/dir" is only unwritable where the root
+    // is — on Windows it names a directory on the current drive, and the
+    // cooker would cheerfully make it.
+    CHECK_FALSE(cooker::cook_model_file(source.c_str(), (source + "/x.tymodel").c_str(), {}, error));
     CHECK(error.find("cannot make") != std::string::npos);
     CHECK_FALSE(cooker::cook_model_file(cooked.c_str(), (dir + "/x.tymodel").c_str(), {}, error));
     CHECK(error.find("not a model the cooker reads") != std::string::npos);

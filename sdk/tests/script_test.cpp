@@ -14,6 +14,7 @@
 
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <string>
 
 namespace scene = tynima::scene;
@@ -22,9 +23,17 @@ using namespace tynima::math;
 
 namespace {
 
+// Where this machine puts temporary files. std::filesystem asks the OS —
+// TMPDIR where it is set, the user's Temp on Windows — rather than assuming
+// "/tmp", which on Windows names a directory on whatever drive the test
+// happens to run from and usually is not there at all.
 std::string temp_dir() {
-    const char* dir = std::getenv("TMPDIR");
-    return std::string(dir != nullptr ? dir : "/tmp") + "/tynima_script_test";
+    std::error_code ec;
+    std::filesystem::path dir = std::filesystem::temp_directory_path(ec);
+    if (ec) {
+        dir = "/tmp";
+    }
+    return (dir / "tynima_script_test").lexically_normal().generic_string();
 }
 
 void write_script(const std::string& path, const std::string& source) {

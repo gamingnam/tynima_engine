@@ -8,6 +8,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <string>
 
 using namespace tynima;
@@ -55,6 +56,19 @@ void register_all(World& world) {
     (void)world.component_id<scene::RigidBody>();
     (void)world.component_id<Probe>();
     (void)world.component_id<Bare>();
+}
+
+// Where this machine puts temporary files. std::filesystem asks the OS —
+// TMPDIR where it is set, the user's Temp on Windows — rather than assuming
+// "/tmp", which on Windows names a directory on whatever drive the test
+// happens to run from and usually is not there at all.
+std::string temp_path(const char* name) {
+    std::error_code ec;
+    std::filesystem::path dir = std::filesystem::temp_directory_path(ec);
+    if (ec) {
+        dir = "/tmp";
+    }
+    return (dir / name).lexically_normal().generic_string();
 }
 
 } // namespace
@@ -145,8 +159,7 @@ TEST_CASE("a scene file is written to disk and read back, and a bad one leaves t
     World world(64);
     register_all(world);
     (void)world.create(scene::Name("only"), scene::Transform{});
-    const std::string path = std::string(std::getenv("TMPDIR") != nullptr ? std::getenv("TMPDIR") : "/tmp") +
-                             "/tynima_scene_test.toml";
+    const std::string path = temp_path("tynima_scene_test.toml");
     std::string error;
     REQUIRE_MESSAGE(scene::save_scene_file(world, path.c_str(), error), error);
     World loaded(64);

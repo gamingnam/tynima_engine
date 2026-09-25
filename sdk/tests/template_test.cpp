@@ -17,6 +17,7 @@
 #include <doctest/doctest.h>
 
 #include <cstdlib>
+#include <filesystem>
 #include <initializer_list>
 #include <string>
 #include <vector>
@@ -218,8 +219,15 @@ TEST_CASE("a template takes its world down before it builds it again") {
     // unload(), because a reload runs load() again on the world that is
     // already standing. Without that, a save would leave a second level
     // inside the first — which is exactly what this counts.
-    const char* tmp = std::getenv("TMPDIR");
-    const std::string dir = std::string(tmp != nullptr ? tmp : "/tmp") + "/tynima_template_test";
+    // std::filesystem asks the OS where temporary files go — TMPDIR where
+    // it is set, the user's Temp on Windows, rather than a "/tmp" that is
+    // not there on either.
+    std::error_code ec;
+    std::filesystem::path tmp = std::filesystem::temp_directory_path(ec);
+    if (ec) {
+        tmp = "/tmp";
+    }
+    const std::string dir = (tmp / "tynima_template_test").lexically_normal().generic_string();
     REQUIRE(platform::make_directories(dir.c_str()));
     const std::string copy = dir + "/game.lua";
 

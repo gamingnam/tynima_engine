@@ -91,7 +91,18 @@ TEST_CASE("texture ids round-trip a handle and never collide with ImGui's invali
     CHECK(ui::ImGuiLayer::texture_id(rhi::TextureHandle{0, 1}) != 0);
 }
 
-TEST_CASE("Cmd+Z reaches a global shortcut through the layer") {
+// ImGui's ImGuiMod_Ctrl is the platform's own command modifier: it is the
+// Ctrl key everywhere but on Apple, where ImGui turns it into Cmd
+// (io.ConfigMacOSXBehaviors, which it sets itself). So the key to hold is
+// not the same one on both, and pressing Super on Windows presses nothing
+// ImGui listens for.
+#if defined(__APPLE__)
+constexpr platform::Key kCommand = platform::Key::LeftSuper;
+#else
+constexpr platform::Key kCommand = platform::Key::LeftCtrl;
+#endif
+
+TEST_CASE("the platform's own Ctrl+Z reaches a global shortcut through the layer") {
     Session session;
     auto window = platform::Window::create({.title = "ui test", .width = 640, .height = 360});
     REQUIRE(window != nullptr);
@@ -103,14 +114,14 @@ TEST_CASE("Cmd+Z reaches a global shortcut through the layer") {
     for (int frame = 0; frame < 6; ++frame) {
         platform::Input::Writer::begin_frame(input);
         if (frame == 2) {
-            platform::Input::Writer::key(input, platform::Key::LeftSuper, true, false);
+            platform::Input::Writer::key(input, kCommand, true, false);
         }
         if (frame == 3) {
             platform::Input::Writer::key(input, platform::Key::Z, true, false);
         }
         if (frame == 4) {
             platform::Input::Writer::key(input, platform::Key::Z, false, false);
-            platform::Input::Writer::key(input, platform::Key::LeftSuper, false, false);
+            platform::Input::Writer::key(input, kCommand, false, false);
         }
         layer.begin_frame(*window, input, events, 1.0f / 60.0f);
         ImGui::DockSpaceOverViewport(0, ImGui::GetMainViewport());

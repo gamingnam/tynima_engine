@@ -50,10 +50,15 @@ TEST_CASE("heap accounting sees every C++ allocation") {
 TEST_CASE("a HeapAllocationScope counts what happens inside it") {
     std::vector<int> v;
     v.reserve(16);
+    // Both born outside the scope: a debug standard library allocates
+    // bookkeeping of its own when a container is constructed (MSVC's
+    // iterator debugging does), which is the library's business and not
+    // the allocation this is about.
+    std::string s;
     HeapAllocationScope scope;
     v.push_back(1); // fits: no allocation
     const std::uint64_t after_push = scope.allocations();
-    std::string s(100, 'x'); // too long for the small-string buffer
+    s.assign(100, 'x'); // too long for the small-string buffer
     const std::uint64_t after_string = scope.allocations();
     CHECK(after_push == 0);
     CHECK(after_string == 1);

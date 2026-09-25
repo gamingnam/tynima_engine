@@ -5,15 +5,24 @@
 #include <doctest/doctest.h>
 
 #include <cstdlib>
+#include <filesystem>
 #include <string>
 
 using namespace tynima;
 
 namespace {
 
+// Where this machine puts temporary files. std::filesystem asks the OS —
+// TMPDIR where it is set, the user's Temp on Windows — rather than assuming
+// "/tmp", which on Windows names a directory on whatever drive the test
+// happens to run from and usually is not there at all.
 std::string temp_path(const char* name) {
-    const char* dir = std::getenv("TMPDIR");
-    return std::string(dir != nullptr ? dir : "/tmp") + "/" + name;
+    std::error_code ec;
+    std::filesystem::path dir = std::filesystem::temp_directory_path(ec);
+    if (ec) {
+        dir = "/tmp";
+    }
+    return (dir / name).lexically_normal().generic_string();
 }
 
 render::ImageData filled(std::uint32_t width, std::uint32_t height, std::uint8_t r, std::uint8_t g,
@@ -152,10 +161,13 @@ TEST_CASE("a picture saved as a PNG loads back as the same pixels, and is the sa
     REQUIRE(cooker::save_png(path.c_str(), image, error));
     REQUIRE(platform::read_file(path.c_str(), second));
     CHECK(first == second);
-    (void)platform::remove_file(path.c_str());
 
     CHECK_FALSE(cooker::save_png(path.c_str(), render::ImageData{}, error));
     CHECK(error.find("no pixels") != std::string::npos);
-    CHECK_FALSE(cooker::save_png("/no/such/dir/x.png", image, error));
+    // Inside a file rather than a directory: the one place no platform will
+    // open a file for writing. "/no/such/dir" is only unwritable where the
+    // root is, which on Windows it is not.
+    CHECK_FALSE(cooker::save_png((path + "/x.png").c_str(), image, error));
     CHECK(error.find("cannot write") != std::string::npos);
+    (void)platform::remove_file(path.c_str());
 }
