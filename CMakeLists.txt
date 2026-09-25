@@ -73,6 +73,8 @@ if(TYNIMA_BUILD_APPS)
   add_subdirectory(apps/sandbox)
 endif()
 
-# Command-line tools: the asset cooker, and the golden image tests.
+# Command-line tools: the command a game is made with, the asset cooker,
+# and the golden image tests.
+add_subdirectory(tools/cli)
 add_subdirectory(tools/cook)
 add_subdirectory(tools/golden)

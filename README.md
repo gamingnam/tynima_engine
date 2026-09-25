@@ -28,6 +28,7 @@ past that declaration.
 | `engine/platform/`| `core`                               | Window, input, filesystem, time, threads (wraps SDL3)       |
 | `engine/core/`    | —                                    | Allocators, containers, math, jobs, logging, reflection     |
 | `apps/sandbox/`   | any engine module                    | Engine developer's playground — a test bed, not a template  |
+| `tools/cli/`      | `core platform assets cooker sdk`    | `tynima`: new, run, cook, build — the command a game uses    |
 | `tools/cook/`     | `core platform assets cooker`        | `tynima-cook`: the asset cooker's command line              |
 | `tools/golden/`   | `core platform render scene cooker sdk` | `tynima-golden`: the renderer's golden image tests       |
 | `apps/sandbox/game/` | `tynima.h` only (headers of sdk/scene/physics/core) | The sandbox's hot-reloadable game module    |
@@ -404,6 +405,33 @@ atlas, growing as glyphs are used) and the layer creates, updates and frees
 them through the device. The UI is one more pass in the frame graph, over the
 picture — or over a cleared window when the picture went to the editor's
 viewport texture, which ImGui then shows like any image.
+
+## Making a game
+
+```sh
+tynima new mygame     # a project that runs, out of a template
+cd mygame
+tynima run            # play it; save src/game.lua while it runs and it reloads
+tynima cook           # every model under assets/ into cooked/
+tynima build          # cook, and build a native game module if the project has one
+```
+
+A project is a directory with a `tynima.toml` in it — a dozen lines saying
+what to run, how big the window is, and where the assets are
+([`sdk/include/tynima/sdk/project.h`](sdk/include/tynima/sdk/project.h)).
+Every command but `new` looks for that file here and in the directories
+above, so they work from anywhere inside a project, and a key nobody knows
+is an error with its line number rather than a setting that quietly does
+nothing.
+
+`tynima run` *is* the engine: the command hosts `sdk::Runtime` with the
+project's settings, so a game written in Lua needs no other binary and
+nothing compiled. `tynima new` copies a template from
+[`sdk/templates/`](sdk/templates) — `basic` today, the platformer and the
+first-person scene next — and writes the project file itself, so a template
+cannot fall behind the format. The whole of that is a CTest: make a project,
+cook it, run it headless. If `tynima new` ever produces something that does
+not run, the build says so.
 
 ## Games in Lua
 
