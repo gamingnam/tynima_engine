@@ -15,7 +15,28 @@
 local ty = require("tynima")
 
 local game = {}
-local state = {}
+
+-- A global, so that a reload keeps it: a local is made afresh every time
+-- this file is read. What is worth keeping across a save is where the
+-- player left the camera, not the pile, which is built again below.
+state = state or {}
+
+-- Everything this script made, so that the reload can take it down before
+-- building it anew — load() runs a second time into the world the first one
+-- built, and without this every save would leave another pile standing.
+local made = { entities = {}, bodies = {} }
+
+local function entity(components)
+    local made_entity = ty.entity(components)
+    made.entities[#made.entities + 1] = made_entity
+    return made_entity
+end
+
+local function body(values)
+    local made_body = ty.body(values)
+    made.bodies[#made.bodies + 1] = made_body
+    return made_body
+end
 
 local BOXES = 24
 local COLOURS = {
@@ -29,10 +50,10 @@ function game.load(reloaded)
     -- Models and bodies from the same shapes: nothing on disk is needed.
     local ground_shape = ty.box(12, 0.5, 12)
     local ground_model = ty.shape_model(ground_shape, { 0.42, 0.42, 0.40 }, 0.9)
-    state.ground_body = ty.body { shape = ground_shape, position = { 0, -0.5, 0 }, motion = "static",
-                                  friction = 0.7 }
-    ty.entity { Name = { text = "ground" }, Transform = { position = { 0, -0.5, 0 } },
-                MeshRenderer = { model = ground_model } }
+    state.ground_body = body { shape = ground_shape, position = { 0, -0.5, 0 }, motion = "static",
+                               friction = 0.7 }
+    entity { Name = { text = "ground" }, Transform = { position = { 0, -0.5, 0 } },
+             MeshRenderer = { model = ground_model } }
 
     -- A pile of boxes, each an entity whose Transform follows its body.
     state.boxes = {}
@@ -44,13 +65,13 @@ function game.load(reloaded)
         local angle = i * 2.39996  -- the golden angle: a spiral, not a stack
         local radius = 0.35 * math.sqrt(i)
         local position = { math.cos(angle) * radius, 1.0 + i * 0.45, math.sin(angle) * radius }
-        local body = ty.body { shape = shape, position = position, mass = 1.5 * half,
-                               friction = 0.6, restitution = 0.05, user_data = i }
-        state.boxes[i] = ty.entity {
+        local box = body { shape = shape, position = position, mass = 1.5 * half,
+                           friction = 0.6, restitution = 0.05, user_data = i }
+        state.boxes[i] = entity {
             Name = { text = string.format("box %d", i) },
             Transform = { position = position },
             MeshRenderer = { model = model },
-            RigidBody = { body = body },
+            RigidBody = { body = box },
         }
     end
 
@@ -161,6 +182,11 @@ function game.update(dt)
 end
 
 function game.unload(reloading)
+    -- Entities first: a box's body is nothing to the world once the thing
+    -- that drew it is gone.
+    for _, e in ipairs(made.entities) do ty.destroy(e) end
+    for _, b in ipairs(made.bodies) do ty.destroy_body(b) end
+    made = { entities = {}, bodies = {} }
     ty.log(reloading and "reloading" or "stopping")
 end
 
