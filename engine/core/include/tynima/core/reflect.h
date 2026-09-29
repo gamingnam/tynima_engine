@@ -128,6 +128,26 @@ template <typename T>
                      .flags = flags};
 }
 
+// A default-constructed T, built by ordinary code rather than by the
+// compiler's constant evaluator. MSVC's does not apply a default member
+// initializer of array type — a char[16] declared as "unnamed" evaluates to
+// zeros — and the language calls for constant initialization wherever the
+// initializer is a constant expression, so the only way out of its hands is
+// an initializer that cannot be one. That is what the volatile read is for:
+// it makes this a dynamic initializer, and an array then holds what it was
+// declared holding. Everything else about the value is unchanged.
+//
+// The cost of that is order: a type's defaults are built with the rest of
+// its translation unit's statics, so a component registered from another
+// static initializer — rather than from a game's load(), which is where
+// registration belongs — could see them before they are there.
+template <typename T> [[nodiscard]] T default_instance() noexcept {
+    T value{};
+    const volatile char* keep = reinterpret_cast<const volatile char*>(&value);
+    (void)*keep;
+    return value;
+}
+
 // A type is reflected when a tynima_reflect(const T*) is found for it — the
 // function TY_REFLECT defines in the type's namespace.
 template <typename T>
@@ -156,7 +176,7 @@ template <typename T> [[nodiscard]] constexpr TypeInfo type_info() noexcept {
     struct TynimaReflect_##Type {                                                                            \
         using ReflectedType = Type;                                                                          \
         static constexpr ::tynima::core::FieldInfo fields[] = {__VA_ARGS__};                                 \
-        static constexpr Type defaults{};                                                                    \
+        static inline const Type defaults = ::tynima::core::default_instance<Type>();                        \
     };                                                                                                       \
     [[maybe_unused]] constexpr ::tynima::core::TypeInfo tynima_reflect(const Type*) noexcept {               \
         return {TynimaReflect_##Type::fields,                                                                \
